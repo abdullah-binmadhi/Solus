@@ -1,0 +1,54 @@
+[package]
+name = "solus"
+version = "1.0.6"
+edition = "2021"
+description = "Solus — A high-definition terminal anime theatre, discovery crucible, and AniList companion powered by Ratatui and ani-cli"
+authors = ["Abdullah Binmadhi", "Logan"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/abdullah-binmadhi/Solus"
+homepage = "https://github.com/abdullah-binmadhi/Solus"
+keywords = ["anime", "tui", "terminal", "cli", "solus"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "solus"
+path = "src/main.rs"
+
+[dependencies]
+# TUI
+ratatui       = "0.28"
+crossterm     = "0.28"
+ratatui-image = { version = "2", features = ["crossterm"] }
+image         = "0.25"
+
+# Async runtime
+tokio         = { version = "1", features = ["full"] }
+
+# HTTP + API
+reqwest       = { version = "0.12", features = ["json"] }
+
+# Database
+sqlx          = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
+
+# Serialization
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+toml          = "0.8"
+
+# Error handling
+anyhow        = "1"
+thiserror     = "1"
+
+# CLI flags
+clap          = { version = "4", features = ["derive"] }
+
+# Utilities
+directories   = "5"
+fuzzy-matcher = "0.3"
+rand          = "0.8"
+base64        = "0.22"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile   = "3"

@@ -1,0 +1,532 @@
+//! ani-cli subprocess wrapper.
+//! Spawns ani-cli for async playback with log streaming.
+
+use crate::error::{AppError, Result};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
+use tokio::process::{Child, Command};
+
+/// Options passed to ani-cli when launching playback.
+#[derive(Debug, Clone)]
+pub struct PlayOptions {
+    /// Title to pass to ani-cli as the search query
+    pub title:   String,
+    /// Episode number to play
+    pub episode: u32,
+    /// Quality string e.g. "1080p", "720p", "best"
+    pub quality: String,
+    /// true = dub, false = sub
+    pub dub:     bool,
+    /// Preferred player passed through to ani-cli
+    pub player:  String,
+    /// Subtitle language label (e.g. "Arabic", "Russian", "Hindi", "Indonesian", "English")
+    pub sub_lang: Option<String>,
+    /// Direct subtitle .vtt URL to pass to player
+    pub sub_url:  Option<String>,
+    /// Direct verified stream URL (.m3u8) for 100% sync and instant launch
+    pub stream_url: Option<String>,
+}
+
+/// Build the ani-cli command arguments for a given play request.
+/// Pure function — separated from spawn so it can be tested without forking.
+pub fn build_args(opts: &PlayOptions) -> Vec<String> {
+    let mut args = Vec::new();
+
+    // Auto-pick the first ani-cli search match to avoid dropping into the
+    // interactive series chooser for ambiguous titles.
+    args.push("-S".to_string());
+    args.push("1".to_string());
+
+    // Episode selection
+    args.push("-e".to_string());
+    args.push(opts.episode.to_string());
+
+    // Quality
+    args.push("-q".to_string());
+    args.push(opts.quality.clone());
+
+    // Exit after play: ensures ani-cli exits cleanly instead of dropping
+    // into an interactive fzf loop that hijacks /dev/tty and freezes the TUI.
+    args.push("--exit-after-play".to_string());
+
+    // Dub flag
+    if opts.dub {
+        args.push("--dub".to_string());
+    }
+
+    // Title as final positional argument.
+    // Note: Do NOT pass -L / sub_lang as command-line arguments to ani-cli because
+    // ani-cli's argument loop treats unhandled flags as positional search terms,
+    // which pollutes the search query (e.g. "-L Arabic <title>") and causes it to
+    // select a completely different anime. Subtitle language is configured via the
+    // ANI_CLI_SUB_LANG and ANI_CLI_PLAYER_FLAGS environment variables in spawn_async.
+    args.push(opts.title.clone());
+
+    args
+}
+
+/// Resolve the actual player command to give ani-cli.
+///
+/// Preference order:
+/// - `mpv` stays the default when installed
+/// - on macOS, `mpv` falls back to `iina` / `iina-cli` when `mpv` is unavailable
+/// - `vlc` remains an explicit cross-platform option
+pub fn resolve_player(preferred: &str) -> String {
+    match preferred {
+        "mpv" => {
+            if command_exists("mpv") {
+                "mpv".to_string()
+            } else if let Some(iina) = macos_iina_fallback() {
+                iina
+            } else {
+                "mpv".to_string()
+            }
+        }
+        "iina" => macos_iina_fallback().unwrap_or_else(|| "iina".to_string()),
+        "vlc" => "vlc".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Detect whether the relevant runtime dependencies are available on this machine.
+pub fn detect_dependencies() -> (bool, bool, bool, bool) {
+    (
+        command_exists("ani-cli"),
+        command_exists("mpv"),
+        macos_iina_fallback().is_some(),
+        command_exists("vlc"),
+    )
+}
+
+fn command_exists(name: &str) -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+
+    env::split_paths(&path).any(|dir| executable_exists(&dir.join(name)))
+}
+
+fn executable_exists(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn macos_iina_fallback() -> Option<String> {
+    if env::consts::OS != "macos" {
+        return None;
+    }
+
+    let app_path = PathBuf::from("/Applications/IINA.app/Contents/MacOS/iina-cli");
+    if executable_exists(&app_path) {
+        return Some(app_path.to_string_lossy().into_owned());
+    }
+
+    if command_exists("iina") {
+        return Some("iina".to_string());
+    }
+
+    None
+}
+
+/// Ensure the Solus player wrapper script exists, is executable, and return its path.
+/// The wrapper intercepts ani-cli's invocation to:
+/// 1. Inject `--audio-file` with the master playlist when HLS multi-audio split streams are detected (e.g. Cyberpunk Edgerunners).
+/// 2. Clear and set `--sub-file` so ani-cli's English fallback never overrides the user's chosen subtitle track.
+/// 3. Match audio track selection with the user's Dub / Sub preference.
+pub fn ensure_player_wrapper(real_player: &str) -> Result<PathBuf> {
+    let wrapper_name = if real_player.contains("iina") {
+        "solus-iina"
+    } else if real_player.contains("vlc") {
+        "solus-vlc"
+    } else {
+        "solus-mpv"
+    };
+
+    // We choose a directory path strictly guaranteed to have NO spaces
+    // (e.g. ~/.local/share/solus/bin or /tmp/solus-bin) because ani-cli executes
+    // $player_function unquoted in bash ($player_function --referrer=...).
+    let bin_dir = env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|h| h.join(".local/share/solus/bin"))
+        .filter(|p| !p.to_string_lossy().contains(' '))
+        .unwrap_or_else(|| env::temp_dir().join("solus-bin"));
+
+    std::fs::create_dir_all(&bin_dir)
+        .map_err(|e| AppError::Player(format!("Failed to create wrapper dir: {e}")))?;
+
+    let wrapper_path = bin_dir.join(wrapper_name);
+
+    let script_content = r#"#!/bin/bash
+set -e
+
+REAL_PLAYER="${SOLUS_REAL_PLAYER:-}"
+if [ -z "$REAL_PLAYER" ]; then
+    REAL_PLAYER="$(command -v mpv || echo "/opt/homebrew/bin/mpv")"
+fi
+
+args=()
+video_link=""
+refr=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --referrer=*)
+            refr="${arg#--referrer=}"
+            args+=("$arg")
+            ;;
+        --sub-file=*)
+            # When SOLUS_SUB_URL is set, omit ani-cli's fallback sub-file
+            if [ -z "$SOLUS_SUB_URL" ]; then
+                args+=("$arg")
+            fi
+            ;;
+        http*://* | /*.m3u8*)
+            video_link="$arg"
+            ;;
+        *)
+            args+=("$arg")
+            ;;
+    esac
+done
+
+is_iina=0
+is_vlc=0
+if [[ "$REAL_PLAYER" =~ iina ]]; then
+    is_iina=1
+elif [[ "$REAL_PLAYER" =~ vlc ]]; then
+    is_vlc=1
+fi
+
+if [ -n "$SOLUS_SUB_URL" ]; then
+    if [ "$is_iina" -eq 1 ]; then
+        escaped_sub="${SOLUS_SUB_URL//:/\\:}"
+        args+=("--mpv-sub-files=$escaped_sub" "--mpv-sid=1")
+    elif [ "$is_vlc" -eq 1 ]; then
+        args+=(":input-slave=$SOLUS_SUB_URL")
+    else
+        args+=("--sub-file=$SOLUS_SUB_URL" "--sid=1" "--sub-visibility=yes")
+    fi
+fi
+
+if [[ "$video_link" =~ /index\.m3u8$ ]]; then
+    master_url="${video_link%/*/*}/master.m3u8"
+    if [ -n "$master_url" ]; then
+        has_audio=$(curl -s -m 2 -e "$refr" "$master_url" 2>/dev/null | grep -m 1 "TYPE=AUDIO" || true)
+        if [ -n "$has_audio" ]; then
+            if [ "$is_iina" -eq 1 ]; then
+                escaped_master="${master_url//:/\\:}"
+                args+=("--mpv-audio-file=$escaped_master")
+            elif [ "$is_vlc" -eq 1 ]; then
+                video_link="$master_url"
+            else
+                args+=("--audio-file=$master_url" "--audio-file-auto=all")
+            fi
+        fi
+    fi
+fi
+
+if [ "$SOLUS_AUDIO_DUB" = "1" ]; then
+    if [ "$is_iina" -eq 1 ]; then
+        args+=("--mpv-alang=en,eng,English")
+    elif [ "$is_vlc" -eq 0 ]; then
+        args+=("--alang=en,eng,English")
+    fi
+else
+    if [ "$is_iina" -eq 1 ]; then
+        args+=("--mpv-alang=ja,jpn,Japanese")
+    elif [ "$is_vlc" -eq 0 ]; then
+        args+=("--alang=ja,jpn,Japanese")
+    fi
+fi
+
+if [ -n "$video_link" ]; then
+    args+=("$video_link")
+fi
+
+exec "$REAL_PLAYER" "${args[@]}"
+"#;
+
+    std::fs::write(&wrapper_path, script_content)
+        .map_err(|e| AppError::Player(format!("Failed to write player wrapper: {e}")))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&wrapper_path)
+            .map_err(|e| AppError::Player(format!("Failed to read wrapper metadata: {e}")))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&wrapper_path, perms)
+            .map_err(|e| AppError::Player(format!("Failed to set wrapper permissions: {e}")))?;
+    }
+
+    Ok(wrapper_path)
+}
+
+/// Spawn ani-cli asynchronously. stdout + stderr are piped for log streaming.
+/// The player is detached by default (ani-cli default behaviour).
+/// Returns a tokio Child — caller is responsible for reading I/O and waiting.
+pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
+    let args = build_args(opts);
+    let player = resolve_player(&opts.player);
+    let wrapper_path = ensure_player_wrapper(&player)?;
+    let bin_dir = wrapper_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| env::temp_dir().join("solus-bin"));
+    let wrapper_name = wrapper_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "solus-mpv".to_string());
+
+    // 1. Direct stream playback:
+    // If we resolved the exact verified stream URL (.m3u8), launch the player directly
+    // through solus-mpv. This eliminates ani-cli fuzzy text searches, guaranteeing 100%
+    // frame-perfect subtitle synchronization, accurate resolution, and sub-100ms launch.
+    if let Some(ref direct_url) = opts.stream_url {
+        if !direct_url.is_empty() {
+            let mut cmd = Command::new(&wrapper_path);
+            cmd.arg("--referrer=https://zokoanime.video/");
+            cmd.arg("--input-terminal=no");
+            cmd.arg(format!("--force-media-title={} Episode {}", opts.title, opts.episode));
+
+            let mut current_paths = match env::var_os("PATH") {
+                Some(val) => env::split_paths(&val).collect::<Vec<_>>(),
+                None => Vec::new(),
+            };
+            current_paths.insert(0, bin_dir.clone());
+            if let Ok(new_path) = env::join_paths(current_paths) {
+                cmd.env("PATH", new_path);
+            }
+
+            cmd.env("SOLUS_REAL_PLAYER", &player);
+            if opts.dub {
+                cmd.env("SOLUS_AUDIO_DUB", "1");
+            } else {
+                cmd.env("SOLUS_AUDIO_DUB", "0");
+            }
+
+            if let Some(ref url) = opts.sub_url {
+                if !url.is_empty() {
+                    cmd.env("SOLUS_SUB_URL", url);
+                }
+            }
+
+            cmd.arg(direct_url);
+
+            return cmd
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| AppError::Player(format!("Failed to spawn direct player: {e}")));
+        }
+    }
+
+    // 2. Fallback playback via ani-cli
+    let mut cmd = Command::new("ani-cli");
+
+    // Prepend wrapper directory to PATH so ani-cli executes the bare binary name
+    // (e.g. "solus-mpv") directly without space splitting in $player_function.
+    let mut current_paths = match env::var_os("PATH") {
+        Some(val) => env::split_paths(&val).collect::<Vec<_>>(),
+        None => Vec::new(),
+    };
+    current_paths.insert(0, bin_dir);
+    if let Ok(new_path) = env::join_paths(current_paths) {
+        cmd.env("PATH", new_path);
+    }
+
+    cmd.args(&args)
+        .env("ANI_CLI_PLAYER", &wrapper_name)
+        .env("SOLUS_REAL_PLAYER", &player)
+        .env("ANI_CLI_EXIT_AFTER_PLAY", "1")
+        .env("ANI_CLI_NO_DETACH", "1");
+
+    if opts.dub {
+        cmd.env("SOLUS_AUDIO_DUB", "1");
+    } else {
+        cmd.env("SOLUS_AUDIO_DUB", "0");
+    }
+
+    if let Some(ref lang) = opts.sub_lang {
+        if !lang.is_empty() {
+            cmd.env("ANI_CLI_SUB_LANG", lang);
+        }
+    }
+
+    if let Some(ref url) = opts.sub_url {
+        if !url.is_empty() {
+            cmd.env("SOLUS_SUB_URL", url);
+        }
+    }
+
+    let mut player_flags = vec!["--input-terminal=no".to_string()];
+    if let Some(ref url) = opts.sub_url {
+        if !url.is_empty() {
+            if player.contains("iina") {
+                // iina-cli expects mpv options prefixed with --mpv-
+                let escaped_url = url.replace(':', "\\:");
+                player_flags.push(format!("--mpv-sub-files={}", escaped_url));
+                player_flags.push("--mpv-sid=1".to_string());
+            } else if player.contains("vlc") {
+                player_flags.push(format!(":input-slave={}", url));
+            } else {
+                // Default: mpv. Pass without literal quotes so sh parameter expansion
+                // passes a clean argument. --sub-files-clr guarantees any preceding
+                // fallback sub-file is eliminated, and the user's chosen subtitle is rendered.
+                player_flags.push("--sub-files-clr".to_string());
+                player_flags.push(format!("--sub-file={}", url));
+                player_flags.push("--sid=1".to_string());
+                player_flags.push("--sub-visibility=yes".to_string());
+            }
+        }
+    }
+    cmd.env("ANI_CLI_PLAYER_FLAGS", player_flags.join(" "));
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::Player(format!("Failed to spawn ani-cli: {e}")))
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(title: &str, episode: u32, quality: &str, dub: bool) -> PlayOptions {
+        PlayOptions {
+            title:   title.to_string(),
+            episode,
+            quality: quality.to_string(),
+            dub,
+            player:  "mpv".to_string(),
+            sub_lang: None,
+            sub_url:  None,
+            stream_url: None,
+        }
+    }
+
+    #[test]
+    fn test_build_args_sub_mode() {
+        let args = build_args(&opts("Naruto", 1, "1080p", false));
+        assert!(args.contains(&"-S".to_string()));
+        assert!(args.contains(&"1".to_string()));
+        assert!(args.contains(&"-e".to_string()));
+        assert!(args.contains(&"1".to_string()));
+        assert!(args.contains(&"-q".to_string()));
+        assert!(args.contains(&"1080p".to_string()));
+        assert!(!args.contains(&"--dub".to_string()));
+        assert!(!args.contains(&"--no-detach".to_string()));
+        assert!(args.contains(&"Naruto".to_string()));
+    }
+
+    #[test]
+    fn test_build_args_dub_mode() {
+        let args = build_args(&opts("One Piece", 5, "720p", true));
+        assert!(args.contains(&"--dub".to_string()));
+        assert!(args.contains(&"5".to_string()));
+        assert!(args.contains(&"720p".to_string()));
+        assert!(args.contains(&"One Piece".to_string()));
+    }
+
+    #[test]
+    fn test_build_args_title_is_last() {
+        let args = build_args(&opts("Frieren", 3, "best", false));
+        assert_eq!(args.last().unwrap(), "Frieren");
+    }
+
+    #[test]
+    fn test_build_args_episode_follows_flag() {
+        let args = build_args(&opts("Test", 7, "720p", false));
+        let e_pos = args.iter().position(|a| a == "-e").unwrap();
+        assert_eq!(args[e_pos + 1], "7");
+    }
+
+    #[test]
+    fn test_build_args_quality_follows_flag() {
+        let args = build_args(&opts("Test", 1, "480p", false));
+        let q_pos = args.iter().position(|a| a == "-q").unwrap();
+        assert_eq!(args[q_pos + 1], "480p");
+    }
+
+    #[test]
+    fn test_build_args_v4_14_contract() {
+        let args = build_args(&PlayOptions {
+            title:   "One Piece".to_string(),
+            episode: 5,
+            quality: "720p".to_string(),
+            dub:     true,
+            player:  "mpv".to_string(),
+            sub_lang: None,
+            sub_url:  None,
+            stream_url: None,
+        });
+        assert_eq!(
+            args,
+            vec!["-S", "1", "-e", "5", "-q", "720p", "--exit-after-play", "--dub", "One Piece"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<String>>()
+        );
+    }
+
+    #[test]
+    fn test_build_args_select_nth_precedes_title() {
+        let args = build_args(&opts("Test", 1, "720p", false));
+        let s_pos = args.iter().position(|a| a == "-S").unwrap();
+        assert_eq!(args[s_pos + 1], "1");
+        assert_eq!(args.last().unwrap(), "Test");
+    }
+
+    #[test]
+    fn test_build_args_does_not_pollute_query_with_sub_lang() {
+        let args = build_args(&PlayOptions {
+            title:   "Frieren".to_string(),
+            episode: 1,
+            quality: "1080p".to_string(),
+            dub:     false,
+            player:  "mpv".to_string(),
+            sub_lang: Some("Arabic".to_string()),
+            sub_url:  Some("https://example.com/sub.vtt".to_string()),
+            stream_url: None,
+        });
+        assert_eq!(
+            args,
+            vec!["-S", "1", "-e", "1", "-q", "1080p", "--exit-after-play", "Frieren"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<String>>()
+        );
+        assert!(!args.contains(&"-L".to_string()));
+        assert!(!args.contains(&"Arabic".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_player_keeps_vlc() {
+        assert_eq!(resolve_player("vlc"), "vlc");
+    }
+
+    #[test]
+    fn test_ensure_player_wrapper_creates_executable_wrapper() {
+        let wrapper = ensure_player_wrapper("mpv").expect("Failed to create mpv wrapper");
+        assert!(wrapper.exists());
+        assert!(wrapper.file_name().unwrap().to_str().unwrap().contains("mpv"));
+
+        let content = std::fs::read_to_string(&wrapper).expect("Failed to read wrapper");
+        assert!(content.contains("TYPE=AUDIO"));
+        assert!(content.contains("SOLUS_SUB_URL"));
+        assert!(content.contains("SOLUS_AUDIO_DUB"));
+
+        let iina_wrapper = ensure_player_wrapper("iina").expect("Failed to create iina wrapper");
+        assert!(iina_wrapper.file_name().unwrap().to_str().unwrap().contains("iina"));
+
+        let vlc_wrapper = ensure_player_wrapper("vlc").expect("Failed to create vlc wrapper");
+        assert!(vlc_wrapper.file_name().unwrap().to_str().unwrap().contains("vlc"));
+    }
+}
