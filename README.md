@@ -91,7 +91,7 @@ Whether you link your public AniList username or import a local backup file (`Se
 
 ---
 
-### 🍎 macOS Setup (Kitty Terminal)
+### ❖ macOS Setup (Kitty Terminal)
 
 #### Step 1: Install Kitty Terminal & Media Player
 Open your regular Mac Terminal app and paste:
@@ -115,7 +115,7 @@ solus
 
 ---
 
-### 🐧 Linux Setup (Kitty Terminal)
+### ◈ Linux Setup (Kitty Terminal)
 
 #### Step 1: Install Kitty & Media Player
 Open your terminal and paste the command for your distribution:
@@ -151,7 +151,7 @@ solus
 
 ---
 
-### 🪟 Windows Setup (WezTerm)
+### ✦ Windows Setup (WezTerm)
 
 On Windows, **WezTerm** brings full picture support so anime covers and episode preview stills look clean and sharp right out of the box.
 
