@@ -84,62 +84,97 @@ Whether you link your public AniList username or import a local backup file (`Se
 
 ---
 
-## ⬡ Prerequisites
+## ❖ Simple Step-by-Step Installation
 
-Before launching `solus`, ensure the following runtime tools are installed on your `$PATH`:
-
-1. **[`ani-cli`](https://github.com/pystardust/ani-cli)** — Required for stream extraction and player handoff.
-2. **A Supported Media Player**:
-   - `mpv` (default and recommended)
-   - `iina` (macOS native player; automatically used as fallback on macOS)
-   - `vlc`
-3. **A Truecolor / Kitty-Graphics Terminal** (recommended):
-   - [Kitty](https://sw.kovidgoyal.net/kitty/), [Ghostty](https://ghostty.org/), or [WezTerm](https://wezfurlong.org/wezterm/) for full high-resolution poster and episode still rendering.
-
-Verify your environment:
-
-```bash
-which ani-cli
-which mpv   # or: which iina / which vlc
-```
+> [!TIP]
+> **Recommended Window Size**: For the best theatre experience, run your terminal **Maximized / Full Screen**, or resize it to at least **125 columns wide × 38 rows tall**. This gives high-definition posters and widescreen episode stills room to shine without any cramped text.
 
 ---
 
-## ❖ Installation
+### 🍎 macOS Setup (Kitty Terminal)
 
-### Build & Install from Source (Cargo)
-
+#### Step 1: Install Kitty Terminal & Media Player
+Open your regular Mac Terminal app and paste:
 ```bash
-git clone https://github.com/abdullah-binmadhi/Solus.git
-cd Solus
-cargo install --path . --force
+brew install --cask kitty && brew install mpv ani-cli
 ```
+*(If you do not have Homebrew installed yet, copy-paste this first: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`)*
 
-Then launch Solus from anywhere:
+#### Step 2: Install Solus
+In the same terminal, paste:
+```bash
+cargo install --git https://github.com/abdullah-binmadhi/Solus.git
+```
+*(Need Rust? Install it with one paste: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)*
 
+#### Step 3: Launch
+Open your newly installed **Kitty** app from Applications and type:
 ```bash
 solus
 ```
 
-### Runtime Dependencies on macOS (Homebrew)
+---
 
+### 🐧 Linux Setup (Kitty Terminal)
+
+#### Step 1: Install Kitty & Media Player
+Open your terminal and paste the command for your distribution:
+
+**Ubuntu / Debian / Mint**:
 ```bash
-brew install ani-cli mpv curl grep aria2 ffmpeg git fzf yt-dlp
-# Optional macOS player:
-brew install --cask iina
+sudo apt update && sudo apt install -y kitty mpv ffmpeg curl git fzf yt-dlp
+git clone https://github.com/pystardust/ani-cli.git && sudo cp ani-cli/ani-cli /usr/local/bin/
 ```
 
-### Runtime Dependencies on Linux
-
+**Arch Linux / Manjaro**:
 ```bash
-# Debian / Ubuntu
-sudo apt install mpv vlc curl grep aria2 ffmpeg fzf yt-dlp
+sudo pacman -S kitty mpv ani-cli ffmpeg yt-dlp
+```
 
-# Fedora
-sudo dnf install mpv vlc curl grep aria2 ffmpeg fzf yt-dlp
+**Fedora**:
+```bash
+sudo dnf install kitty mpv ffmpeg curl git fzf yt-dlp
+git clone https://github.com/pystardust/ani-cli.git && sudo cp ani-cli/ani-cli /usr/local/bin/
+```
 
-# Arch Linux
-sudo pacman -S mpv vlc curl grep aria2 ffmpeg fzf yt-dlp
+#### Step 2: Install Solus
+```bash
+cargo install --git https://github.com/abdullah-binmadhi/Solus.git
+```
+*(Need Rust? Install it with: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)*
+
+#### Step 3: Launch
+Open **Kitty** and type:
+```bash
+solus
+```
+
+---
+
+### 🪟 Windows Setup (WezTerm)
+
+On Windows, **WezTerm** brings full picture support so anime covers and episode preview stills look clean and sharp right out of the box.
+
+#### Step 1: Install WezTerm, Video Player & Tools
+Open **PowerShell** (search "PowerShell" in your Windows Start Menu) and paste this single setup command:
+```powershell
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+iwr -useb get.scoop.sh | iex
+scoop bucket add extras
+scoop install wezterm mpv ani-cli git yt-dlp
+```
+
+#### Step 2: Install Solus
+In the same PowerShell window, paste:
+```powershell
+cargo install --git https://github.com/abdullah-binmadhi/Solus.git
+```
+*(Need Rust on Windows? Install it with: `winget install Rustlang.Rustup`)*
+
+#### Step 3: Launch
+Open **WezTerm** from your Start Menu and type:
+```bash
+solus
 ```
 
 ---
