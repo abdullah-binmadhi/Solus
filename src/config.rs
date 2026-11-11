@@ -87,22 +87,29 @@ impl Default for CacheConfig {
     }
 }
 
+fn default_sub_lang_val() -> String {
+    "English".to_string()
+}
+
 /// Root config struct — persisted to ~/.config/ani-tui/config.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub quality:    Quality,
-    pub audio_mode: AudioMode,
-    pub player:     Player,
-    pub cache:      CacheConfig,
+    pub quality:          Quality,
+    pub audio_mode:       AudioMode,
+    pub player:           Player,
+    #[serde(default = "default_sub_lang_val")]
+    pub default_sub_lang: String,
+    pub cache:            CacheConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            quality:    Quality::default(),
-            audio_mode: AudioMode::default(),
-            player:     Player::default(),
-            cache:      CacheConfig::default(),
+            quality:          Quality::default(),
+            audio_mode:       AudioMode::default(),
+            player:           Player::default(),
+            default_sub_lang: default_sub_lang_val(),
+            cache:            CacheConfig::default(),
         }
     }
 }
@@ -245,17 +252,19 @@ mod tests {
     #[test]
     fn test_config_round_trip_toml() {
         let original = Config {
-            quality:    Quality::P720,
-            audio_mode: AudioMode::Dub,
-            player:     Player::Iina,
-            cache:      CacheConfig::default(),
+            quality:          Quality::P720,
+            audio_mode:       AudioMode::Dub,
+            player:           Player::Iina,
+            default_sub_lang: "Arabic".to_string(),
+            cache:            CacheConfig::default(),
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
 
-        assert_eq!(deserialized.quality,    Quality::P720);
-        assert_eq!(deserialized.audio_mode, AudioMode::Dub);
-        assert_eq!(deserialized.player,     Player::Iina);
+        assert_eq!(deserialized.quality,          Quality::P720);
+        assert_eq!(deserialized.audio_mode,       AudioMode::Dub);
+        assert_eq!(deserialized.player,           Player::Iina);
+        assert_eq!(deserialized.default_sub_lang, "Arabic");
     }
 
     #[test]
@@ -264,10 +273,11 @@ mod tests {
         let path = tmp.path().join("config.toml");
 
         let original = Config {
-            quality:    Quality::P480,
-            audio_mode: AudioMode::Sub,
-            player:     Player::Mpv,
-            cache:      CacheConfig::default(),
+            quality:          Quality::P480,
+            audio_mode:       AudioMode::Sub,
+            player:           Player::Mpv,
+            default_sub_lang: "English".to_string(),
+            cache:            CacheConfig::default(),
         };
 
         // Save manually (bypassing config_path() which uses XDG dirs)

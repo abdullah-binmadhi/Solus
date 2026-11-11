@@ -247,7 +247,17 @@ async fn main() -> anyhow::Result<()> {
                             .position(|q| q.label == pref_str)
                             .unwrap_or(0);
 
-                        state.playback_sub_cursor = 0;
+                        let pref_sub = &cfg.default_sub_lang;
+                        state.playback_sub_cursor = state
+                            .playback_sub_languages
+                            .iter()
+                            .position(|s| {
+                                s.name.to_lowercase().contains(&pref_sub.to_lowercase())
+                                    || s.code.to_lowercase().starts_with(&pref_sub.to_lowercase())
+                                    || s.stream_label.to_lowercase().contains(&pref_sub.to_lowercase())
+                            })
+                            .unwrap_or(0);
+
                         state.is_loading_subs = false;
                     }
                 }
@@ -1449,7 +1459,7 @@ async fn handle_settings(
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => state.go_back(),
         KeyCode::Char('j') | KeyCode::Down => {
-            state.settings_cursor = (state.settings_cursor + 1).min(2);
+            state.settings_cursor = (state.settings_cursor + 1).min(3);
         }
         KeyCode::Char('k') | KeyCode::Up => {
             state.settings_cursor = state.settings_cursor.saturating_sub(1);
@@ -1701,6 +1711,12 @@ fn apply_settings_delta(
                 config::AudioMode::Sub => config::AudioMode::Dub,
                 config::AudioMode::Dub => config::AudioMode::Sub,
             };
+        }
+        3 => {
+            let values = ui::settings::SUBTITLE_CHOICES;
+            let current = values.iter().position(|&val| val.eq_ignore_ascii_case(&cfg.default_sub_lang)).unwrap_or(0) as i32;
+            let next = (current + delta).rem_euclid(values.len() as i32) as usize;
+            cfg.default_sub_lang = values[next].to_string();
         }
         _ => {}
     }
@@ -2173,6 +2189,17 @@ async fn start_playback(
     if !(has_mpv || has_iina || has_vlc) {
         state.show_toast("No supported player found. Open ! for setup help.", unix_now());
         return;
+    }
+
+    let mut opts = opts;
+    if let Some(ref sub_u) = opts.sub_url {
+        if sub_u.starts_with("http://") || sub_u.starts_with("https://") {
+            let anime_id = state.selected_anime.as_ref().map(|a| a.id).unwrap_or(0);
+            let code = opts.sub_lang.as_deref().unwrap_or("sub");
+            let client = reqwest::Client::new();
+            let cached_path = api::subtitles::ensure_cached_subtitle(&client, sub_u, anime_id, episode, code).await;
+            opts.sub_url = Some(cached_path);
+        }
     }
 
     let mut child = match api::player::spawn_async(&opts) {

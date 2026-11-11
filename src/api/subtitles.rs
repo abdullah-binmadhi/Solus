@@ -3,7 +3,7 @@
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const XOR_KEY: [u8; 14] = [111, 116, 97, 107, 117, 45, 101, 109, 98, 101, 100, 45, 118, 49]; // "otaku-embed-v1"
@@ -194,7 +194,8 @@ pub fn parse_m3u8_qualities(master_url: &str, m3u8_content: &str) -> Vec<Quality
 }
 
 /// Dynamically fetch verified stream info (qualities, subtitles, and direct master URL)
-/// for a specific anime episode.
+/// for a specific anime episode. Automatically queries and merges community multi-language
+/// subtitle tracks (Arabic, Spanish, French, German, Italian, etc.) if not already present in the stream.
 pub async fn fetch_stream_info(
     anilist_id: i64,
     query_title: &str,
@@ -207,23 +208,208 @@ pub async fn fetch_stream_info(
         .build()
         .unwrap_or_default();
 
+    // Run stream resolution and external multi-language subtitle fetching in parallel!
+    let (stream_res, ext_subs) = tokio::join!(
+        resolve_primary_stream(&client, anilist_id, query_title, episode, is_dub),
+        fetch_external_subtitles(&client, anilist_id, episode)
+    );
+
+    let mut info = stream_res.unwrap_or_else(StreamInfo::fallback);
+
+    // Merge external community subtitles (OpenSubtitles) into the stream's subtitle list
+    let mut existing_codes: HashSet<String> = info.subtitles.iter().map(|s| s.code.clone()).collect();
+    for ext in ext_subs {
+        if !existing_codes.contains(&ext.code) {
+            existing_codes.insert(ext.code.clone());
+            info.subtitles.push(ext);
+        }
+    }
+
+    // Ensure English is first if present
+    if let Some(pos) = info.subtitles.iter().position(|s| s.code.starts_with("eng")) {
+        if pos != 0 {
+            let eng = info.subtitles.remove(pos);
+            info.subtitles.insert(0, eng);
+        }
+    }
+
+    info
+}
+
+async fn resolve_primary_stream(
+    client: &reqwest::Client,
+    anilist_id: i64,
+    query_title: &str,
+    episode: u32,
+    is_dub: bool,
+) -> Option<StreamInfo> {
     // 1. First attempt: resolve MAL ID via AniList GraphQL
-    if let Some(mal_id) = fetch_mal_id(&client, anilist_id).await {
-        if let Ok(info) = fetch_stream_for_mal(&client, mal_id, episode, is_dub).await {
+    if let Some(mal_id) = fetch_mal_id(client, anilist_id).await {
+        if let Ok(info) = fetch_stream_for_mal(client, mal_id, episode, is_dub).await {
             if !info.subtitles.is_empty() || !info.qualities.is_empty() {
-                return info;
+                return Some(info);
             }
         }
     }
 
     // 2. Fallback attempt: resolve via HiAnime direct search
-    if let Ok(info) = fetch_stream_via_hianime(&client, query_title, episode, is_dub).await {
+    if let Ok(info) = fetch_stream_via_hianime(client, query_title, episode, is_dub).await {
         if !info.subtitles.is_empty() || !info.qualities.is_empty() {
-            return info;
+            return Some(info);
         }
     }
 
-    StreamInfo::fallback()
+    None
+}
+
+#[derive(Debug, Deserialize)]
+struct AniZipMappingData {
+    mappings: Option<AniZipMappingDetails>,
+    #[serde(default)]
+    episodes: HashMap<String, AniZipEpDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AniZipMappingDetails {
+    imdb_id: Option<String>,
+    #[serde(rename = "type")]
+    media_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AniZipEpDetails {
+    season_number: Option<u32>,
+    episode_number: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StremioSubtitlesPayload {
+    #[serde(default)]
+    subtitles: Vec<StremioSubtitleItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StremioSubtitleItem {
+    url: Option<String>,
+    lang: Option<String>,
+    #[serde(rename = "subtitleFileName")]
+    subtitle_file_name: Option<String>,
+}
+
+/// Fetch community multi-language subtitle tracks for an anime episode via AniZip mapping + OpenSubtitles proxy.
+pub async fn fetch_external_subtitles(
+    client: &reqwest::Client,
+    anilist_id: i64,
+    episode: u32,
+) -> Vec<SubtitleOption> {
+    let anizip_url = format!("https://api.ani.zip/mappings?anilist_id={}", anilist_id);
+    let Ok(resp) = client.get(&anizip_url).timeout(Duration::from_secs(4)).send().await else {
+        return Vec::new();
+    };
+    let Ok(parsed) = resp.json::<AniZipMappingData>().await else {
+        return Vec::new();
+    };
+
+    let Some(imdb_id) = parsed.mappings.as_ref().and_then(|m| m.imdb_id.clone()).filter(|id| !id.is_empty()) else {
+        return Vec::new();
+    };
+
+    let is_movie = parsed
+        .mappings
+        .as_ref()
+        .and_then(|m| m.media_type.as_deref())
+        .map(|t| t.eq_ignore_ascii_case("movie"))
+        .unwrap_or(false);
+
+    let query_url = if is_movie {
+        format!("https://opensubtitles-v3.strem.io/subtitles/movie/{}.json", imdb_id)
+    } else {
+        let ep_key = episode.to_string();
+        let (season, ep_num) = if let Some(ep_info) = parsed.episodes.get(&ep_key) {
+            (ep_info.season_number.unwrap_or(1), ep_info.episode_number.unwrap_or(episode))
+        } else {
+            (1, episode)
+        };
+        format!("https://opensubtitles-v3.strem.io/subtitles/series/{}:{}:{}.json", imdb_id, season, ep_num)
+    };
+
+    let Ok(sub_resp) = client.get(&query_url).timeout(Duration::from_secs(4)).send().await else {
+        return Vec::new();
+    };
+    let Ok(sub_data) = sub_resp.json::<StremioSubtitlesPayload>().await else {
+        return Vec::new();
+    };
+
+    let mut options = Vec::new();
+    let mut seen = HashSet::new();
+
+    for item in sub_data.subtitles {
+        let Some(url) = item.url.filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        let lang = item.lang.as_deref().unwrap_or("eng");
+        let label = item.subtitle_file_name.as_deref().unwrap_or(lang);
+        let (code, name) = resolve_lang_meta(label, lang);
+
+        if seen.insert(code.clone()) {
+            options.push(SubtitleOption {
+                code,
+                name: name.clone(),
+                stream_label: format!("{} [Auto-Synced]", name),
+                url,
+            });
+        }
+    }
+
+    options
+}
+
+/// Download and cache a remote subtitle URL to ~/.cache/solus/subs/ and return the local path.
+/// If the subtitle is already local or download fails, returns the input URL.
+pub async fn ensure_cached_subtitle(
+    client: &reqwest::Client,
+    sub_url: &str,
+    anime_id: i64,
+    episode: u32,
+    code: &str,
+) -> String {
+    if !sub_url.starts_with("http://") && !sub_url.starts_with("https://") {
+        return sub_url.to_string();
+    }
+
+    let cache_dir = directories::ProjectDirs::from("", "", "ani-tui")
+        .map(|dirs| dirs.cache_dir().join("subs"))
+        .unwrap_or_else(|| std::env::temp_dir().join("solus-subs"));
+
+    if std::fs::create_dir_all(&cache_dir).is_err() {
+        return sub_url.to_string();
+    }
+
+    let clean_code: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let ext = if sub_url.contains(".vtt") { "vtt" } else { "srt" };
+    let filename = format!("{}_{}_{}.{}", anime_id, episode, if clean_code.is_empty() { "sub" } else { &clean_code }, ext);
+    let file_path = cache_dir.join(&filename);
+
+    if file_path.is_file() {
+        if let Ok(metadata) = std::fs::metadata(&file_path) {
+            if metadata.len() > 0 {
+                return file_path.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    if let Ok(resp) = client.get(sub_url).timeout(Duration::from_secs(6)).send().await {
+        if let Ok(bytes) = resp.bytes().await {
+            if !bytes.is_empty() {
+                if std::fs::write(&file_path, &bytes).is_ok() {
+                    return file_path.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+
+    sub_url.to_string()
 }
 
 /// Backwards compatibility wrapper for subtitle detection.
@@ -356,7 +542,11 @@ fn deobfuscate_blob(blob_b64: &str) -> Option<String> {
 
 fn resolve_lang_meta(label: &str, lang: &str) -> (String, String) {
     let l_lower = label.to_lowercase();
-    let lang_lower = lang.to_lowercase();
+    let lang_lower = if lang.is_empty() {
+        l_lower.clone()
+    } else {
+        lang.to_lowercase()
+    };
 
     // Specific regional checks first
     if l_lower.contains("latin") || l_lower.contains("latam") || l_lower.contains("es-419") || lang_lower == "es-419" {
@@ -365,8 +555,8 @@ fn resolve_lang_meta(label: &str, lang: &str) -> (String, String) {
     if l_lower.contains("espana") || l_lower.contains("españa") || l_lower.contains("castilian") || l_lower.contains("castellano") || l_lower.contains("spain") || lang_lower == "es-es" {
         return ("spa-es".to_string(), "Spanish (Castilian/Spain)".to_string());
     }
-    if l_lower.contains("brasil") || l_lower.contains("brazil") || lang_lower == "pt-br" {
-        return ("por-br".to_string(), "Portuguese (Brasil)".to_string());
+    if l_lower.contains("brasil") || l_lower.contains("brazil") || lang_lower == "pt-br" || lang_lower == "pob" {
+        return ("por-br".to_string(), "Portuguese (Brazil)".to_string());
     }
     if l_lower.contains("portugal") || lang_lower == "pt-pt" {
         return ("por-pt".to_string(), "Portuguese (Portugal)".to_string());
@@ -401,8 +591,10 @@ fn resolve_lang_meta(label: &str, lang: &str) -> (String, String) {
         ("vie".to_string(), "Vietnamese (Tiếng Việt)".to_string())
     } else if l_lower.contains("japan") || l_lower.contains("日本語") || lang_lower == "ja" || lang_lower == "jpn" {
         ("jpn".to_string(), "Japanese (日本語)".to_string())
+    } else if l_lower.contains("traditional") || lang_lower == "zht" {
+        ("zho-tw".to_string(), "Chinese (Traditional / 繁體中文)".to_string())
     } else if l_lower.contains("chin") || l_lower.contains("mandarin") || l_lower.contains("中文") || lang_lower == "zh" || lang_lower == "zho" || lang_lower == "chi" {
-        ("zho".to_string(), "Chinese (中文)".to_string())
+        ("zho".to_string(), "Chinese (Simplified / 简体中文)".to_string())
     } else if l_lower.contains("kore") || l_lower.contains("한국어") || lang_lower == "ko" || lang_lower == "kor" {
         ("kor".to_string(), "Korean (한국어)".to_string())
     } else if l_lower.contains("poli") || l_lower.contains("polsk") || lang_lower == "pl" || lang_lower == "pol" {
@@ -437,6 +629,22 @@ fn resolve_lang_meta(label: &str, lang: &str) -> (String, String) {
         ("nor".to_string(), "Norwegian (Norsk)".to_string())
     } else if l_lower.contains("mala") || l_lower.contains("melayu") || lang_lower == "ms" || lang_lower == "msa" || lang_lower == "may" {
         ("msa".to_string(), "Malay (Bahasa Melayu)".to_string())
+    } else if l_lower.contains("serb") || lang_lower == "srp" || lang_lower == "scc" {
+        ("srp".to_string(), "Serbian (Srpski)".to_string())
+    } else if l_lower.contains("bulg") || lang_lower == "bul" {
+        ("bul".to_string(), "Bulgarian (Български)".to_string())
+    } else if l_lower.contains("croat") || lang_lower == "hrv" || lang_lower == "scr" {
+        ("hrv".to_string(), "Croatian (Hrvatski)".to_string())
+    } else if l_lower.contains("tami") || lang_lower == "tam" {
+        ("tam".to_string(), "Tamil (தமிழ்)".to_string())
+    } else if l_lower.contains("beng") || lang_lower == "ben" {
+        ("ben".to_string(), "Bengali (বাংলা)".to_string())
+    } else if l_lower.contains("malayalam") || lang_lower == "mal" {
+        ("mal".to_string(), "Malayalam (മലയാളം)".to_string())
+    } else if l_lower.contains("alba") || lang_lower == "alb" || lang_lower == "sqi" {
+        ("sqi".to_string(), "Albanian (Shqip)".to_string())
+    } else if l_lower.contains("slov") || lang_lower == "slv" || lang_lower == "slo" {
+        ("slv".to_string(), "Slovenian (Slovenščina)".to_string())
     } else {
         // Fallback: Never drop a valid subtitle track!
         let code = if !lang_lower.is_empty() {
@@ -608,6 +816,25 @@ mod tests {
         let (code3, name3) = resolve_lang_meta("Spanish (- Espanol(Espana))", "");
         assert_eq!(code3, "spa-es");
         assert_eq!(name3, "Spanish (Castilian/Spain)");
+    }
+
+    #[test]
+    fn test_resolve_lang_meta_community_codes() {
+        let (c_ar, n_ar) = resolve_lang_meta("ara", "");
+        assert_eq!(c_ar, "ara");
+        assert_eq!(n_ar, "Arabic (العربية)");
+
+        let (c_pt, n_pt) = resolve_lang_meta("pob", "");
+        assert_eq!(c_pt, "por-br");
+        assert_eq!(n_pt, "Portuguese (Brazil)");
+
+        let (c_ja, n_ja) = resolve_lang_meta("jpn", "");
+        assert_eq!(c_ja, "jpn");
+        assert_eq!(n_ja, "Japanese (日本語)");
+
+        let (c_ru, n_ru) = resolve_lang_meta("rus", "");
+        assert_eq!(c_ru, "rus");
+        assert_eq!(n_ru, "Russian (Русский)");
     }
 
     #[test]
