@@ -2,6 +2,8 @@
 
 **A High-Definition Terminal Anime Theatre, Discovery Crucible & AniList Companion**
 
+https://github.com/abdullah-binmadhi/Solus/raw/main/docs/videos/solus-demo.mp4
+
 `Solus` is a keyboard-driven terminal anime theatre built in Rust with `ratatui`, `sqlx` (SQLite), and `ratatui-image`. Designed for modern GPU-accelerated terminals like **Kitty**, **Ghostty**, and **WezTerm**, Solus pairs pixel-accurate cover art and widescreen episode stills with a two-stage recommendation engine, genre-attuned episode chronicles, zero-token AniList synchronization, and seamless external playback via [`ani-cli`](https://github.com/pystardust/ani-cli).
 
 ```text
