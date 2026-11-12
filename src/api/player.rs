@@ -202,11 +202,11 @@ fi
 if [ -n "$SOLUS_SUB_URL" ]; then
     if [ "$is_iina" -eq 1 ]; then
         escaped_sub="${SOLUS_SUB_URL//:/\\:}"
-        args+=("--mpv-sub-files=$escaped_sub" "--mpv-sid=1")
+        args+=("--mpv-sub-files=$escaped_sub" "--mpv-sub-visibility=yes")
     elif [ "$is_vlc" -eq 1 ]; then
         args+=(":input-slave=$SOLUS_SUB_URL")
     else
-        args+=("--sub-file=$SOLUS_SUB_URL" "--sid=1" "--sub-visibility=yes")
+        args+=("--sub-file=$SOLUS_SUB_URL" "--sub-visibility=yes" "--sub-auto=fuzzy")
     fi
 fi
 
@@ -370,7 +370,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 // iina-cli expects mpv options prefixed with --mpv-
                 let escaped_url = url.replace(':', "\\:");
                 player_flags.push(format!("--mpv-sub-files={}", escaped_url));
-                player_flags.push("--mpv-sid=1".to_string());
+                player_flags.push("--mpv-sub-visibility=yes".to_string());
             } else if player.contains("vlc") {
                 player_flags.push(format!(":input-slave={}", url));
             } else {
@@ -379,8 +379,8 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 // fallback sub-file is eliminated, and the user's chosen subtitle is rendered.
                 player_flags.push("--sub-files-clr".to_string());
                 player_flags.push(format!("--sub-file={}", url));
-                player_flags.push("--sid=1".to_string());
                 player_flags.push("--sub-visibility=yes".to_string());
+                player_flags.push("--sub-auto=fuzzy".to_string());
             }
         }
     }

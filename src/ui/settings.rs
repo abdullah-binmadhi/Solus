@@ -13,15 +13,16 @@ use crate::{config, state::AppState};
 const PLAYER_CHOICES: [&str; 3] = ["mpv", "iina", "vlc"];
 const QUALITY_CHOICES: [&str; 5] = ["best", "1080p", "720p", "480p", "360p"];
 const AUDIO_CHOICES: [&str; 2] = ["sub", "dub"];
-pub const SUBTITLE_CHOICES: [&str; 10] = [
+pub const SUBTITLE_CHOICES: [&str; 11] = [
     "English",
     "Arabic",
+    "Russian",
+    "Indonesian",
     "Spanish",
     "French",
     "German",
     "Italian",
     "Portuguese",
-    "Russian",
     "Japanese",
     "Turkish",
 ];

@@ -130,6 +130,30 @@ impl SubtitleOption {
     }
 }
 
+/// Prioritize core languages at the top of the subtitle track list:
+/// 1. English
+/// 2. Arabic
+/// 3. Russian
+/// 4. Indonesian (Bahasa Indonesia)
+/// 5. Remaining languages in original order
+pub fn prioritize_subtitles(subtitles: &mut Vec<SubtitleOption>) {
+    let lang_priority = |code: &str| -> usize {
+        if code.starts_with("eng") {
+            0
+        } else if code.starts_with("ara") {
+            1
+        } else if code.starts_with("rus") {
+            2
+        } else if code.starts_with("ind") {
+            3
+        } else {
+            4
+        }
+    };
+
+    subtitles.sort_by_key(|s| lang_priority(&s.code));
+}
+
 /// Parse actual available video resolutions from an HLS master playlist.
 pub fn parse_m3u8_qualities(master_url: &str, m3u8_content: &str) -> Vec<QualityOption> {
     let mut raw_qualities: Vec<(u32, QualityOption)> = Vec::new();
@@ -225,13 +249,8 @@ pub async fn fetch_stream_info(
         }
     }
 
-    // Ensure English is first if present
-    if let Some(pos) = info.subtitles.iter().position(|s| s.code.starts_with("eng")) {
-        if pos != 0 {
-            let eng = info.subtitles.remove(pos);
-            info.subtitles.insert(0, eng);
-        }
-    }
+    // Prioritize English, Arabic, Russian, and Bahasa Indonesia at the top of the track list
+    prioritize_subtitles(&mut info.subtitles);
 
     info
 }
@@ -697,6 +716,8 @@ fn map_subtitles(subs: &[serde_json::Value]) -> Vec<SubtitleOption> {
         options.insert(0, SubtitleOption::default_english());
     }
 
+    prioritize_subtitles(&mut options);
+
     options
 }
 
@@ -902,5 +923,22 @@ mod tests {
         let quals_older = parse_m3u8_qualities("https://cdn.example.com/stream/master.m3u8", m3u8_older);
         assert_eq!(quals_older.len(), 1);
         assert_eq!(quals_older[0].label, "800p");
+    }
+
+    #[test]
+    fn test_prioritize_subtitles_orders_core_languages_first() {
+        let mut subs = vec![
+            SubtitleOption { code: "spa".to_string(), name: "Spanish".to_string(), stream_label: "Spanish".to_string(), url: "spa.vtt".to_string() },
+            SubtitleOption { code: "rus".to_string(), name: "Russian".to_string(), stream_label: "Russian".to_string(), url: "rus.srt".to_string() },
+            SubtitleOption { code: "fre".to_string(), name: "French".to_string(), stream_label: "French".to_string(), url: "fre.vtt".to_string() },
+            SubtitleOption { code: "eng".to_string(), name: "English".to_string(), stream_label: "English".to_string(), url: "eng.vtt".to_string() },
+            SubtitleOption { code: "ind".to_string(), name: "Indonesian".to_string(), stream_label: "Indonesian".to_string(), url: "ind.srt".to_string() },
+            SubtitleOption { code: "ara".to_string(), name: "Arabic".to_string(), stream_label: "Arabic".to_string(), url: "ara.vtt".to_string() },
+        ];
+
+        prioritize_subtitles(&mut subs);
+
+        let codes: Vec<&str> = subs.iter().map(|s| s.code.as_str()).collect();
+        assert_eq!(codes, vec!["eng", "ara", "rus", "ind", "spa", "fre"]);
     }
 }

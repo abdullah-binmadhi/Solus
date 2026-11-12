@@ -29,6 +29,56 @@ impl Default for SyncResult {
     }
 }
 
+/// Decode raw subtitle bytes handling UTF-8, stripping BOM, and falling back to CP1251 (Cyrillic).
+pub fn decode_subtitle_bytes(bytes: &[u8]) -> String {
+    let bytes = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        &bytes[3..]
+    } else {
+        bytes
+    };
+
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+
+    // Single-byte Cyrillic CP1251 fallback
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if b < 0x80 {
+            out.push(b as char);
+        } else if b >= 0xC0 {
+            let unicode = 0x0410 + (b - 0xC0) as u32;
+            if let Some(c) = char::from_u32(unicode) {
+                out.push(c);
+            } else {
+                out.push(b as char);
+            }
+        } else if b == 0xA8 {
+            out.push('Ё');
+        } else if b == 0xB8 {
+            out.push('ё');
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
+/// Check if content represents valid subtitle text (not an HTML error page like 403 Forbidden).
+pub fn is_valid_subtitle_content(content: &str) -> bool {
+    let lower = content.to_lowercase();
+    if lower.contains("<html")
+        || lower.contains("<head")
+        || lower.contains("<body")
+        || lower.contains("403 forbidden")
+        || lower.contains("404 not found")
+        || lower.contains("<title>")
+    {
+        return false;
+    }
+    content.contains("-->") || content.contains("WEBVTT")
+}
+
 /// Parse timestamp string in HH:MM:SS,mmm or HH:MM:SS.mmm format into seconds.
 pub fn parse_timestamp(s: &str) -> Option<f64> {
     let s = s.trim();
@@ -134,6 +184,30 @@ pub fn calculate_optimal_alignment(
         }
     }
 
+    // Plateau Centering for scale = 1.0:
+    // If a range of offsets achieves >= 98% of peak score, pick the midpoint
+    // to prevent edge bias caused by non-uniform dialogue gaps.
+    if best_score > 0 {
+        let threshold = (best_score as f64 * 0.98) as u64;
+        let mut min_off = best_offset;
+        let mut max_off = best_offset;
+        for step in -450..=450 {
+            let offset = step as f64 * 0.1;
+            if (offset - best_offset).abs() <= 2.0 {
+                let score = compute_score(1.0, offset);
+                if score >= threshold {
+                    if offset < min_off {
+                        min_off = offset;
+                    }
+                    if offset > max_off {
+                        max_off = offset;
+                    }
+                }
+            }
+        }
+        best_offset = (min_off + max_off) / 2.0;
+    }
+
     // Phase 2: Test framerate drift scales only if they beat 1.0 baseline by a significant margin
     const OTHER_SCALES: [f64; 4] = [
         23.976 / 25.0,
@@ -164,6 +238,20 @@ pub fn calculate_optimal_alignment(
             best_score = score;
             best_offset = offset;
         }
+    }
+
+    // Identity Guard: If at offset 0.0s (scale 1.0) the score already achieves >= 90%
+    // of the peak score, the subtitle is already in sync with the video release.
+    // Any minor offset differences (< 2s) are translator-pacing variations or song credits.
+    // Suppress offset shift to prevent introducing an artificial delay on in-sync tracks.
+    let score_zero = compute_score(1.0, 0.0);
+    if score_zero > 0 && score_zero >= ((best_score as f64 * 0.90) as u64) && (best_scale - 1.0).abs() < 0.001 {
+        return SyncResult {
+            offset_seconds: 0.0,
+            scale_factor: 1.0,
+            score: score_zero,
+            applied: false,
+        };
     }
 
     // Decision: only apply if the adjustment is noticeable (> 80ms or non-1.0 scale) and score is solid
@@ -213,6 +301,7 @@ pub fn apply_subtitle_shift(content: &str, offset_seconds: f64, scale_factor: f6
 }
 
 /// Fallback Tier 2: Probe audio lead time via ffmpeg silencedetect (runs in < 1.5s).
+#[allow(dead_code)]
 pub async fn estimate_audio_lead_time(stream_url: &str) -> Option<f64> {
     if !stream_url.starts_with("http://") && !stream_url.starts_with("https://") {
         return None;
@@ -259,7 +348,7 @@ pub async fn ensure_synchronized_subtitle(
     client: &reqwest::Client,
     target_sub_url: &str,
     ref_sub_url: Option<&str>,
-    stream_url: Option<&str>,
+    _stream_url: Option<&str>,
     anime_id: i64,
     episode: u32,
     code: &str,
@@ -280,19 +369,29 @@ pub async fn ensure_synchronized_subtitle(
     let code_name = if clean_code.is_empty() { "sub" } else { &clean_code };
     let synced_path = cache_dir.join(format!("{}_{}_{}_synced.srt", anime_id, episode, code_name));
 
-    // If already synchronized and cached, return immediately
+    // If already synchronized and cached, verify content is valid subtitle (not HTML error)
     if synced_path.is_file() {
-        if let Ok(meta) = std::fs::metadata(&synced_path) {
-            if meta.len() > 0 {
+        if let Ok(cached_content) = std::fs::read_to_string(&synced_path) {
+            if is_valid_subtitle_content(&cached_content) {
                 return (synced_path.to_string_lossy().into_owned(), None);
+            } else {
+                // Remove corrupted or 403 HTML cache entry
+                let _ = std::fs::remove_file(&synced_path);
             }
         }
     }
 
-    // 1. Download target subtitle content
-    let target_resp = match client.get(target_sub_url).timeout(Duration::from_secs(6)).send().await {
-        Ok(r) => r,
-        Err(_) => return (target_sub_url.to_string(), None),
+    // 1. Download target subtitle content with strict headers and status check
+    let target_resp = match client
+        .get(target_sub_url)
+        .header("Referer", "https://zokoanime.video/")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .timeout(Duration::from_secs(6))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return (target_sub_url.to_string(), None),
     };
     let Ok(target_bytes) = target_resp.bytes().await else {
         return (target_sub_url.to_string(), None);
@@ -300,7 +399,10 @@ pub async fn ensure_synchronized_subtitle(
     if target_bytes.is_empty() {
         return (target_sub_url.to_string(), None);
     }
-    let target_text = String::from_utf8_lossy(&target_bytes).into_owned();
+    let target_text = decode_subtitle_bytes(&target_bytes);
+    if !is_valid_subtitle_content(&target_text) {
+        return (target_sub_url.to_string(), None);
+    }
 
     // 2. Tier 1: Align against reference subtitle if available
     let mut sync_res: Option<SyncResult> = None;
@@ -311,48 +413,31 @@ pub async fn ensure_synchronized_subtitle(
             let ref_req = client
                 .get(ref_url)
                 .header("Referer", "https://zokoanime.video/")
-                .header("User-Agent", "Mozilla/5.0")
-                .timeout(Duration::from_secs(4));
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                .timeout(Duration::from_secs(5));
 
             if let Ok(ref_resp) = ref_req.send().await {
-                if let Ok(ref_bytes) = ref_resp.bytes().await {
-                    let ref_text = String::from_utf8_lossy(&ref_bytes);
-                    let ref_intervals = parse_subtitle_intervals(&ref_text);
-                    let target_intervals = parse_subtitle_intervals(&target_text);
+                if ref_resp.status().is_success() {
+                    if let Ok(ref_bytes) = ref_resp.bytes().await {
+                        let ref_text = decode_subtitle_bytes(&ref_bytes);
+                        if is_valid_subtitle_content(&ref_text) {
+                            let ref_intervals = parse_subtitle_intervals(&ref_text);
+                            let target_intervals = parse_subtitle_intervals(&target_text);
 
-                    let alignment = calculate_optimal_alignment(&ref_intervals, &target_intervals);
-                    if alignment.applied {
-                        final_content = apply_subtitle_shift(&target_text, alignment.offset_seconds, alignment.scale_factor);
-                    }
-                    sync_res = Some(alignment);
-                }
-            }
-        }
-    }
-
-    // 3. Tier 2: Fallback to audio VAD if no reference subtitle or sync not applied
-    if sync_res.as_ref().map(|s| !s.applied).unwrap_or(true) {
-        if let Some(s_url) = stream_url {
-            let target_intervals = parse_subtitle_intervals(&target_text);
-            if let Some(&(first_s, _)) = target_intervals.first() {
-                if let Some(audio_lead) = estimate_audio_lead_time(s_url).await {
-                    let offset = (audio_lead - first_s).clamp(-30.0, 30.0);
-                    if offset.abs() > 0.3 {
-                        final_content = apply_subtitle_shift(&target_text, offset, 1.0);
-                        sync_res = Some(SyncResult {
-                            offset_seconds: (offset * 100.0).round() / 100.0,
-                            scale_factor: 1.0,
-                            score: 100,
-                            applied: true,
-                        });
+                            let alignment = calculate_optimal_alignment(&ref_intervals, &target_intervals);
+                            if alignment.applied {
+                                final_content = apply_subtitle_shift(&target_text, alignment.offset_seconds, alignment.scale_factor);
+                            }
+                            sync_res = Some(alignment);
+                        }
                     }
                 }
             }
         }
     }
 
-    // Write final synchronized file
-    if std::fs::write(&synced_path, &final_content).is_ok() {
+    // Write final validated file to cache
+    if is_valid_subtitle_content(&final_content) && std::fs::write(&synced_path, &final_content).is_ok() {
         return (synced_path.to_string_lossy().into_owned(), sync_res);
     }
 
@@ -499,5 +584,53 @@ Lain's acting funny.
         assert!(sync.applied);
         assert!((sync.offset_seconds - 2.10).abs() <= 0.15);
         assert!((sync.scale_factor - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_optimal_alignment_identity_guard_on_insync() {
+        let ref_intervals = vec![
+            (10.0, 13.0),
+            (20.0, 24.0),
+            (30.0, 33.0),
+            (40.0, 45.0),
+            (50.0, 52.0),
+        ];
+        // Target is essentially identical (minor 20ms jitter from speech boundary)
+        let target_intervals = vec![
+            (10.02, 13.01),
+            (20.01, 23.98),
+            (30.03, 33.00),
+            (40.01, 45.02),
+            (50.02, 51.99),
+        ];
+
+        let result = calculate_optimal_alignment(&ref_intervals, &target_intervals);
+        // Identity guard must activate and guarantee 0.0s offset
+        assert!(!result.applied);
+        assert_eq!(result.offset_seconds, 0.0);
+        assert_eq!(result.scale_factor, 1.0);
+    }
+
+    #[test]
+    fn test_is_valid_subtitle_content() {
+        let html_403 = "<html><head><title>403 Forbidden</title></head><body>nginx</body></html>";
+        assert!(!is_valid_subtitle_content(html_403));
+
+        let valid_vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nHello";
+        assert!(is_valid_subtitle_content(valid_vtt));
+
+        let valid_srt = "1\n00:00:01,000 --> 00:00:04,000\nHello";
+        assert!(is_valid_subtitle_content(valid_srt));
+    }
+
+    #[test]
+    fn test_decode_subtitle_bytes() {
+        // UTF-8 with BOM
+        let utf8_bom = [0xEF, 0xBB, 0xBF, b'H', b'e', b'l', b'l', b'o'];
+        assert_eq!(decode_subtitle_bytes(&utf8_bom), "Hello");
+
+        // CP1251 bytes: 0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2 = "Привет"
+        let cp1251_bytes = [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2];
+        assert_eq!(decode_subtitle_bytes(&cp1251_bytes), "Привет");
     }
 }
