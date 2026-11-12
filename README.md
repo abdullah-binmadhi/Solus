@@ -1,10 +1,10 @@
 # ❖ SOLUS
 
-**The fast, featherlight anime player with zero ads, built-in AniList sync, and no browser required.**
+**The fast, featherlight anime theatre with zero ads, built-in AniList sync, TV casting, mobile remote, and no browser required.**
 
 https://github.com/user-attachments/assets/7f520a34-a56e-4465-b31e-c7046d798322
 
-`Solus` is an anime theatre that lives directly inside your terminal. You get crisp cover art, real episode thumbnails, multiple subtitle languages, and full AniList integration—all without opening a single browser tab, installing three ad-blockers, or fighting pop-up windows just to click Play.
+`Solus` is an anime theatre that lives directly inside your terminal. You get crisp cover art, real episode thumbnails, cinema-grade typography presets, local phone remote companion, direct Smart TV casting, and full AniList integration—all without opening a single browser tab, installing three ad-blockers, or fighting pop-up windows just to click Play.
 
 ```text
 ╔════════════════════════════════════════════════════════════════════════════════════════╗
@@ -41,12 +41,16 @@ Watching anime on the web usually means choosing between a bloated streaming sit
 **Solus fixes all of that by skipping the browser entirely:**
 
 - **No Ads. No Pop-ups. No Ad-Blocker Required.** — When you press `Enter` on an episode, it opens cleanly in your media player (`mpv`, `iina`, or `vlc`). No banners, no redirects, no nonsense.
-- **Lighter Than a Single Browser Tab** — While Chrome turns your laptop fans into a jet engine, Solus uses a tiny fraction of your RAM and launches in a blink.
-- **Faster & Safer Than Anime Websites** — Everything runs locally on your machine. You browse at keyboard speed without loading heavy web trackers or shady scripts.
+- **Split-Deck Fuzzy Feature Command Hub (`s`)** — An omni-searchable control palette inspired by Raycast and Neovim Telescope. Search any feature, typography style, or setting in real time with Skim fuzzy matching, preview details on the live inspector card, and trigger actions with `Enter`—no need to memorize cryptic hotkeys.
+- **Cinema-Grade Subtitles & Signage Collision Guard** — Four hand-tuned typography presets (`Studio Minimal`, `Netflix Clean`, `Anime Fansub`, `OLED Plate`) with custom stroke outlines, drop shadows, and pill backdrops. Dialogue that collides with translated Japanese signs is automatically lifted upward in real time so you never miss a beat.
+- **Zero-Setup Local LAN Mobile Remote Companion (`m`)** — Scan an in-terminal ASCII QR code from your smartphone to launch an embedded OLED touch remote on your local Wi-Fi. Scrub through episodes, play/pause, adjust volume, skip intro/outro, and switch sub/dub right from your couch.
+- **Native AirPlay & Smart TV Direct Streamer (`c`)** — Scan your local Wi-Fi for Apple TV, LG webOS, Samsung Tizen, and Sony Bravia TVs. Beam decrypted 1080p/4K master streams directly to television hardware decoders with a full-screen TV Command Deck.
+- **Real-Time Anime4K Upscaling & Adaptive Ambilight** — Direct GPU GLSL shader upscaling reconstructs crisp line-art in real time, while cover-adaptive Ambilight extracts vibrant color histograms from anime posters to softly tint terminal borders.
 - **Watch in Your Language** — Flip between `SUB` and `DUB` with one key (`d`), or press `o` to choose your video quality (`1080p`, `720p`, `480p`) and subtitle language—including **English, Arabic, Spanish, French, German, Russian, Portuguese, Italian**, and more.
-- **Seamless AniList Compatibility** — Connect your AniList account by username or drop in your saved JSON backup file (`s` → `i`). Your **Continue Watching** and **Watchlist** stay in sync, and when you remove a show you dropped (`x`), it stays gone.
-- **Discovery That Actually Knows Your Taste (`t`)** — Tired of scrolling for an hour? Take a quick multi-choice taste quiz, press `f` to narrow down the exact vibe you want, and type in an anime you already love (like *Death Note* or *Monster*). Solus finds something special instead of handing you the same generic top-10 list.
-- **Every Episode Looks & Reads Like a Feature** — Each episode comes with its own widescreen preview thumbnail and a full, spoiler-free synopsis written to match the show's genre—witty and chaotic for comedies, dark and gloomy for thrillers.
+- **Seamless AniList Compatibility** — Connect your AniList account by username or drop in your saved JSON backup file (`s` → AniList). Your **Continue Watching** and **Watchlist** stay in sync, and dropped shows stay gone.
+- **Fluid Background Auto-Updater (`u`)** — Zero-lag startup update checks throttled with a 4-hour SQLite cache, atomic in-place binary swapping, and multi-architecture binary distribution.
+- **Discovery That Actually Knows Your Taste (`w`)** — Tired of scrolling for an hour? Take an interactive taste quiz, press `f` to narrow down the exact vibe you want, and search by an anime you already love (*Death Note*, *Monster*, *Steins;Gate*). Solus curates personalized gems instead of generic top-10 lists.
+- **Anime Wrapped & Viewing Telemetry (`a`)** — Press `a` to view your total watch time, completed episodes, favorite studio affinity radar, and seasonal pacing graphs rendered in high-density Braille charts.
 
 ---
 
@@ -155,58 +159,114 @@ solus
 | `Enter` | Open the **Detail & Episode Inspector** screen for the highlighted anime |
 | `r` | Immediately resume the next unwatched episode of the highlighted anime |
 | `x` / `d` / `Del` | Remove highlighted anime from *Continue Watching* or *Watchlist* |
-| `t` | Open **For You // Tailored** (interactive recommendation engine) |
-| `/` | Open instant search |
-| `s` | Open **Settings & AniList Sync / Backup Importer** |
-| `!` | Check player & streaming setup |
-| `?` | Open keyboard shortcuts help |
+| `w` | Open **For You // Tailored** (interactive recommendation engine) |
+| `a` | Open **Anime Wrapped & Taste Analytics** (watch time, genres, telemetry) |
+| `m` / `M` | Display **Mobile Touch Remote ASCII QR Code Modal** |
+| `s` | Open **Split-Deck Fuzzy Feature Command Hub** |
+| `/` | Open instant fuzzy title search |
+| `!` | Open Dependency Health Doctor (validates mpv, ani-cli, ffmpeg) |
+| `u` | Check for Solus releases in the background |
+| `U` | Trigger immediate auto-update and restart |
 | `Shift+R` | Refresh Home rows from AniList |
+| `?` | Open keyboard shortcuts help modal |
 | `q` / `Esc` | Quit Solus |
 
 ### Detail Screen & Split-Deck Episode Inspector
 | Key | Action |
 | :--- | :--- |
-| `h` / `l` or `↑` / `↓` | Navigate across episodes |
-| `v` | Switch between **Split-Deck View** (default) and **Horizontal List View** |
-| `Enter` | Play the selected episode |
+| `j` / `k` or `↑` / `↓` | Navigate across episode entries |
+| `Enter` / `Space` | Play the selected episode |
+| `Tab` / `p` | Toggle streaming provider between **ani-cli** and **AllAnime** |
+| `c` / `C` | Open **AirPlay / DLNA TV Device Picker** to beam episode to Smart TV |
+| `m` / `M` | Display **Mobile Touch Remote ASCII QR Code Modal** |
+| `v` | Switch between **Split-Deck Inspector** (default) and **Horizontal List View** |
 | `o` | Open **Stream & Subtitle Options** (`1080p`/`720p` + subtitle languages) |
 | `w` | Mark the selected episode watched / unwatched |
 | `+` | Add or remove the anime from your **Watchlist** |
 | `n` | Play the next unwatched episode immediately |
 | `d` | Switch audio between `SUB` and `DUB` |
-| `m` | Manually adjust the stream search title if a show has an alternate name |
-| `Tab` | Switch focus between *Top Buttons*, *Episodes*, and *More Like This* |
-| `Esc` / `q` | Back to Home |
+| `s` | Open **Split-Deck Fuzzy Feature Command Hub** |
+| `Esc` / `q` | Return to Home screen |
 
-### Tailored Discovery (`t`)
+### Split-Deck Feature Command Hub (`s`)
+| Key | Action |
+| :--- | :--- |
+| `Any typing` | Filter features, presets, and actions in real time using fuzzy scoring |
+| `j` / `k` or `↑` / `↓` | Move selection pointer across filtered commands |
+| `Ctrl+n` / `Ctrl+p` | Next / previous command item |
+| `Enter` | Trigger the highlighted action (cycle preset, toggle option, launch modal, check updates) |
+| `h` / `l` or `←` / `→` | Cycle option forward / backward on cycling rows |
+| `Backspace` | Delete query characters |
+| `Esc` | Clear query or exit Hub back to previous screen |
+
+### Smart TV Command Deck (`c`)
+| Key | Action |
+| :--- | :--- |
+| `Space` | Toggle TV playback (Play / Pause) |
+| `h` / `l` or `←` / `→` | Seek ±10 seconds on the television |
+| `q` / `Esc` | Stop casting and return to Detail screen |
+
+### Tailored Discovery (`w`)
 | Key | Action |
 | :--- | :--- |
 | `j` / `k` or `↑` / `↓` | Move through quiz choices or recommended anime |
 | `Space` | Select multiple answers during the **6-Question Refinement (`f`)** |
 | `Enter` | Confirm your choices / open the selected anime |
-| `f` | Refine your results with 6 deeper questions + **Example Anime Search** |
+| `f` | Refine results with deeper mood questions + **Anchor Anime Search** |
 | `r` | Retake the taste quiz from the start |
-| `Esc` | Back |
+| `Esc` | Back to Home |
 
 ---
 
 ## ⬡ Configuration
 
-Solus creates its config file automatically on your first launch:
-
-- **macOS**: `~/Library/Application Support/solus/config.toml`
-- **Linux**: `~/.config/solus/config.toml`
-- **Windows**: `%APPDATA%\solus\config.toml`
+Solus creates and synchronizes its configuration automatically at `~/.config/solus/config.toml` (with cross-platform fallbacks for macOS Application Support and Windows AppData):
 
 ```toml
-quality          = "best"      # best | 1080p | 720p | 480p | 360p
-audio_mode       = "sub"       # sub | dub
-player           = "mpv"       # mpv | iina | vlc
-anilist_username = ""          # Optional: public AniList username for automatic sync
+# Solus Theatre Configuration (~/.config/solus/config.toml)
+player            = "mpv"       # mpv | iina | vlc
+quality           = "best"      # best | 1080p | 720p | 480p | 360p
+audio_mode        = "sub"       # sub | dub
+anilist_username  = ""          # Optional: AniList public username for auto-sync
+anime4k_mode      = "off"       # off | balanced | ultra
+ambilight_enabled = true        # Cover-adaptive RGB terminal border glow
+auto_skip_intro   = true        # Automated AniSkip OP/ED jumping
+
+[subtitle_style]
+preset              = "studio_minimal" # studio_minimal | netflix_clean | anime_fansub | oled_plate | custom
+collision_avoidance = true             # Real-time dialogue lifting over translated signage
+
+[remote]
+enabled = true                  # Background Tokio HTTP daemon on local LAN
+port    = 8484                  # Touch client accessible at http://<LAN_IP>:8484
+
+[cast]
+default_protocol = "auto"       # auto | airplay | dlna
+
+[update]
+check_on_startup = true         # Background GitHub release checker
+auto_install     = false        # Atomic binary replacement on new versions
 
 [cache]
-trending_ttl = 86400           # 24 hours
-stable_ttl   = 604800          # 7 days
+trending_ttl = 86400            # 24 hours
+stable_ttl   = 604800           # 7 days
+```
+
+---
+
+## ❖ Architecture & Ecosystem
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                          ❖ SOLUS RUNTIME CORE                          │
+├───────────────────┬─────────────────────┬──────────────────────────────┤
+│  Terminal View    │  Playback & Media   │  Network & Protocols         │
+├───────────────────┼─────────────────────┼──────────────────────────────┤
+│ Ratatui TUI Deck  │ mpv IPC Unix Socket │ AniList GraphQL Client       │
+│ Sixels/Kitty Img  │ Direct HLS Streamer │ Local LAN Remote (Tokio 8484)│
+│ Fuzzy Skim Hub    │ Subtitle Styler/ASS │ AirPlay & DLNA TV Sender     │
+│ Cover Ambilight   │ Anime4K GLSL Engine │ GitHub Release Auto-Updater  │
+└───────────────────┴─────────────────────┴──────────────────────────────┘
 ```
 
 ---
@@ -215,4 +275,4 @@ stable_ttl   = 604800          # 7 days
 
 - Licensed under the **[MIT License](LICENSE)**.
 - Metadata powered by **[AniList](https://anilist.co)**, **[ani.zip](https://api.ani.zip)**, and **[Kitsu](https://kitsu.app)**.
-- Playback powered by **[`ani-cli`](https://github.com/pystardust/ani-cli)**.
+- Playback engine powered by **[`ani-cli`](https://github.com/pystardust/ani-cli)** and **[`mpv`](https://mpv.io/)**.
