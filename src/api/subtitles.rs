@@ -367,6 +367,7 @@ pub async fn fetch_external_subtitles(
 
 /// Download and cache a remote subtitle URL to ~/.cache/solus/subs/ and return the local path.
 /// If the subtitle is already local or download fails, returns the input URL.
+#[allow(dead_code)]
 pub async fn ensure_cached_subtitle(
     client: &reqwest::Client,
     sub_url: &str,

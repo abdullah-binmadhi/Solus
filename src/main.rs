@@ -2197,8 +2197,44 @@ async fn start_playback(
             let anime_id = state.selected_anime.as_ref().map(|a| a.id).unwrap_or(0);
             let code = opts.sub_lang.as_deref().unwrap_or("sub");
             let client = reqwest::Client::new();
-            let cached_path = api::subtitles::ensure_cached_subtitle(&client, sub_u, anime_id, episode, code).await;
+
+            // Locate verified reference subtitle from the primary stream (e.g. native official English .vtt)
+            let ref_sub_url = state
+                .playback_sub_languages
+                .iter()
+                .find(|s| !s.stream_label.contains("[Auto-Synced]") && (s.url.starts_with("http://") || s.url.starts_with("https://")))
+                .map(|s| s.url.as_str())
+                .or_else(|| {
+                    state
+                        .playback_sub_languages
+                        .iter()
+                        .find(|s| s.code.starts_with("eng") && (s.url.starts_with("http://") || s.url.starts_with("https://")))
+                        .map(|s| s.url.as_str())
+                });
+
+            let stream_ref = opts.stream_url.as_deref().or(state.pending_master_url.as_deref());
+
+            let (cached_path, sync_res) = services::subsync::ensure_synchronized_subtitle(
+                &client,
+                sub_u,
+                ref_sub_url,
+                stream_ref,
+                anime_id,
+                episode,
+                code,
+            )
+            .await;
+
             opts.sub_url = Some(cached_path);
+
+            if let Some(res) = sync_res {
+                if res.applied {
+                    state.show_toast(
+                        format!("❖ Auto-Synced {} sub (offset: {:+.2}s)", code, res.offset_seconds),
+                        unix_now(),
+                    );
+                }
+            }
         }
     }
 
