@@ -97,6 +97,8 @@ enum AppMessage {
     UpdateSuccess(String),
     /// Background update failed (error message)
     UpdateFailed(String),
+    /// Remote touch companion requested switching to an episode
+    RemotePlayEpisode(u32),
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -138,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
             state.remote_state.clone(),
             "/tmp/solus-mpv.sock".to_string(),
             remote_shutdown.clone(),
+            Some(tx.clone()),
         );
     }
 
@@ -239,8 +242,11 @@ async fn main() -> anyhow::Result<()> {
                     state.player_stop = None;
                     let remote_state_done = state.remote_state.clone();
                     tokio::spawn(async move {
-                        let mut st = remote_state_done.write().await;
-                        st.is_playing = false;
+                        {
+                            let mut st = remote_state_done.write().await;
+                            st.is_playing = false;
+                        }
+                        services::remote::broadcast_state(&remote_state_done).await;
                     });
                     let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
                     if state.screen == Screen::Playback {
@@ -503,13 +509,16 @@ async fn main() -> anyhow::Result<()> {
                     let title = state.selected_anime.as_ref().map(|a| a.display_title().to_string()).unwrap_or_else(|| "Anime Stream".to_string());
                     let ep_title = state.episode_titles.get(&ep).cloned().unwrap_or_else(|| format!("Episode {}", ep));
                     tokio::spawn(async move {
-                        let mut st = remote_state_clone.write().await;
-                        st.is_playing = true;
-                        st.title = title;
-                        st.episode = ep;
-                        st.episode_title = ep_title;
-                        st.time_pos = pos;
-                        st.duration = dur;
+                        {
+                            let mut st = remote_state_clone.write().await;
+                            st.is_playing = true;
+                            st.title = title;
+                            st.episode = ep;
+                            st.episode_title = ep_title;
+                            st.time_pos = pos;
+                            st.duration = dur;
+                        }
+                        services::remote::broadcast_state(&remote_state_clone).await;
                     });
                 }
                 AppMessage::EpisodeAutoScrobbled(anime_id, ep) => {
@@ -587,6 +596,29 @@ async fn main() -> anyhow::Result<()> {
                     state.is_updating = false;
                     state.update_progress = None;
                     state.show_toast(format!("Update failed: {}", err), unix_now());
+                }
+                AppMessage::RemotePlayEpisode(ep) => {
+                    if let Some(ref anime) = state.selected_anime.clone() {
+                        state.selected_episode = Some(ep);
+                        let title = anime.display_title().to_string();
+                        let query = anime.playback_query();
+                        let glsl_shaders = services::shaders::build_shader_arg(state.anime4k_mode);
+                        let opts = api::player::PlayOptions {
+                            title: query,
+                            episode: ep,
+                            quality: cfg.quality.as_str().to_string(),
+                            dub: cfg.audio_mode == config::AudioMode::Dub,
+                            player: cfg.player.as_str().to_string(),
+                            sub_lang: None,
+                            sub_url: None,
+                            stream_url: None,
+                            ipc_socket: None,
+                            start_pos: None,
+                            glsl_shaders,
+                            sub_style: Some(cfg.subtitle_style.clone()),
+                        };
+                        start_playback(&mut state, opts, title, ep, &tx, &pool, &cfg).await;
+                    }
                 }
             }
         }
@@ -3073,12 +3105,52 @@ async fn start_playback(
     let r_title = title.clone();
     let r_ep = episode;
     let r_ep_title = state.episode_titles.get(&episode).cloned().unwrap_or_else(|| format!("Episode {}", episode));
+    let r_poster = state.selected_anime.as_ref().and_then(|a| a.cover_url.clone());
+    let r_total_eps = state.selected_anime.as_ref().and_then(|a| a.episodes).unwrap_or(24);
+    let mut ep_items = Vec::new();
+    for e in 1..=r_total_eps {
+        let e_num = e as u32;
+        let e_t = state.episode_titles.get(&e_num).cloned().unwrap_or_else(|| format!("Episode {}", e_num));
+        let is_w = state.watched_episodes.contains(&e_num);
+        ep_items.push(services::remote::RemoteEpisodeItem {
+            ep: e_num,
+            title: e_t,
+            is_watched: is_w,
+            is_current: e_num == episode,
+        });
+    }
+    let r_subs: Vec<services::remote::RemoteSubtitleTrack> = state
+        .playback_sub_languages
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| services::remote::RemoteSubtitleTrack {
+            id: (idx + 1) as u32,
+            code: s.code.clone(),
+            label: s.name.clone(),
+            is_active: idx == state.playback_sub_cursor,
+        })
+        .collect();
+    let r_sub_preset = cfg.subtitle_style.preset.label().to_string();
+    let r_anime4k = cfg.anime4k_mode.as_str().to_string();
+    let r_audio_mode = if opts.dub { "dub".to_string() } else { "sub".to_string() };
+
     tokio::spawn(async move {
-        let mut st = remote_state_init.write().await;
-        st.is_playing = true;
-        st.title = r_title;
-        st.episode = r_ep;
-        st.episode_title = r_ep_title;
+        {
+            let mut st = remote_state_init.write().await;
+            st.is_playing = true;
+            st.title = r_title;
+            st.episode = r_ep;
+            st.episode_title = r_ep_title;
+            st.poster_url = r_poster;
+            st.episodes = ep_items;
+            if !r_subs.is_empty() {
+                st.subtitles = r_subs;
+            }
+            st.sub_preset = r_sub_preset;
+            st.anime4k = r_anime4k;
+            st.audio_mode = r_audio_mode;
+        }
+        services::remote::broadcast_state(&remote_state_init).await;
     });
 
     // 4. Subtitle auto-sync
