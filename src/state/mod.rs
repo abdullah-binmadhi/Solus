@@ -33,6 +33,8 @@ pub enum Screen {
     TailoredSummary,
     /// Tailored Algorithm: Scored anime results shelf
     TailoredResults,
+    /// Personal Anime Wrapped & Taste Analytics Dashboard
+    TasteAnalytics,
 }
 
 /// Which category row the cursor is on (Home screen).
@@ -383,6 +385,18 @@ pub struct AppState {
 
     /// Cached MyAnimeList ID mapping for AniSkip lookup
     pub anime_mal_ids: HashMap<i64, i64>,
+
+    /// Dynamically extracted cover-adaptive ambilight theme palette for the active anime
+    pub ambilight_theme: Option<crate::ui::theme::ThemePalette>,
+
+    /// Whether the dynamic cover-adaptive ambilight theme is enabled
+    pub ambilight_enabled: bool,
+
+    /// Real-time Anime4K GLSL shader mode (Off, Balanced 2x, Ultra 4K)
+    pub anime4k_mode: crate::config::Anime4KMode,
+
+    /// Personal Anime Wrapped & viewing telemetry data
+    pub analytics_data: Option<crate::db::user::UserAnalytics>,
 }
 
 impl AppState {
@@ -497,11 +511,35 @@ impl AppState {
             download_range_input: String::new(),
             active_download:  None,
             anime_mal_ids:    HashMap::new(),
+            ambilight_theme:  None,
+            ambilight_enabled: true,
+            anime4k_mode:     crate::config::Anime4KMode::Off,
+            analytics_data:   None,
         }
     }
 
-    pub fn theme(&self) -> &'static crate::ui::theme::ThemePalette {
-        crate::ui::theme::get_theme(self.theme_index)
+    pub fn theme(&self) -> crate::ui::theme::ThemePalette {
+        if self.ambilight_enabled && self.screen == Screen::Detail {
+            if let Some(amb) = self.ambilight_theme {
+                return amb;
+            }
+        }
+        *crate::ui::theme::get_theme(self.theme_index)
+    }
+
+    /// Toggle Anime4K upscaling preset: Off -> Balanced 2x -> Ultra 4K -> Off
+    pub fn toggle_anime4k(&mut self) {
+        self.anime4k_mode = match self.anime4k_mode {
+            crate::config::Anime4KMode::Off => crate::config::Anime4KMode::Balanced,
+            crate::config::Anime4KMode::Balanced => crate::config::Anime4KMode::Ultra,
+            crate::config::Anime4KMode::Ultra => crate::config::Anime4KMode::Off,
+        };
+    }
+
+    /// Open Personal Anime Wrapped & Taste Analytics Dashboard
+    pub fn open_taste_analytics(&mut self) {
+        self.overlay_base = self.screen.clone();
+        self.screen = Screen::TasteAnalytics;
     }
 
     /// Show a toast notification (auto-dismissed after 4 seconds).
@@ -552,7 +590,7 @@ impl AppState {
                     Screen::Home
                 }
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard => {
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics => {
                 self.overlay_base.clone()
             }
             Screen::TailoredSummary => {
@@ -853,7 +891,7 @@ impl AppState {
             Screen::Detail | Screen::Playback | Screen::PlaybackQuery | Screen::PlaybackOptions => {
                 Screen::Detail
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults => self.overlay_base.clone(),
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults | Screen::TasteAnalytics => self.overlay_base.clone(),
             Screen::Home => Screen::Home,
         }
     }

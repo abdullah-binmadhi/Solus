@@ -77,6 +77,21 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                 },
                 Style::default().fg(if state.dub_available == Some(false) { Color::Rgb(220, 120, 80) } else { Color::Rgb(120, 120, 135) }),
             ),
+            Span::raw("   "),
+            Span::styled(" Anime4K: ", Style::default().fg(Color::Rgb(160, 160, 175))),
+            Span::styled(
+                format!(" {} ", state.anime4k_mode.as_str()),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(match state.anime4k_mode {
+                        crate::config::Anime4KMode::Off => Color::Rgb(50, 50, 65),
+                        crate::config::Anime4KMode::Balanced => Color::Rgb(40, 120, 180),
+                        crate::config::Anime4KMode::Ultra => Color::Rgb(180, 0, 255),
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled("([u] toggle)", Style::default().fg(Color::Rgb(120, 120, 135))),
         ]),
     ])
     .block(
@@ -321,6 +336,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         Span::raw(" Select  "),
         Span::styled(" a ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
         Span::raw(" Audio  "),
+        Span::styled(" u ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        Span::raw(" Anime4K  "),
         Span::styled(" Esc/q ", Style::default().fg(Color::White).bg(Color::Rgb(50, 50, 65))),
         Span::raw(" Back"),
     ]))

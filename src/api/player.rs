@@ -32,6 +32,8 @@ pub struct PlayOptions {
     pub ipc_socket: Option<String>,
     /// Playback start position in seconds (for exact resume)
     pub start_pos:  Option<f64>,
+    /// Optional Anime4K GLSL shaders argument string (colon-separated)
+    pub glsl_shaders: Option<String>,
 }
 
 /// Build the ani-cli command arguments for a given play request.
@@ -263,6 +265,14 @@ if [ -n "$SOLUS_START_POS" ]; then
     fi
 fi
 
+if [ -n "$SOLUS_SHADERS" ]; then
+    if [ "$is_iina" -eq 1 ]; then
+        args+=("--mpv-glsl-shaders=$SOLUS_SHADERS")
+    elif [ "$is_vlc" -eq 0 ]; then
+        args+=("--glsl-shaders=$SOLUS_SHADERS")
+    fi
+fi
+
 if [ -n "$video_link" ]; then
     args+=("$video_link")
 fi
@@ -345,6 +355,15 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 cmd.arg(format!("--start={}", pos));
             }
 
+            if let Some(ref shaders) = opts.glsl_shaders {
+                cmd.env("SOLUS_SHADERS", shaders);
+                if player.contains("iina") {
+                    cmd.arg(format!("--mpv-glsl-shaders={}", shaders));
+                } else if !player.contains("vlc") {
+                    cmd.arg(format!("--glsl-shaders={}", shaders));
+                }
+            }
+
             cmd.arg(direct_url);
 
             return cmd
@@ -416,6 +435,15 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
         }
     }
 
+    if let Some(ref shaders) = opts.glsl_shaders {
+        cmd.env("SOLUS_SHADERS", shaders);
+        if player.contains("iina") {
+            player_flags.push(format!("--mpv-glsl-shaders={}", shaders));
+        } else if !player.contains("vlc") {
+            player_flags.push(format!("--glsl-shaders={}", shaders));
+        }
+    }
+
     if let Some(ref url) = opts.sub_url {
         if !url.is_empty() {
             if player.contains("iina") {
@@ -463,6 +491,7 @@ mod tests {
             stream_url: None,
             ipc_socket: None,
             start_pos:  None,
+            glsl_shaders: None,
         }
     }
 
@@ -522,6 +551,7 @@ mod tests {
             stream_url: None,
             ipc_socket: None,
             start_pos:  None,
+            glsl_shaders: None,
         });
         assert_eq!(
             args,
@@ -553,6 +583,7 @@ mod tests {
             stream_url: None,
             ipc_socket: None,
             start_pos:  None,
+            glsl_shaders: None,
         });
         assert_eq!(
             args,

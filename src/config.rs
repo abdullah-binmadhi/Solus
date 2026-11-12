@@ -95,6 +95,34 @@ fn default_auto_skip_intro() -> bool {
     true
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Real-time Anime4K GLSL shader upscaling mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Anime4KMode {
+    #[default]
+    Off,
+    Balanced,
+    Ultra,
+}
+
+impl Anime4KMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Anime4KMode::Off => "off",
+            Anime4KMode::Balanced => "balanced 2x",
+            Anime4KMode::Ultra => "ultra 4k",
+        }
+    }
+}
+
+fn default_anime4k() -> Anime4KMode {
+    Anime4KMode::Off
+}
+
 /// Root config struct — persisted to ~/.config/ani-tui/config.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -105,6 +133,10 @@ pub struct Config {
     pub default_sub_lang: String,
     #[serde(default = "default_auto_skip_intro")]
     pub auto_skip_intro:  bool,
+    #[serde(default = "default_anime4k")]
+    pub anime4k_mode:     Anime4KMode,
+    #[serde(default = "default_true")]
+    pub ambilight_enabled: bool,
     pub cache:            CacheConfig,
 }
 
@@ -116,6 +148,8 @@ impl Default for Config {
             player:           Player::default(),
             default_sub_lang: default_sub_lang_val(),
             auto_skip_intro:  default_auto_skip_intro(),
+            anime4k_mode:     default_anime4k(),
+            ambilight_enabled: default_true(),
             cache:            CacheConfig::default(),
         }
     }
@@ -264,6 +298,8 @@ mod tests {
             player:           Player::Iina,
             default_sub_lang: "Arabic".to_string(),
             auto_skip_intro:  true,
+            anime4k_mode:     Anime4KMode::Balanced,
+            ambilight_enabled: true,
             cache:            CacheConfig::default(),
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
@@ -273,6 +309,8 @@ mod tests {
         assert_eq!(deserialized.audio_mode,       AudioMode::Dub);
         assert_eq!(deserialized.player,           Player::Iina);
         assert_eq!(deserialized.default_sub_lang, "Arabic");
+        assert_eq!(deserialized.anime4k_mode,     Anime4KMode::Balanced);
+        assert!(deserialized.ambilight_enabled);
     }
 
     #[test]
@@ -286,6 +324,8 @@ mod tests {
             player:           Player::Mpv,
             default_sub_lang: "English".to_string(),
             auto_skip_intro:  true,
+            anime4k_mode:     Anime4KMode::Off,
+            ambilight_enabled: false,
             cache:            CacheConfig::default(),
         };
 

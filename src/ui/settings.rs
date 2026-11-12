@@ -14,6 +14,8 @@ const PLAYER_CHOICES: [&str; 3] = ["mpv", "iina", "vlc"];
 const QUALITY_CHOICES: [&str; 5] = ["best", "1080p", "720p", "480p", "360p"];
 const AUDIO_CHOICES: [&str; 2] = ["sub", "dub"];
 const SKIP_CHOICES: [&str; 2] = ["enabled", "disabled"];
+const ANIME4K_CHOICES: [&str; 3] = ["off", "balanced 2x", "ultra 4k"];
+const AMBILIGHT_CHOICES: [&str; 2] = ["enabled", "disabled"];
 pub const SUBTITLE_CHOICES: [&str; 11] = [
     "English",
     "Arabic",
@@ -29,7 +31,7 @@ pub const SUBTITLE_CHOICES: [&str; 11] = [
 ];
 
 pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config) {
-    let area = centered_rect(66, 74, frame.area());
+    let area = centered_rect(68, 86, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -48,6 +50,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -76,6 +80,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
     render_setting_row(rows[3], "Audio", &AUDIO_CHOICES, audio_index(&cfg.audio_mode), state.settings_cursor == 2, frame);
     render_setting_row(rows[4], "Subtitle", &SUBTITLE_CHOICES, sub_index(&cfg.default_sub_lang), state.settings_cursor == 3, frame);
     render_setting_row(rows[5], "Auto-Skip", &SKIP_CHOICES, if cfg.auto_skip_intro { 0 } else { 1 }, state.settings_cursor == 4, frame);
+    render_setting_row(rows[6], "Anime4K", &ANIME4K_CHOICES, anime4k_index(&cfg.anime4k_mode), state.settings_cursor == 5, frame);
+    render_setting_row(rows[7], "Ambilight", &AMBILIGHT_CHOICES, if cfg.ambilight_enabled { 0 } else { 1 }, state.settings_cursor == 6, frame);
 
     let preferred_ready = match cfg.player {
         config::Player::Mpv => state.has_mpv || state.has_iina,
@@ -186,6 +192,14 @@ fn audio_index(audio: &config::AudioMode) -> usize {
     match audio {
         config::AudioMode::Sub => 0,
         config::AudioMode::Dub => 1,
+    }
+}
+
+fn anime4k_index(mode: &config::Anime4KMode) -> usize {
+    match mode {
+        config::Anime4KMode::Off => 0,
+        config::Anime4KMode::Balanced => 1,
+        config::Anime4KMode::Ultra => 2,
     }
 }
 

@@ -87,6 +87,8 @@ enum AppMessage {
     DownloadFailed(i64, u32, String),
     /// MyAnimeList ID resolved for an anime (anime_id, mal_id)
     AnimeMalIdReady(i64, i64),
+    /// Viewing telemetry and taste analytics loaded from local SQLite
+    AnalyticsDataReady(db::user::UserAnalytics),
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -112,6 +114,8 @@ async fn main() -> anyhow::Result<()> {
 
     // ── App state ─────────────────────────────────────────────────────────────
     let mut state     = AppState::new();
+    state.anime4k_mode = cfg.anime4k_mode;
+    state.ambilight_enabled = cfg.ambilight_enabled;
     let mut home_data = ui::home::HomeData::empty();
     refresh_dependency_status(&mut state);
     if !state.has_ani_cli || !state.has_any_player() {
@@ -207,6 +211,8 @@ async fn main() -> anyhow::Result<()> {
                         state.detail_cache.insert(anime_id, proto3);
                     }
                     if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
+                        let base_theme = ui::theme::get_theme(state.theme_index);
+                        state.ambilight_theme = Some(ui::theme::extract_ambilight_palette(&card_img, base_theme));
                         if state.current_card_img.is_none() {
                             state.current_card_img = Some(card_img);
                             state.episode_fallback_thumbnails.clear();
@@ -471,6 +477,9 @@ async fn main() -> anyhow::Result<()> {
                 AppMessage::AnimeMalIdReady(anime_id, mal_id) => {
                     state.anime_mal_ids.insert(anime_id, mal_id);
                 }
+                AppMessage::AnalyticsDataReady(analytics) => {
+                    state.analytics_data = Some(analytics);
+                }
             }
         }
 
@@ -532,6 +541,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Screen::TailoredResults => {
                         ui::tailored::render_tailored_results(frame, &mut state);
+                    }
+                    Screen::TasteAnalytics => {
+                        render_base_screen(frame, &mut state, &home_data, &base_screen);
+                        ui::analytics::render(frame, &state);
                     }
                 }
                 // Toast notification renders on top of everything
@@ -597,6 +610,7 @@ async fn handle_key(
         Screen::TailoredWizard => handle_tailored_wizard(key, state),
         Screen::TailoredSummary => handle_tailored_summary(key, state, pool, tx).await,
         Screen::TailoredResults => handle_tailored_results(key, state, pool, cfg, tx).await,
+        Screen::TasteAnalytics => handle_analytics(key, state, pool, tx).await,
     }
 }
 
@@ -656,7 +670,10 @@ async fn handle_home(
         KeyCode::Char('/') => state.open_search(),
         KeyCode::Char('?') => state.open_help(),
         KeyCode::Char('s') => state.open_settings(),
-        KeyCode::Char('a') | KeyCode::Char('L') => state.open_login(),
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            trigger_analytics_fetch(state, pool.clone(), tx.clone());
+        }
+        KeyCode::Char('L') => state.open_login(),
         KeyCode::Char('t') | KeyCode::Char('T') => {
             state.theme_index = (state.theme_index + 1) % ui::theme::THEMES.len();
             let theme_name = state.theme().name;
@@ -874,6 +891,8 @@ async fn open_detail_from_anime(
                 let proto_portrait = picker.new_resize_protocol(portrait_img);
                 state.detail_cache.insert(anime_id, proto_portrait);
             }
+            let base_theme = ui::theme::get_theme(state.theme_index);
+            state.ambilight_theme = Some(ui::theme::extract_ambilight_palette(&card_img, base_theme));
             state.current_card_img = Some(card_img);
         }
     }
@@ -1606,6 +1625,10 @@ async fn handle_playback_options(
                 trigger_stream_detection(anime, ep, state.pending_dub, tx);
             }
         }
+        KeyCode::Char('u') | KeyCode::Char('U') => {
+            state.toggle_anime4k();
+            state.show_toast(format!("Anime4K: {}", state.anime4k_mode.as_str()), unix_now());
+        }
         KeyCode::Enter => {
             if let Some(anime) = state.selected_anime.clone() {
                 let ep    = state.selected_episode.unwrap_or(1);
@@ -1656,6 +1679,7 @@ async fn handle_playback_options(
                     }
                 }
 
+                let glsl_shaders = services::shaders::build_shader_arg(state.anime4k_mode);
                 let opts = api::player::PlayOptions {
                     title:   query,
                     episode: ep,
@@ -1667,6 +1691,7 @@ async fn handle_playback_options(
                     stream_url,
                     ipc_socket: None,
                     start_pos:  None,
+                    glsl_shaders,
                 };
                 start_playback(state, opts, title, ep, tx, pool, cfg).await;
             }
@@ -1759,7 +1784,7 @@ async fn handle_settings(
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => state.go_back(),
         KeyCode::Char('j') | KeyCode::Down => {
-            state.settings_cursor = (state.settings_cursor + 1).min(4);
+            state.settings_cursor = (state.settings_cursor + 1).min(6);
         }
         KeyCode::Char('k') | KeyCode::Up => {
             state.settings_cursor = state.settings_cursor.saturating_sub(1);
@@ -1767,6 +1792,8 @@ async fn handle_settings(
         KeyCode::Char('h') | KeyCode::Left => {
             if apply_settings_delta(cfg, state.settings_cursor, -1).is_ok() {
                 let _ = cfg.save();
+                state.anime4k_mode = cfg.anime4k_mode;
+                state.ambilight_enabled = cfg.ambilight_enabled;
                 state.show_toast("Settings saved", unix_now());
             }
             refresh_dependency_status(state);
@@ -1774,6 +1801,8 @@ async fn handle_settings(
         KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
             if apply_settings_delta(cfg, state.settings_cursor, 1).is_ok() {
                 let _ = cfg.save();
+                state.anime4k_mode = cfg.anime4k_mode;
+                state.ambilight_enabled = cfg.ambilight_enabled;
                 state.show_toast("Settings saved", unix_now());
             }
             refresh_dependency_status(state);
@@ -2021,9 +2050,55 @@ fn apply_settings_delta(
         4 => {
             cfg.auto_skip_intro = !cfg.auto_skip_intro;
         }
+        5 => {
+            let values = [
+                config::Anime4KMode::Off,
+                config::Anime4KMode::Balanced,
+                config::Anime4KMode::Ultra,
+            ];
+            let current = values.iter().position(|v| v == &cfg.anime4k_mode).unwrap_or(0) as i32;
+            let next = (current + delta).rem_euclid(values.len() as i32) as usize;
+            cfg.anime4k_mode = values[next];
+        }
+        6 => {
+            cfg.ambilight_enabled = !cfg.ambilight_enabled;
+        }
         _ => {}
     }
     Ok(())
+}
+
+// ── Anime Wrapped & Analytics screen ──────────────────────────────────────────
+
+async fn handle_analytics(
+    key:   event::KeyEvent,
+    state: &mut AppState,
+    pool:  &sqlx::SqlitePool,
+    tx:    &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('a') | KeyCode::Char('A') => {
+            state.go_back();
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            state.show_toast("Refreshing viewing telemetry...", unix_now());
+            trigger_analytics_fetch(state, pool.clone(), tx.clone());
+        }
+        _ => {}
+    }
+}
+
+fn trigger_analytics_fetch(
+    state: &mut AppState,
+    pool: sqlx::SqlitePool,
+    tx: tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    state.open_taste_analytics();
+    tokio::spawn(async move {
+        if let Ok(data) = db::user::compute_user_analytics(&pool).await {
+            let _ = tx.send(AppMessage::AnalyticsDataReady(data)).await;
+        }
+    });
 }
 
 // ── Playback screen ───────────────────────────────────────────────────────────

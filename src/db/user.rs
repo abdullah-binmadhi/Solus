@@ -2,7 +2,7 @@
 
 use crate::config::AudioMode;
 use crate::error::Result;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use std::collections::{HashMap, HashSet};
 
 /// A single history entry: which episode of which show was watched.
@@ -525,6 +525,224 @@ pub async fn delete_offline_episode(
     Ok(())
 }
 
+// ─── Analytics / Personal Anime Wrapped ───────────────────────────────────────
+
+/// Aggregated telemetry and taste metrics for the user's viewing history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserAnalytics {
+    pub total_episodes_watched: usize,
+    pub total_hours_watched: f64,
+    pub completed_shows: usize,
+    pub in_progress_shows: usize,
+    pub completion_rate: f64,
+    pub avg_score: f64,
+    pub top_genres: Vec<(String, usize, f64)>, // (genre, count, percentage)
+    pub era_distribution: Vec<(&'static str, usize, f64)>, // (era, count, percentage)
+    pub format_distribution: Vec<(String, usize)>,
+    pub recent_activity: Vec<u64>, // last 14 days activity counts
+    pub taste_archetype: &'static str,
+}
+
+/// Query local SQLite watch history and anime metadata to generate personalized analytics.
+pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // 1. Total distinct episodes watched
+    let total_episodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM history")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+    // 2. Total duration in seconds: exact position sum from playback_progress
+    // plus estimated 24 mins (1440s) for watched episodes without progress rows
+    let tracked_seconds: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(position_secs), 0.0) FROM playback_progress"
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0.0);
+
+    let tracked_episodes_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM playback_progress"
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    let untracked_episodes = (total_episodes - tracked_episodes_count).max(0);
+    let total_seconds = tracked_seconds + (untracked_episodes as f64 * 24.0 * 60.0);
+    let total_hours = total_seconds / 3600.0;
+
+    // 3. Watched anime statistics (genres, eras, formats, scores)
+    let rows = sqlx::query(
+        "SELECT a.id, a.genres, a.season_year, a.format, a.score, a.episodes,
+                COUNT(h.episode) as watched_count
+         FROM history h
+         JOIN anime a ON h.anime_id = a.id
+         GROUP BY a.id"
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut completed_shows = 0usize;
+    let mut in_progress_shows = 0usize;
+    let mut total_score = 0.0f64;
+    let mut scored_count = 0usize;
+
+    let mut genre_counts: HashMap<String, usize> = HashMap::new();
+    let mut total_genre_tags = 0usize;
+
+    let mut pre_2000 = 0usize;
+    let mut era_2000s = 0usize;
+    let mut era_2010s = 0usize;
+    let mut era_2020s = 0usize;
+    let mut total_dated_shows = 0usize;
+
+    let mut format_counts: HashMap<String, usize> = HashMap::new();
+
+    for row in &rows {
+        let watched: i64 = row.try_get("watched_count").unwrap_or(0);
+        let ep_opt: Option<i64> = row.try_get("episodes").unwrap_or(None);
+        let score_opt: Option<i64> = row.try_get("score").unwrap_or(None);
+        let year_opt: Option<i64> = row.try_get("season_year").unwrap_or(None);
+        let format_opt: Option<String> = row.try_get("format").unwrap_or(None);
+        let genres_raw: String = row.try_get("genres").unwrap_or_else(|_| "[]".to_string());
+
+        if let Some(total_eps) = ep_opt {
+            if total_eps > 0 && watched >= total_eps {
+                completed_shows += 1;
+            } else {
+                in_progress_shows += 1;
+            }
+        } else if watched > 0 {
+            in_progress_shows += 1;
+        }
+
+        if let Some(score) = score_opt {
+            if score > 0 {
+                total_score += score as f64;
+                scored_count += 1;
+            }
+        }
+
+        if let Some(year) = year_opt {
+            total_dated_shows += 1;
+            if year < 2000 {
+                pre_2000 += 1;
+            } else if year < 2010 {
+                era_2000s += 1;
+            } else if year < 2020 {
+                era_2010s += 1;
+            } else {
+                era_2020s += 1;
+            }
+        }
+
+        let fmt = format_opt.unwrap_or_else(|| "TV".to_string());
+        *format_counts.entry(fmt).or_insert(0) += 1;
+
+        if let Ok(genres) = serde_json::from_str::<Vec<String>>(&genres_raw) {
+            for g in genres {
+                *genre_counts.entry(g).or_insert(0) += 1;
+                total_genre_tags += 1;
+            }
+        }
+    }
+
+    let total_shows = completed_shows + in_progress_shows;
+    let completion_rate = if total_shows > 0 {
+        (completed_shows as f64 / total_shows as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let avg_score = if scored_count > 0 {
+        total_score / scored_count as f64
+    } else {
+        0.0
+    };
+
+    let mut top_genres: Vec<(String, usize, f64)> = genre_counts
+        .into_iter()
+        .map(|(g, count)| {
+            let pct = if total_genre_tags > 0 {
+                (count as f64 / total_genre_tags as f64) * 100.0
+            } else {
+                0.0
+            };
+            (g, count, pct)
+        })
+        .collect();
+    top_genres.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top_genres.truncate(8);
+
+    let dated_div = total_dated_shows.max(1) as f64;
+    let era_distribution = vec![
+        ("Pre-2000 (Golden Age)", pre_2000, (pre_2000 as f64 / dated_div) * 100.0),
+        ("2000s (Classic Era)",   era_2000s, (era_2000s as f64 / dated_div) * 100.0),
+        ("2010s (Modern Era)",    era_2010s, (era_2010s as f64 / dated_div) * 100.0),
+        ("2020s (Current Era)",   era_2020s, (era_2020s as f64 / dated_div) * 100.0),
+    ];
+
+    let mut format_distribution: Vec<(String, usize)> = format_counts.into_iter().collect();
+    format_distribution.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // 4. Activity across last 14 days
+    let day_seconds = 86400i64;
+    let mut recent_activity = vec![0u64; 14];
+    let start_14_days_ago = now - (14 * day_seconds);
+
+    let history_timestamps: Vec<i64> = sqlx::query_scalar(
+        "SELECT watched_at FROM history WHERE watched_at >= ?"
+    )
+    .bind(start_14_days_ago)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for ts in history_timestamps {
+        let diff = now - ts;
+        if diff >= 0 {
+            let day_idx = (diff / day_seconds) as usize;
+            if day_idx < 14 {
+                recent_activity[13 - day_idx] += 1;
+            }
+        }
+    }
+
+    // 5. Determine personality archetype based on leading genre
+    let taste_archetype = match top_genres.first().map(|(g, _, _)| g.as_str()) {
+        Some("Psychological") => "✦ The Narrative Philosopher",
+        Some("Sci-Fi")        => "✦ Cyberpunk Visionary & Futurist",
+        Some("Action")        => "✦ Apex Kinetic Connoisseur",
+        Some("Drama")         => "✦ Melancholic Humanist",
+        Some("Fantasy")       => "✦ Myth Seeker & Worldbuilder",
+        Some("Mystery")       => "✦ Labyrinth Mind & Enigma Decoder",
+        Some("Comedy")        => "✦ Cathartic Absurdist",
+        Some("Slice of Life") => "✦ Zen Pastoralist",
+        Some("Romance")       => "✦ Romantic Idealist",
+        Some("Horror")        => "✦ Gothic Surrealist",
+        _                     => "✦ Eclectic Polymath",
+    };
+
+    Ok(UserAnalytics {
+        total_episodes_watched: total_episodes as usize,
+        total_hours_watched: total_hours,
+        completed_shows,
+        in_progress_shows,
+        completion_rate,
+        avg_score,
+        top_genres,
+        era_distribution,
+        format_distribution,
+        recent_activity,
+        taste_archetype,
+    })
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -861,5 +1079,70 @@ mod tests {
         assert_eq!(entries[0].last_episode, 5);
         // Does not add to watched history
         assert!(get_watched_episodes(&pool, 1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_compute_user_analytics() {
+        let pool = setup().await;
+        // Insert an anime with genres and metadata
+        let anime = Anime {
+            id:            99,
+            title_english: Some("Serial Experiments Lain".into()),
+            title_romaji:  "Serial Experiments Lain".into(),
+            title_native:  None,
+            description:   None,
+            episodes:      Some(13),
+            status:        Some("FINISHED".into()),
+            season:        Some("SUMMER".into()),
+            season_year:   Some(1998),
+            score:         Some(85),
+            format:        Some("TV".into()),
+            genres:        "[\"Psychological\",\"Sci-Fi\",\"Mystery\"]".into(),
+            cover_url:     None,
+            cover_blob:    None,
+            has_dub:       1,
+            updated_at:    1_000_000,
+            next_airing_episode: None,
+        };
+        upsert_anime(&pool, &anime).await.unwrap();
+
+        // Mark 13 episodes watched
+        for ep in 1..=13 {
+            record_watched(&pool, 99, ep, 1_000 + ep).await.unwrap();
+        }
+
+        // Insert second anime with Psychological
+        let anime2 = Anime {
+            id:            100,
+            title_english: Some("Monster".into()),
+            title_romaji:  "Monster".into(),
+            title_native:  None,
+            description:   None,
+            episodes:      Some(74),
+            status:        Some("FINISHED".into()),
+            season:        Some("SPRING".into()),
+            season_year:   Some(2004),
+            score:         Some(88),
+            format:        Some("TV".into()),
+            genres:        "[\"Psychological\",\"Thriller\"]".into(),
+            cover_url:     None,
+            cover_blob:    None,
+            has_dub:       1,
+            updated_at:    1_000_000,
+            next_airing_episode: None,
+        };
+        upsert_anime(&pool, &anime2).await.unwrap();
+        record_watched(&pool, 100, 1, 2_000).await.unwrap();
+
+        let analytics = compute_user_analytics(&pool).await.unwrap();
+        assert_eq!(analytics.total_episodes_watched, 14);
+        assert!(analytics.total_hours_watched > 5.0);
+        assert_eq!(analytics.completed_shows, 1);
+        assert_eq!(analytics.in_progress_shows, 1);
+        assert_eq!(analytics.top_genres[0].0, "Psychological");
+        assert_eq!(analytics.top_genres[0].1, 2);
+        assert_eq!(analytics.taste_archetype, "✦ The Narrative Philosopher");
+        assert_eq!(analytics.era_distribution[0].0, "Pre-2000 (Golden Age)");
+        assert!(analytics.era_distribution[0].1 >= 1);
     }
 }
