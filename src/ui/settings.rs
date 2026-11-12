@@ -281,12 +281,12 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
     // ── 1. Search Input Bar ───────────────────────────────────────────────────
     let query_display = if state.settings_query.is_empty() {
         Line::from(vec![
-            Span::styled(" 🔍 > ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" ❖ > ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
             Span::styled("Type to filter features & commands (e.g. 'cast', 'remote', 'sub', 'update')...", Style::default().fg(Color::Rgb(120, 125, 145))),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" 🔍 > ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+            Span::styled(" ❖ > ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
             Span::styled(&state.settings_query, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled("█", Style::default().fg(theme.primary)),
         ])

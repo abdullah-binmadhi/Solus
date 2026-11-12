@@ -21,6 +21,8 @@ pub struct RemoteSubtitleTrack {
     pub code: String,
     pub label: String,
     pub is_active: bool,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 /// Individual episode entry for the mobile episode switcher.
@@ -52,6 +54,8 @@ pub struct RemotePlaybackState {
     pub subtitles: Vec<RemoteSubtitleTrack>,
     pub episodes: Vec<RemoteEpisodeItem>,
     pub anime4k: String,
+    #[serde(default)]
+    pub anime_id: Option<i64>,
 }
 
 impl Default for RemotePlaybackState {
@@ -77,22 +81,26 @@ impl Default for RemotePlaybackState {
                     code: "eng".to_string(),
                     label: "English (Official)".to_string(),
                     is_active: true,
+                    url: None,
                 },
                 RemoteSubtitleTrack {
                     id: 2,
                     code: "ara".to_string(),
                     label: "Arabic / العربية".to_string(),
                     is_active: false,
+                    url: None,
                 },
                 RemoteSubtitleTrack {
                     id: 3,
                     code: "spa".to_string(),
                     label: "Spanish / Español".to_string(),
                     is_active: false,
+                    url: None,
                 },
             ],
             episodes: Vec::new(),
             anime4k: "off".to_string(),
+            anime_id: None,
         }
     }
 }
@@ -105,6 +113,7 @@ pub struct RemoteActionRequest {
     pub pos: Option<f64>,
     pub value: Option<i32>,
     pub sub_id: Option<u32>,
+    pub sub_url: Option<String>,
     pub episode: Option<u32>,
     pub speed: Option<f64>,
     pub preset: Option<String>,
@@ -465,8 +474,61 @@ async fn handle_remote_action(
         }
         "set_sub" => {
             if let Some(sub_id) = req.sub_id {
-                let cmd = serde_json::json!({ "command": ["set_property", "sid", sub_id] });
-                let _ = send_mpv_json_command(sock_path, cmd).await;
+                let (target_url, target_code, target_label, anime_id, episode) = {
+                    let st = state.read().await;
+                    let track = st.subtitles.iter().find(|s| s.id == sub_id);
+                    (
+                        track.and_then(|s| s.url.clone()).or_else(|| req.sub_url.clone()),
+                        track.map(|s| s.code.clone()).unwrap_or_default(),
+                        track.map(|s| s.label.clone()).unwrap_or_default(),
+                        st.anime_id,
+                        st.episode,
+                    )
+                };
+
+                let mut sub_applied = false;
+
+                if let Some(ref url) = target_url {
+                    if url.starts_with("http://") || url.starts_with("https://") {
+                        let client = reqwest::Client::new();
+                        let aid = anime_id.unwrap_or(0);
+                        let (local_path, _) = crate::services::subsync::ensure_synchronized_subtitle(
+                            &client,
+                            url,
+                            None,
+                            None,
+                            aid,
+                            episode,
+                            &target_code,
+                        )
+                        .await;
+
+                        let title = if target_label.is_empty() { "Subtitle" } else { &target_label };
+                        let lang = if target_code.is_empty() { "sub" } else { &target_code };
+                        let cmd = serde_json::json!({
+                            "command": ["sub-add", local_path, "select", title, lang]
+                        });
+                        let _ = send_mpv_json_command(sock_path, cmd).await;
+                        sub_applied = true;
+                    } else if !url.is_empty() {
+                        let title = if target_label.is_empty() { "Subtitle" } else { &target_label };
+                        let lang = if target_code.is_empty() { "sub" } else { &target_code };
+                        let cmd = serde_json::json!({
+                            "command": ["sub-add", url, "select", title, lang]
+                        });
+                        let _ = send_mpv_json_command(sock_path, cmd).await;
+                        sub_applied = true;
+                    }
+                }
+
+                if !sub_applied {
+                    let cmd = serde_json::json!({ "command": ["set_property", "sid", sub_id] });
+                    let _ = send_mpv_json_command(sock_path, cmd).await;
+                }
+
+                let vis_cmd = serde_json::json!({ "command": ["set_property", "sub-visibility", "yes"] });
+                let _ = send_mpv_json_command(sock_path, vis_cmd).await;
+
                 let mut st = state.write().await;
                 let mut active_label = None;
                 for s in &mut st.subtitles {
@@ -501,9 +563,48 @@ async fn handle_remote_action(
             st.sub_delay = 0.0;
         }
         "set_sub_preset" => {
-            if let Some(ref preset) = req.preset {
+            if let Some(ref preset_str) = req.preset {
+                let preset = match preset_str.to_lowercase().as_str() {
+                    s if s.contains("netflix") => crate::services::substyler::SubtitlePreset::NetflixClean,
+                    s if s.contains("fansub") => crate::services::substyler::SubtitlePreset::AnimeFansub,
+                    s if s.contains("oled") => crate::services::substyler::SubtitlePreset::OledPlate,
+                    _ => crate::services::substyler::SubtitlePreset::StudioMinimal,
+                };
+                let style_cfg = crate::services::substyler::SubtitleStyleConfig::from_preset(preset);
+                let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "sub-font", style_cfg.font_family] })).await;
+                let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "sub-font-size", style_cfg.font_size] })).await;
+                let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "sub-border-size", style_cfg.border_size] })).await;
+                let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "sub-shadow-offset", style_cfg.shadow_offset] })).await;
+                let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "sub-margin-y", style_cfg.margin_y] })).await;
+                let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "sub-color", style_cfg.primary_color] })).await;
+                let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "sub-border-color", style_cfg.border_color] })).await;
+                let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "sub-ass-override", "force"] })).await;
+                if style_cfg.backdrop_opacity > 0.0 {
+                    let alpha_hex = format!("{:02X}", (style_cfg.backdrop_opacity * 255.0).round() as u8);
+                    let back_color = format!("#{}000000", alpha_hex);
+                    let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "sub-back-color", back_color] })).await;
+                } else {
+                    let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "sub-back-color", "#00000000"] })).await;
+                }
                 let mut st = state.write().await;
-                st.sub_preset = preset.clone();
+                st.sub_preset = preset_str.clone();
+            }
+        }
+        "set_anime4k" => {
+            if let Some(ref mode_str) = req.mode {
+                let mode = match mode_str.to_lowercase().as_str() {
+                    s if s.contains("balanced") => crate::config::Anime4KMode::Balanced,
+                    s if s.contains("ultra") => crate::config::Anime4KMode::Ultra,
+                    _ => crate::config::Anime4KMode::Off,
+                };
+                let shader_arg = crate::services::shaders::build_shader_arg(mode).unwrap_or_default();
+                let cmd = serde_json::json!({ "command": ["set_property", "glsl-shaders", shader_arg] });
+                let _ = send_mpv_json_command(sock_path, cmd).await;
+                if let Some(tx) = tx_app {
+                    let _ = tx.send(crate::AppMessage::RemoteAnime4K(mode)).await;
+                }
+                let mut st = state.write().await;
+                st.anime4k = mode.as_str().to_string();
             }
         }
         "select_episode" => {
@@ -1054,9 +1155,9 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
 
       <div class="section-label">REAL-TIME ANIME4K SHADER</div>
       <div class="btn-group">
-        <button class="btn-pill" id="a4k-off">Off</button>
-        <button class="btn-pill" id="a4k-balanced">Balanced 2x</button>
-        <button class="btn-pill" id="a4k-ultra">Ultra 4K</button>
+        <button class="btn-pill" id="a4k-off" onclick="setAnime4k('off')">Off</button>
+        <button class="btn-pill" id="a4k-balanced" onclick="setAnime4k('balanced')">Balanced 2x</button>
+        <button class="btn-pill" id="a4k-ultra" onclick="setAnime4k('ultra')">Ultra 4K</button>
       </div>
     </div>
   </div>
@@ -1190,6 +1291,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       updateSpeedPills(data.speed || 1.0);
       updateAudioPills(data.audio_mode || 'sub');
       updatePresetPills(data.sub_preset || 'Studio Minimal');
+      updateA4kPills(data.anime4k || 'off');
     }
 
     function renderSubtitlesList(subs) {
@@ -1227,6 +1329,15 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     }
 
     function selectSubtitle(id) {
+      if (currentState && currentState.subtitles) {
+        for (let s of currentState.subtitles) {
+          s.is_active = (s.id === id);
+          if (s.is_active) {
+            document.getElementById('sub-badge').innerText = s.label;
+          }
+        }
+        renderSubtitlesList(currentState.subtitles);
+      }
       sendAction('set_sub', { sub_id: id });
       closeAllDrawers();
     }
@@ -1234,6 +1345,25 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     function selectEpisode(ep) {
       sendAction('select_episode', { episode: ep });
       closeAllDrawers();
+    }
+
+    function setAnime4k(mode) {
+      updateA4kPills(mode);
+      sendAction('set_anime4k', { mode: mode });
+    }
+
+    function updateA4kPills(mode) {
+      const activeMode = (mode || 'off').toLowerCase();
+      ['off', 'balanced', 'ultra'].forEach(m => {
+        const el = document.getElementById(`a4k-${m}`);
+        if (el) {
+          if (m === activeMode || (m === 'balanced' && activeMode.includes('balanced')) || (m === 'ultra' && activeMode.includes('ultra'))) {
+            el.classList.add('active');
+          } else {
+            el.classList.remove('active');
+          }
+        }
+      });
     }
 
     function updateSpeedPills(speed) {
@@ -1371,6 +1501,7 @@ mod tests {
                 code: "eng".to_string(),
                 label: "English".to_string(),
                 is_active: true,
+                url: None,
             }],
             episodes: vec![RemoteEpisodeItem {
                 ep: 1,
@@ -1386,5 +1517,71 @@ mod tests {
         assert!(json.contains("1440.0"));
         assert!(json.contains("English"));
         assert!(json.contains("Journey's End"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_remote_action_set_anime4k() {
+        let state = Arc::new(RwLock::new(RemotePlaybackState::default()));
+        let req = RemoteActionRequest {
+            action: "set_anime4k".to_string(),
+            delta: None,
+            pos: None,
+            value: None,
+            sub_id: None,
+            sub_url: None,
+            episode: None,
+            speed: None,
+            preset: None,
+            mode: Some("balanced".to_string()),
+        };
+
+        handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
+        let st = state.read().await;
+        assert_eq!(st.anime4k, "balanced 2x");
+    }
+
+    #[tokio::test]
+    async fn test_handle_remote_action_set_sub_updates_active_track() {
+        let state = Arc::new(RwLock::new(RemotePlaybackState::default()));
+        let req = RemoteActionRequest {
+            action: "set_sub".to_string(),
+            delta: None,
+            pos: None,
+            value: None,
+            sub_id: Some(2),
+            sub_url: None,
+            episode: None,
+            speed: None,
+            preset: None,
+            mode: None,
+        };
+
+        handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
+        let st = state.read().await;
+        assert_eq!(st.sub_lang, "Arabic / العربية");
+        assert!(st.sub_active);
+        assert!(st.subtitles[1].is_active);
+        assert!(!st.subtitles[0].is_active);
+    }
+
+    #[tokio::test]
+    async fn test_handle_remote_action_set_sub_preset() {
+        let state = Arc::new(RwLock::new(RemotePlaybackState::default()));
+        let req = RemoteActionRequest {
+            action: "set_sub_preset".to_string(),
+            delta: None,
+            pos: None,
+            value: None,
+            sub_id: None,
+            sub_url: None,
+            episode: None,
+            speed: None,
+            preset: Some("Netflix Clean".to_string()),
+            mode: None,
+        };
+
+        handle_remote_action(&req, "/tmp/nonexistent-solus-test.sock", &state, None).await;
+        let st = state.read().await;
+        assert_eq!(st.sub_preset, "Netflix Clean");
     }
 }

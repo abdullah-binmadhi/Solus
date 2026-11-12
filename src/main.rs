@@ -99,6 +99,8 @@ enum AppMessage {
     UpdateFailed(String),
     /// Remote touch companion requested switching to an episode
     RemotePlayEpisode(u32),
+    /// Remote touch companion toggled or selected Anime4K shader mode
+    RemoteAnime4K(config::Anime4KMode),
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -359,6 +361,29 @@ async fn main() -> anyhow::Result<()> {
 
                         state.sync_active_provider();
                         state.is_loading_subs = false;
+
+                        if !state.playback_sub_languages.is_empty() {
+                            let r_state = state.remote_state.clone();
+                            let r_subs: Vec<services::remote::RemoteSubtitleTrack> = state
+                                .playback_sub_languages
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, s)| services::remote::RemoteSubtitleTrack {
+                                    id: (idx + 1) as u32,
+                                    code: s.code.clone(),
+                                    label: s.name.clone(),
+                                    is_active: idx == state.playback_sub_cursor,
+                                    url: if s.url.is_empty() { None } else { Some(s.url.clone()) },
+                                })
+                                .collect();
+                            tokio::spawn(async move {
+                                {
+                                    let mut st = r_state.write().await;
+                                    st.subtitles = r_subs;
+                                }
+                                services::remote::broadcast_state(&r_state).await;
+                            });
+                        }
                     }
                 }
                 AppMessage::AiringStatusUpdated(anime_id, status, episodes, next_airing) => {
@@ -619,6 +644,12 @@ async fn main() -> anyhow::Result<()> {
                         };
                         start_playback(&mut state, opts, title, ep, &tx, &pool, &cfg).await;
                     }
+                }
+                AppMessage::RemoteAnime4K(mode) => {
+                    state.anime4k_mode = mode;
+                    cfg.anime4k_mode = mode;
+                    let _ = cfg.save();
+                    state.show_toast(format!("❖ Anime4K: {}", mode.as_str()), unix_now());
                 }
             }
         }
@@ -3128,17 +3159,20 @@ async fn start_playback(
             code: s.code.clone(),
             label: s.name.clone(),
             is_active: idx == state.playback_sub_cursor,
+            url: if s.url.is_empty() { None } else { Some(s.url.clone()) },
         })
         .collect();
     let r_sub_preset = cfg.subtitle_style.preset.label().to_string();
     let r_anime4k = cfg.anime4k_mode.as_str().to_string();
     let r_audio_mode = if opts.dub { "dub".to_string() } else { "sub".to_string() };
+    let r_aid = anime_id;
 
     tokio::spawn(async move {
         {
             let mut st = remote_state_init.write().await;
             st.is_playing = true;
             st.title = r_title;
+            st.anime_id = Some(r_aid);
             st.episode = r_ep;
             st.episode_title = r_ep_title;
             st.poster_url = r_poster;
