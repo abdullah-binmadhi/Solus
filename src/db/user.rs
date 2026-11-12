@@ -558,9 +558,25 @@ pub struct UserAnalytics {
     pub audio_preference: &'static str,
 }
 
+fn is_canonical_or_subgenre(g: &str) -> bool {
+    const VALID_GENRES: &[&str] = &[
+        // Canonical AniList genres
+        "Action", "Adventure", "Comedy", "Drama", "Ecchi", "Fantasy",
+        "Horror", "Mahou Shoujo", "Mecha", "Music", "Mystery", "Psychological",
+        "Romance", "Sci-Fi", "Slice of Life", "Sports", "Supernatural", "Thriller",
+        // Recognized major subgenres & demographics
+        "Cyberpunk", "Seinen", "Shounen", "Shonen", "Shojo", "Josei", "Isekai",
+        "Dystopian", "Post-Apocalyptic", "Crime", "Super Power", "Martial Arts",
+        "Military", "Historical", "Space", "Football", "Basketball", "Baseball",
+        "Volleyball", "Boxing", "Detective", "Philosophy", "Magic", "Steampunk",
+        "Time Manipulation", "Survival", "Card Battle", "School"
+    ];
+    VALID_GENRES.iter().any(|&vg| vg.eq_ignore_ascii_case(g.trim()))
+}
+
 /// Query local SQLite watch history and anime metadata to generate personalized analytics.
 pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> {
-    let now = std::time::SystemTime::now()
+    let _now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
@@ -705,8 +721,11 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
 
         if let Ok(genres) = serde_json::from_str::<Vec<String>>(&genres_raw) {
             for g in genres {
-                *genre_counts.entry(g).or_insert(0) += 1;
-                total_genre_tags += 1;
+                let trimmed = g.trim();
+                if is_canonical_or_subgenre(trimmed) {
+                    *genre_counts.entry(trimmed.to_string()).or_insert(0) += eps_watched;
+                    total_genre_tags += eps_watched;
+                }
             }
         }
     }
@@ -756,59 +775,75 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     let mut format_distribution: Vec<(String, usize)> = format_counts.into_iter().collect();
     format_distribution.sort_by_key(|a| std::cmp::Reverse(a.1));
 
-    // 4. Activity across last 14 days, viewing window cadence, and active streak
-    let day_seconds = 86400i64;
-    let mut recent_activity = vec![0u64; 14];
-    let _start_14_days_ago = now - (14 * day_seconds);
+    // 4. Activity across last 14 local calendar days, viewing window cadence, and active streak
+    let history_day_rows = sqlx::query(
+        "SELECT date(watched_at, 'unixepoch', 'localtime') as day_str, COUNT(*) as cnt
+         FROM history
+         GROUP BY day_str"
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
 
-    let all_history_timestamps: Vec<i64> = sqlx::query_scalar(
-        "SELECT watched_at FROM history ORDER BY watched_at DESC"
+    let mut day_counts: HashMap<String, u64> = HashMap::new();
+    for r in history_day_rows {
+        let d: String = r.try_get("day_str").unwrap_or_default();
+        let c: i64 = r.try_get("cnt").unwrap_or(0);
+        day_counts.insert(d, c as u64);
+    }
+
+    let mut recent_activity = vec![0u64; 14];
+    for (i, slot) in recent_activity.iter_mut().enumerate() {
+        let offset = 13 - i;
+        let query_str = format!("SELECT date('now', 'localtime', '-{} days')", offset);
+        if let Ok(day_date) = sqlx::query_scalar::<_, String>(&query_str).fetch_one(pool).await {
+            *slot = day_counts.get(&day_date).copied().unwrap_or(0);
+        }
+    }
+
+    // Local hour distribution for viewing cadence
+    let hour_rows = sqlx::query(
+        "SELECT CAST(strftime('%H', watched_at, 'unixepoch', 'localtime') AS INTEGER) as hr, COUNT(*) as cnt
+         FROM history
+         GROUP BY hr"
     )
     .fetch_all(pool)
     .await
     .unwrap_or_default();
 
     let mut hour_buckets = [0usize; 4]; // [Night (22-04), Morning (05-11), Afternoon (12-17), Prime (18-21)]
-    let mut day_set = std::collections::BTreeSet::new();
-
-    for &ts in &all_history_timestamps {
-        let diff = now - ts;
-        if diff >= 0 {
-            let day_idx = (diff / day_seconds) as usize;
-            if day_idx < 14 {
-                recent_activity[13 - day_idx] += 1;
-            }
-            day_set.insert(ts / day_seconds);
-        }
-
-        let hour = ((ts.rem_euclid(day_seconds)) / 3600) as usize;
-        match hour {
-            22..=23 | 0..=4 => hour_buckets[0] += 1,
-            5..=11 => hour_buckets[1] += 1,
-            12..=17 => hour_buckets[2] += 1,
-            _ => hour_buckets[3] += 1,
+    for r in hour_rows {
+        let hr: i64 = r.try_get("hr").unwrap_or(0);
+        let cnt: i64 = r.try_get("cnt").unwrap_or(0);
+        let c = cnt as usize;
+        match hr {
+            22..=23 | 0..=4 => hour_buckets[0] += c,
+            5..=11          => hour_buckets[1] += c,
+            12..=17         => hour_buckets[2] += c,
+            _               => hour_buckets[3] += c,
         }
     }
 
-    let viewing_cadence = if hour_buckets[0] >= hour_buckets[1] && hour_buckets[0] >= hour_buckets[2] && hour_buckets[0] >= hour_buckets[3] {
-        "❖ Night Owl (23:00 - 04:00)"
-    } else if hour_buckets[3] >= hour_buckets[1] && hour_buckets[3] >= hour_buckets[2] {
+    let viewing_cadence = if hour_buckets[2] >= hour_buckets[0] && hour_buckets[2] >= hour_buckets[1] && hour_buckets[2] >= hour_buckets[3] {
+        "✦ Afternoon Flow (12:00 - 18:00)"
+    } else if hour_buckets[1] >= hour_buckets[0] && hour_buckets[1] >= hour_buckets[3] {
+        "⬡ Dawn & Morning (05:00 - 12:00)"
+    } else if hour_buckets[3] >= hour_buckets[0] {
         "◈ Prime Time (18:00 - 22:00)"
-    } else if hour_buckets[2] >= hour_buckets[1] {
-        "✦ Afternoon Binger (12:00 - 18:00)"
     } else {
-        "⬡ Morning Ritual (06:00 - 11:00)"
+        "❖ Night Owl (22:00 - 05:00)"
     };
 
-    let today_day = now / day_seconds;
     let mut active_streak_days = 0usize;
-    let mut check_day = today_day;
-    if !day_set.contains(&check_day) {
-        check_day = today_day.saturating_sub(1);
-    }
-    while day_set.contains(&check_day) {
-        active_streak_days += 1;
-        check_day = check_day.saturating_sub(1);
+    let watched_today = recent_activity[13] > 0;
+    let watched_yesterday = recent_activity[12] > 0;
+    if watched_today || watched_yesterday {
+        let mut idx = if watched_today { 13 } else { 12 };
+        while recent_activity[idx] > 0 {
+            active_streak_days += 1;
+            if idx == 0 { break; }
+            idx -= 1;
+        }
     }
 
     let sub_count: i64 = sqlx::query_scalar(
@@ -835,6 +870,9 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
 
     // 5. Determine personality archetype based on leading genre
     let taste_archetype = match top_genres.first().map(|(g, _, _)| g.as_str()) {
+        Some("Sports") | Some("Football") | Some("Basketball") | Some("Baseball") => "✦ Kinetic Tactician & Grit Striker",
+        Some("Cyberpunk")     => "✦ High-Tech Neon Dystopian",
+        Some("Seinen")        => "✦ Cerebral Realist & Narrative Analyst",
         Some("Psychological") => "✦ The Narrative Philosopher",
         Some("Sci-Fi")        => "✦ Cyberpunk Visionary & Futurist",
         Some("Action")        => "✦ Apex Kinetic Connoisseur",
@@ -845,6 +883,8 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
         Some("Slice of Life") => "✦ Zen Pastoralist",
         Some("Romance")       => "✦ Romantic Idealist",
         Some("Horror")        => "✦ Gothic Surrealist",
+        Some("Mecha")         => "✦ Heavy Iron Pilot",
+        Some("Shounen") | Some("Shonen") => "✦ High-Spirited Champion",
         _                     => "✦ Eclectic Polymath",
     };
 
@@ -1264,7 +1304,7 @@ mod tests {
         assert_eq!(analytics.completed_shows, 1);
         assert_eq!(analytics.in_progress_shows, 1);
         assert_eq!(analytics.top_genres[0].0, "Psychological");
-        assert_eq!(analytics.top_genres[0].1, 2);
+        assert_eq!(analytics.top_genres[0].1, 14);
         assert_eq!(analytics.taste_archetype, "✦ The Narrative Philosopher");
         assert_eq!(analytics.era_distribution[0].0, "Pre-2000 (Golden Age)");
         assert!(analytics.era_distribution[0].1 >= 1);

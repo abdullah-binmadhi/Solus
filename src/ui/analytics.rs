@@ -8,11 +8,124 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Sparkline},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
 use crate::state::AppState;
+
+type RgbColor = (u8, u8, u8);
+type GradientStop = (RgbColor, RgbColor);
+
+/// Multi-stop truecolor gradient shader for horizontal metric bars.
+/// Interpolates smoothly between `start_rgb` and `end_rgb` across `bar_len` characters,
+/// adds a luminous leading cap `▌`, and fills the remaining `total_width` with dark telemetry track `·`.
+fn render_gradient_bar<'a>(
+    bar_len: usize,
+    total_width: usize,
+    start_rgb: (u8, u8, u8),
+    end_rgb: (u8, u8, u8),
+) -> Vec<Span<'a>> {
+    let mut spans = Vec::with_capacity(bar_len + 1);
+    if bar_len > 0 {
+        for i in 0..bar_len {
+            let t = if bar_len > 1 {
+                i as f64 / (bar_len - 1) as f64
+            } else {
+                1.0
+            };
+            let r = (start_rgb.0 as f64 + t * (end_rgb.0 as f64 - start_rgb.0 as f64)).round() as u8;
+            let g = (start_rgb.1 as f64 + t * (end_rgb.1 as f64 - start_rgb.1 as f64)).round() as u8;
+            let b = (start_rgb.2 as f64 + t * (end_rgb.2 as f64 - start_rgb.2 as f64)).round() as u8;
+
+            let char_str = if i + 1 == bar_len { "▌" } else { "█" };
+            spans.push(Span::styled(
+                char_str,
+                Style::default().fg(Color::Rgb(r, g, b)),
+            ));
+        }
+    }
+    let empty_len = total_width.saturating_sub(bar_len);
+    if empty_len > 0 {
+        spans.push(Span::styled(
+            "·".repeat(empty_len),
+            Style::default().fg(Color::Rgb(45, 50, 68)),
+        ));
+    }
+    spans
+}
+
+/// Synthesizer waveform equalizer generator with vertical truecolor amplitude shaders.
+/// Spans the entire card width with 14 discrete day columns, sub-block amplitude resolution,
+/// and pixel-perfect aligned day axis.
+fn render_equalizer_matrix<'a>(
+    activity: &[u64],
+) -> (Vec<Line<'a>>, Line<'a>) {
+    let max_v = activity.iter().max().copied().unwrap_or(1).max(1) as f64;
+    let blocks = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let row_colors = [
+        Color::Rgb(244, 63, 94),  // Peak Amplitude: Neon Hot Pink / Crimson
+        Color::Rgb(251, 191, 36), // High: Cyber Amber / Gold
+        Color::Rgb(52, 211, 153), // Mid: Neon Emerald
+        Color::Rgb(56, 189, 248), // Base: Electric Sky Cyan
+    ];
+
+    let mut matrix_lines = Vec::with_capacity(4);
+    for (r, &color) in row_colors.iter().enumerate() {
+        let level = 4.0 - r as f64;
+        let mut spans = Vec::new();
+        spans.push(Span::raw(" "));
+        for &v in activity.iter() {
+            if v == 0 {
+                spans.push(Span::styled(" ·  ", Style::default().fg(Color::Rgb(42, 46, 62))));
+                continue;
+            }
+            let h = (v as f64 / max_v) * 4.0;
+            if h >= level {
+                let is_peak = (v as f64) >= max_v && max_v > 0.0;
+                let style = if is_peak {
+                    Style::default().fg(color).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(color)
+                };
+                spans.push(Span::styled("███ ", style));
+            } else if h > level - 1.0 {
+                let frac = (h - (level - 1.0)).clamp(0.0, 1.0);
+                let idx = ((frac * 8.0).floor() as usize).min(7);
+                let b = blocks[idx];
+                let b_str = format!("{}{}{} ", b, b, b);
+                spans.push(Span::styled(b_str, Style::default().fg(color)));
+            } else {
+                spans.push(Span::raw("    "));
+            }
+        }
+        matrix_lines.push(Line::from(spans));
+    }
+
+    let mut label_spans = Vec::new();
+    label_spans.push(Span::raw(" "));
+    for i in 0..14 {
+        let offset = 13 - i;
+        let tag = if offset == 0 {
+            "Now"
+        } else if offset == 1 {
+            "-1d"
+        } else {
+            &format!("{}d", offset)
+        };
+        let style = if offset == 0 {
+            Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)
+        } else if offset == 1 {
+            Style::default().fg(Color::Rgb(251, 191, 36)).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(95, 100, 125))
+        };
+        label_spans.push(Span::styled(format!("{:>3} ", tag), style));
+    }
+    let timeline_label = Line::from(label_spans);
+
+    (matrix_lines, timeline_label)
+}
 
 /// Render the Taste Analytics / Anime Wrapped dashboard.
 pub fn render(frame: &mut Frame, state: &AppState) {
@@ -47,13 +160,22 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         return;
     };
 
+    // Dynamically scale vertical layout constraints based on available terminal height
+    let (banner_h, stat_h, footer_h) = if inner.height >= 38 {
+        (4, 4, 2)
+    } else if inner.height >= 28 {
+        (3, 3, 1)
+    } else {
+        (2, 3, 1)
+    };
+
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4), // Persona Archetype & Viewing Cadence Banner
-            Constraint::Length(4), // 6 KPI Stat Cards
-            Constraint::Min(20),   // Split Body (Left = Genres + Eras/Formats; Right = Top Titles + 14-Day Velocity)
-            Constraint::Length(2), // Footer Keybinding hints
+            Constraint::Length(banner_h), // Persona Archetype & Cadence Banner
+            Constraint::Length(stat_h),   // 6 KPI Stat Cards
+            Constraint::Min(14),          // Split Body (Left = Genres + Eras/Formats; Right = Top Titles + Velocity)
+            Constraint::Length(footer_h), // Footer Keybinding hints
         ])
         .split(inner);
 
@@ -165,7 +287,18 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         ])
         .split(body_cols[0]);
 
-    // Box 1: Genre Affinity Polarity with Relative Normalization (Zero Dead Space & Concatenation)
+    // Box 1: Genre Affinity Polarity with Luminous Multi-Stop Gradient Shaders
+    const GENRE_GRADIENTS: &[GradientStop] = &[
+        ((245, 158, 11), (239, 68, 68)),   // 1. Solar Gold -> Flame Crimson
+        ((236, 72, 153), (139, 92, 246)),  // 2. Neon Magenta -> Royal Purple
+        ((6, 182, 212), (59, 130, 246)),   // 3. Cyber Cyan -> Azure Blue
+        ((16, 185, 129), (163, 230, 53)),  // 4. Toxic Emerald -> Electric Lime
+        ((99, 102, 241), (192, 132, 252)), // 5. Cyber Indigo -> Lilac
+        ((251, 113, 133), (253, 186, 116)),// 6. Sunset Coral -> Peach
+        ((20, 184, 166), (45, 212, 191)),  // 7. Electric Teal -> Mint
+        ((56, 189, 248), (147, 197, 253)), // 8. Arctic Sky -> Ice Blue
+    ];
+
     let genre_card_width = left_rows[0].width as usize;
     let bar_width = genre_card_width.saturating_sub(38).clamp(8, 44);
 
@@ -174,7 +307,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         genre_lines.push(Line::from(Span::styled(" No watched genres recorded yet.", Style::default().fg(theme.text_dim))));
     } else {
         let max_cnt = data.top_genres.first().map(|(_, c, _)| *c).unwrap_or(1) as f64;
-        for (g, count, pct) in data.top_genres.iter().take(8) {
+        for (idx, (g, count, pct)) in data.top_genres.iter().take(8).enumerate() {
             let label = if g.chars().count() > 14 {
                 format!("{}…", g.chars().take(13).collect::<String>())
             } else {
@@ -182,16 +315,20 @@ pub fn render(frame: &mut Frame, state: &AppState) {
             };
             let rel = (*count as f64) / max_cnt;
             let bar_len = (rel * bar_width as f64).round() as usize;
-            let bar = "█".repeat(bar_len);
-            let empty = "░".repeat(bar_width.saturating_sub(bar_len));
-            genre_lines.push(Line::from(vec![
+
+            let (start_rgb, end_rgb) = GENRE_GRADIENTS[idx % GENRE_GRADIENTS.len()];
+            let bar_spans = render_gradient_bar(bar_len, bar_width, start_rgb, end_rgb);
+
+            let mut line_spans = vec![
                 Span::styled(format!(" {:<14} ", label), Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
-                Span::styled(bar, Style::default().fg(theme.primary)),
-                Span::styled(empty, Style::default().fg(Color::Rgb(45, 48, 65))),
-                Span::styled(format!(" {:>4.1}% ", pct), Style::default().fg(theme.text_dim)),
-                Span::styled(format!("({:>2} ep)", count), Style::default().fg(Color::Rgb(100, 105, 130))),
-            ]));
+            ];
+            line_spans.extend(bar_spans);
+            line_spans.push(Span::styled(format!(" {:>4.1}% ", pct), Style::default().fg(theme.text_dim)));
+            line_spans.push(Span::styled(format!("({:>2} ep)", count), Style::default().fg(Color::Rgb(100, 105, 130))));
+
+            genre_lines.push(Line::from(line_spans));
         }
+
         if data.top_genres.len() < 7 {
             genre_lines.push(Line::from(""));
             genre_lines.push(Line::from(Span::styled(
@@ -213,24 +350,34 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     );
     frame.render_widget(genre_widget, left_rows[0]);
 
-    // Box 2: Golden Era & Formats Distribution Matrix
+    // Box 2: Golden Era & Formats Distribution Matrix with Era Color Shaders
+    const ERA_GRADIENTS: &[GradientStop] = &[
+        ((217, 119, 6), (251, 191, 36)),   // Pre-2000: Vintage Sepia Gold
+        ((37, 99, 235), (96, 165, 250)),   // 2000s: Classic Sapphire
+        ((124, 58, 237), (192, 132, 252)), // 2010s: Ultra Violet
+        ((225, 29, 72), (251, 113, 133)),  // 2020s: Cyber Rose
+    ];
+
     let era_card_width = left_rows[1].width as usize;
     let era_bar_width = era_card_width.saturating_sub(44).clamp(8, 32);
 
     let mut era_lines = vec![];
     let max_era_cnt = data.era_distribution.iter().map(|(_, c, _)| *c).max().unwrap_or(1) as f64;
-    for (label, count, pct) in &data.era_distribution {
+    for (idx, (label, count, pct)) in data.era_distribution.iter().enumerate() {
         let rel = if max_era_cnt > 0.0 { *count as f64 / max_era_cnt } else { 0.0 };
         let bar_len = (rel * era_bar_width as f64).round() as usize;
-        let bar = "█".repeat(bar_len);
-        let empty = "░".repeat(era_bar_width.saturating_sub(bar_len));
-        era_lines.push(Line::from(vec![
+
+        let (start_rgb, end_rgb) = ERA_GRADIENTS.get(idx).copied().unwrap_or(((100, 100, 150), (200, 200, 255)));
+        let era_bar_spans = render_gradient_bar(bar_len, era_bar_width, start_rgb, end_rgb);
+
+        let mut line_spans = vec![
             Span::styled(format!(" {:<22} ", label), Style::default().fg(theme.text)),
-            Span::styled(bar, Style::default().fg(theme.secondary)),
-            Span::styled(empty, Style::default().fg(Color::Rgb(45, 48, 65))),
-            Span::styled(format!(" {:>3.0}% ", pct), Style::default().fg(theme.text_dim)),
-            Span::styled(format!("({:>2} title{})", count, if *count == 1 { "" } else { "s" }), Style::default().fg(Color::Rgb(100, 105, 130))),
-        ]));
+        ];
+        line_spans.extend(era_bar_spans);
+        line_spans.push(Span::styled(format!(" {:>3.0}% ", pct), Style::default().fg(theme.text_dim)));
+        line_spans.push(Span::styled(format!("({:>2} title{})", count, if *count == 1 { "" } else { "s" }), Style::default().fg(Color::Rgb(100, 105, 130))));
+
+        era_lines.push(Line::from(line_spans));
     }
 
     // Add format segmented bar and breakdown
@@ -250,12 +397,17 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     let tv_bar_len = ((tv_pct / 100.0) * fmt_bar_width as f64).round() as usize;
     let ona_bar_len = fmt_bar_width.saturating_sub(tv_bar_len);
 
-    era_lines.push(Line::from(vec![
+    let tv_gauge = render_gradient_bar(tv_bar_len, tv_bar_len, (6, 182, 212), (59, 130, 246));
+    let ona_gauge = render_gradient_bar(ona_bar_len, ona_bar_len, (168, 85, 247), (236, 72, 153));
+
+    let mut gauge_line = vec![
         Span::styled(" Format Ratio: ", Style::default().fg(theme.text_dim)),
-        Span::styled("█".repeat(tv_bar_len), Style::default().fg(theme.accent)),
-        Span::styled("░".repeat(ona_bar_len), Style::default().fg(theme.secondary)),
-        Span::styled(format!(" TV {:.0}% / ONA {:.0}%", tv_pct, ona_pct), Style::default().fg(theme.text)),
-    ]));
+    ];
+    gauge_line.extend(tv_gauge);
+    gauge_line.extend(ona_gauge);
+    gauge_line.push(Span::styled(format!(" TV {:.0}% / ONA {:.0}%", tv_pct, ona_pct), Style::default().fg(theme.text)));
+    era_lines.push(Line::from(gauge_line));
+
     era_lines.push(Line::from(Span::styled(
         format!(" Breakdown: {} TV Series • {} Web ONA • {} Feature Films", tv_cnt, ona_cnt, mov_cnt),
         Style::default().fg(Color::Rgb(110, 115, 135)),
@@ -283,7 +435,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         ])
         .split(body_cols[1]);
 
-    // Box 3: Heavy Rotation / Top Watched Titles (Multi-line rich cards, zero dead space)
+    // Box 3: Heavy Rotation / Top Watched Titles with Progress Shaders
     let titles_card_width = right_rows[0].width as usize;
     let mut title_lines = vec![];
     let title_icons = ["❖", "◈", "✦", "⬡"];
@@ -304,22 +456,27 @@ pub fn render(frame: &mut Frame, state: &AppState) {
             Span::styled(display_title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         ]));
 
-        // Line 2: Progress Bar & Ep counts
+        // Line 2: Progress Bar with dynamic progress shader
         let bar_len = ((show.completion_pct / 100.0) * prog_bar_width as f64).round() as usize;
-        let bar = "█".repeat(bar_len);
-        let empty = "░".repeat(prog_bar_width.saturating_sub(bar_len));
+        let (prog_start, prog_end) = if show.completion_pct >= 99.0 {
+            ((245, 158, 11), (16, 185, 129)) // Gold to Emerald for completed
+        } else if show.completion_pct >= 50.0 {
+            ((99, 102, 241), (217, 70, 239)) // Indigo to Fuchsia
+        } else {
+            ((13, 148, 136), (56, 189, 248)) // Teal to Sky Cyan
+        };
+        let prog_spans = render_gradient_bar(bar_len, prog_bar_width, prog_start, prog_end);
+
         let ep_str = match show.total_episodes {
             Some(tot) => format!("[{:>2}/{} ep • {:>3.0}%]", show.episodes_watched, tot, show.completion_pct),
             None => format!("[{:>2} ep watched]", show.episodes_watched),
         };
 
-        title_lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(bar, Style::default().fg(theme.secondary)),
-            Span::styled(empty, Style::default().fg(Color::Rgb(45, 48, 65))),
-            Span::styled(format!(" {} ", ep_str), Style::default().fg(theme.text_dim)),
-            Span::styled(format!("{:.1}h", show.total_hours), Style::default().fg(theme.accent)),
-        ]));
+        let mut line2_spans = vec![Span::raw("    ")];
+        line2_spans.extend(prog_spans);
+        line2_spans.push(Span::styled(format!(" {} ", ep_str), Style::default().fg(theme.text_dim)));
+        line2_spans.push(Span::styled(format!("{:.1}h", show.total_hours), Style::default().fg(theme.accent)));
+        title_lines.push(Line::from(line2_spans));
 
         // Line 3: Telemetry & Pace
         let avg_ep_mins = if show.episodes_watched > 0 {
@@ -342,7 +499,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         ]));
         title_lines.push(Line::from(vec![
             Span::raw("    "),
-            Span::styled("░".repeat(prog_bar_width), Style::default().fg(Color::Rgb(40, 44, 58))),
+            Span::styled("·".repeat(prog_bar_width), Style::default().fg(Color::Rgb(40, 44, 58))),
             Span::styled(" [0 ep • 0%] ", Style::default().fg(Color::Rgb(80, 85, 105))),
             Span::styled("0.0h", Style::default().fg(Color::Rgb(70, 75, 95))),
         ]));
@@ -370,8 +527,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     );
     frame.render_widget(titles_widget, right_rows[0]);
 
-    // Box 4: 14-Day Velocity & Binge Matrix
-    let velocity_card_width = right_rows[1].width as usize;
+    // Box 4: 14-Day Velocity & Binge Matrix with Equalizer Shaders
     let sparkline_block = Block::default()
         .title(Span::styled(
             " 󰓅 14-DAY VELOCITY & BINGE MATRIX ",
@@ -388,9 +544,9 @@ pub fn render(frame: &mut Frame, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // Stats Header
-            Constraint::Length(4), // Sparkline Bars (Enlarged to 4 rows)
-            Constraint::Length(1), // Timeline tick marks
-            Constraint::Length(1), // 7-day mini activity row
+            Constraint::Length(4), // Equalizer Waveform (4 rows with vertical truecolor amplitude shaders)
+            Constraint::Length(1), // Timeline tick marks (Aligned pixel-perfect under each column)
+            Constraint::Length(1), // 7-day mini activity chip row
             Constraint::Min(0),    // Insights paragraph
         ])
         .split(sparkline_inner);
@@ -404,21 +560,12 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     ]));
     frame.render_widget(spark_header, spark_layout[0]);
 
-    let sparkline = Sparkline::default()
-        .data(&data.recent_activity)
-        .style(Style::default().fg(Color::Rgb(80, 250, 123)));
-    frame.render_widget(sparkline, spark_layout[1]);
+    // Render multi-band synthesizer equalizer waveform with shaders
+    let (waveform_lines, timeline_label) = render_equalizer_matrix(&data.recent_activity);
+    let waveform_widget = Paragraph::new(waveform_lines);
+    frame.render_widget(waveform_widget, spark_layout[1]);
 
-    // Day tick markers across the sparkline base
-    let tick_sep = velocity_card_width.saturating_sub(4).clamp(10, 70);
-    let tick_label = if tick_sep >= 48 {
-        " 14d      12d      10d       8d       6d       4d       2d     Today"
-    } else if tick_sep >= 36 {
-        " 14d    10d     7d     4d     Today"
-    } else {
-        " 14d ─── 7d ─── Today"
-    };
-    let timeline_widget = Paragraph::new(Line::from(Span::styled(tick_label, Style::default().fg(Color::Rgb(80, 85, 105)))));
+    let timeline_widget = Paragraph::new(timeline_label);
     frame.render_widget(timeline_widget, spark_layout[2]);
 
     // 7-day mini activity chip row
@@ -513,12 +660,11 @@ mod tests {
             completion_rate: 0.0,
             avg_score: 81.3,
             top_genres: vec![
-                ("Cyberpunk".to_string(), 2, 4.7),
-                ("Denpa".to_string(), 2, 4.7),
-                ("Drama".to_string(), 2, 4.7),
-                ("Sci-Fi".to_string(), 2, 4.7),
-                ("Urban".to_string(), 2, 4.7),
-                ("Action".to_string(), 1, 2.3),
+                ("Sports".to_string(), 10, 40.0),
+                ("Drama".to_string(), 6, 24.0),
+                ("Sci-Fi".to_string(), 6, 24.0),
+                ("Cyberpunk".to_string(), 6, 24.0),
+                ("Action".to_string(), 3, 12.0),
             ],
             era_distribution: vec![
                 ("Pre-2000 (Golden Age)", 1, 33.0),
@@ -527,27 +673,27 @@ mod tests {
                 ("2020s (Current Era)", 2, 67.0),
             ],
             format_distribution: vec![("TV".to_string(), 2), ("ONA".to_string(), 1)],
-            recent_activity: vec![0, 0, 0, 0, 0, 0, 2, 10, 0, 0, 1, 3, 0, 0],
-            taste_archetype: "✦ Eclectic Polymath",
+            recent_activity: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 12, 3],
+            taste_archetype: "✦ Kinetic Tactician & Grit Striker",
             top_shows: vec![
                 TopWatchedAnime {
                     id: 1,
-                    title: "Cyberpunk: Edgerunners".to_string(),
+                    title: "Aoashi Season 2".to_string(),
                     episodes_watched: 10,
-                    total_episodes: Some(10),
-                    total_hours: 3.6,
-                    completion_pct: 100.0,
+                    total_episodes: Some(24),
+                    total_hours: 3.8,
+                    completion_pct: 42.0,
                 },
                 TopWatchedAnime {
                     id: 2,
-                    title: "Frieren: Beyond Journey's End".to_string(),
-                    episodes_watched: 4,
-                    total_episodes: Some(28),
-                    total_hours: 1.5,
-                    completion_pct: 14.3,
+                    title: "Cyberpunk: Edgerunners 2".to_string(),
+                    episodes_watched: 3,
+                    total_episodes: Some(10),
+                    total_hours: 1.2,
+                    completion_pct: 30.0,
                 },
             ],
-            viewing_cadence: "❖ Night Owl (23:00 - 04:00)",
+            viewing_cadence: "✦ Afternoon Flow (12:00 - 18:00)",
             active_streak_days: 2,
             audio_preference: "Japanese Sub",
         });
@@ -566,10 +712,9 @@ mod tests {
             .collect();
 
         assert!(rendered_text.contains("SOLUS // ANIME WRAPPED"));
-        assert!(rendered_text.contains("Eclectic Polymath"));
-        assert!(rendered_text.contains("Night Owl"));
-        assert!(rendered_text.contains("Cyberpunk: Edgerunners"));
-        assert!(rendered_text.contains("Frieren"));
+        assert!(rendered_text.contains("Kinetic Tactician & Grit Striker"));
+        assert!(rendered_text.contains("Afternoon Flow"));
+        assert!(rendered_text.contains("Aoashi Season 2"));
         assert!(rendered_text.contains("Format Ratio"));
         assert!(rendered_text.contains("14-DAY VELOCITY"));
         assert!(rendered_text.contains("Uncharted Rotation Slot"));
