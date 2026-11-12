@@ -237,6 +237,12 @@ async fn main() -> anyhow::Result<()> {
                 AppMessage::PlaybackDone => {
                     state.now_playing = None;
                     state.player_stop = None;
+                    let remote_state_done = state.remote_state.clone();
+                    tokio::spawn(async move {
+                        let mut st = remote_state_done.write().await;
+                        st.is_playing = false;
+                    });
+                    let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
                     if state.screen == Screen::Playback {
                         state.screen = Screen::Detail;
                     }
@@ -3058,6 +3064,22 @@ async fn start_playback(
     let sock_path = format!("/tmp/solus-mpv-{}-{}.sock", anime_id, episode);
     let _ = std::fs::remove_file(&sock_path);
     opts.ipc_socket = Some(sock_path.clone());
+    let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
+    #[cfg(unix)]
+    let _ = std::os::unix::fs::symlink(&sock_path, "/tmp/solus-mpv.sock");
+
+    // Initialize remote companion state immediately
+    let remote_state_init = state.remote_state.clone();
+    let r_title = title.clone();
+    let r_ep = episode;
+    let r_ep_title = state.episode_titles.get(&episode).cloned().unwrap_or_else(|| format!("Episode {}", episode));
+    tokio::spawn(async move {
+        let mut st = remote_state_init.write().await;
+        st.is_playing = true;
+        st.title = r_title;
+        st.episode = r_ep;
+        st.episode_title = r_ep_title;
+    });
 
     // 4. Subtitle auto-sync
     if let Some(ref sub_u) = opts.sub_url {

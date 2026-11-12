@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 
@@ -84,7 +84,7 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
         HubItem {
             id: HubActionId::SubPreset,
             category: "❖ CINEMATIC SUBTITLES",
-            label: "Subtitle Typography Preset",
+            label: "Typography Preset",
             keywords: "sub subtitle font styling preset appearance libass text minimal netflix fansub oled",
             badge: format!("[ {} ▾ ]", cfg.subtitle_style.preset.label()),
             description: "High-legibility typography presets with custom stroke outlines, drop shadows, and opacity plates.",
@@ -107,35 +107,35 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
         HubItem {
             id: HubActionId::CastScan,
             category: "❖ TELEVISION & MOBILE REMOTE",
-            label: "Scan & Beam to TV (AirPlay / DLNA)",
+            label: "Scan & Beam to TV",
             keywords: "cast tv television airplay dlna upnp apple stream living room screen monitor",
-            badge: "Direct Play 󰄬".to_string(),
+            badge: "[ AirPlay / DLNA ]".to_string(),
             description: "Scans local Wi-Fi for Apple TV, LG webOS, Samsung Tizen, and Sony TVs to cast pristine 1080p/4K streams directly.",
             kind: HubActionKind::Launch("CastModal"),
         },
         HubItem {
             id: HubActionId::RemoteQrModal,
             category: "❖ TELEVISION & MOBILE REMOTE",
-            label: "Launch Mobile Remote QR Modal",
+            label: "Mobile Remote QR Code",
             keywords: "remote phone qr mobile companion touch web wifi lan couch bed",
-            badge: "QR Code ◈".to_string(),
+            badge: "[ QR Code ◈ ]".to_string(),
             description: "Displays a scannable ASCII QR code to control playback, volume, and episode switching from your smartphone.",
             kind: HubActionKind::Launch("RemoteModal"),
         },
         HubItem {
             id: HubActionId::RemoteOpenBrowser,
             category: "❖ TELEVISION & MOBILE REMOTE",
-            label: "Open Touch Remote in Browser",
+            label: "Open Remote in Browser",
             keywords: "browser web remote open http link localhost chrome safari",
-            badge: format!("http://{}:8484", crate::services::remote::get_local_ip()),
+            badge: "[ Port 8484 ]".to_string(),
             description: "Opens the zero-dependency OLED touch client in your local web browser.",
             kind: HubActionKind::Execute("OpenBrowser"),
         },
         HubItem {
             id: HubActionId::RemoteToggleServer,
             category: "❖ TELEVISION & MOBILE REMOTE",
-            label: "Mobile LAN Remote Server",
-            keywords: "server daemon listener port 8484 background mobile",
+            label: "Mobile Remote Daemon",
+            keywords: "server daemon listener port 8484 background mobile lan",
             badge: if cfg.remote.enabled { "[󰄬] Active (8484)".to_string() } else { "[ ] Disabled".to_string() },
             description: "Toggles the background lightweight Tokio HTTP server on local port 8484.",
             kind: HubActionKind::Toggle(cfg.remote.enabled),
@@ -145,7 +145,7 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
         HubItem {
             id: HubActionId::Anime4kMode,
             category: "❖ VISUAL & PLAYBACK ENGINE",
-            label: "Real-Time Anime4K Upscaler",
+            label: "Anime4K Shader Engine",
             keywords: "anime4k gpu shader upscale 4k 2x balanced ultra compute glsl mpv",
             badge: format!("[ {} ▾ ]", cfg.anime4k_mode.as_str()),
             description: "Direct OS GPU GLSL shaders reconstructing line-art and upscaling compressed streams to 4K in real time.",
@@ -157,7 +157,7 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
         HubItem {
             id: HubActionId::AmbilightGlow,
             category: "❖ VISUAL & PLAYBACK ENGINE",
-            label: "Cover-Adaptive Ambilight Glow",
+            label: "Adaptive Ambilight Glow",
             keywords: "ambilight color theme palette border glow dynamic dynamicimage hsl",
             badge: if cfg.ambilight_enabled { "[󰄬] Enabled".to_string() } else { "[ ] Disabled".to_string() },
             description: "Samples RGB color histograms from anime cover posters to dynamically tint Solus terminal borders per show.",
@@ -192,7 +192,7 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
         HubItem {
             id: HubActionId::AutoUpdateMode,
             category: "❖ SYSTEM & MAINTENANCE",
-            label: "Auto-Update Channel",
+            label: "Auto-Update Policy",
             keywords: "auto update startup channel install check background",
             badge: match update_idx {
                 0 => "[ Check Only ▾ ]".to_string(),
@@ -208,25 +208,25 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
         HubItem {
             id: HubActionId::HealthDoctor,
             category: "❖ SYSTEM & MAINTENANCE",
-            label: "Dependency Health Doctor (!)",
+            label: "Dependency Health Doctor",
             keywords: "doctor dependencies setup ani-cli mpv iina vlc check health",
-            badge: if state.has_ani_cli && state.has_any_player() { "Healthy 󰄬".to_string() } else { "Action Needed ⚠".to_string() },
+            badge: if state.has_ani_cli && state.has_any_player() { "[󰄬] Healthy".to_string() } else { "[!] Issues".to_string() },
             description: "Validates terminal prerequisites including ani-cli, mpv, ffmpeg, and graphical protocol drivers.",
             kind: HubActionKind::Launch("Setup"),
         },
         HubItem {
             id: HubActionId::AniListSync,
             category: "❖ SYSTEM & MAINTENANCE",
-            label: "AniList Library Sync & Login (L)",
+            label: "AniList Library Sync",
             keywords: "anilist sync token account auth login backup import export",
-            badge: if state.auth.token.is_some() { "Connected 󰄬".to_string() } else { "Logged Out".to_string() },
+            badge: if state.auth.token.is_some() { "[󰄬] Connected".to_string() } else { "[ ] Offline".to_string() },
             description: "Synchronizes Watching, Completed, and Planning lists with AniList and manages offline JSON backups.",
             kind: HubActionKind::Launch("AniListLogin"),
         },
     ]
 }
 
-/// Returns items matching the active fuzzy search query, sorted by score.
+/// Filters and ranks hub items using the Skim fuzzy matcher over titles, categories, and keywords.
 pub fn get_filtered_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
     let items = get_hub_items(cfg, state);
     let query = state.settings_query.trim();
@@ -250,7 +250,7 @@ pub fn get_filtered_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem
 
 /// Renders the Split-Deck Fuzzy Feature Command Hub.
 pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config) {
-    let area = centered_rect(84, 88, frame.area());
+    let area = centered_rect(88, 88, frame.area());
     frame.render_widget(Clear, area);
 
     let theme = state.theme();
@@ -305,8 +305,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
     let deck_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(54), // Left: Action List
-            Constraint::Percentage(46), // Right: Contextual Inspector
+            Constraint::Percentage(52), // Left: Action List
+            Constraint::Percentage(48), // Right: Contextual Inspector
         ])
         .split(root_chunks[1]);
 
@@ -332,6 +332,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
 
     let mut action_lines = Vec::new();
     let mut last_category = "";
+    let width = list_inner.width as usize;
 
     if filtered.is_empty() {
         action_lines.push(Line::from(Span::styled(
@@ -353,24 +354,57 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
             }
 
             let is_focused = idx == selected_idx;
-            let (cursor, style, badge_style) = if is_focused {
-                (
-                    " ▶ ",
-                    Style::default().fg(Color::White).bg(Color::Rgb(40, 45, 65)).add_modifier(Modifier::BOLD),
-                    Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD),
-                )
+            let cursor = if is_focused { " ▶ " } else { "   " };
+            let cursor_len = 3;
+
+            let badge_str = format!(" {} ", item.badge);
+            let badge_len = badge_str.chars().count();
+
+            // Calculate exact space available for the label without touching the badge
+            let max_label_len = width.saturating_sub(cursor_len + badge_len + 1);
+
+            let display_label = if item.label.chars().count() > max_label_len && max_label_len > 4 {
+                let truncated: String = item.label.chars().take(max_label_len.saturating_sub(1)).collect();
+                format!("{}…", truncated)
             } else {
-                (
-                    "   ",
-                    Style::default().fg(Color::Rgb(210, 215, 230)),
-                    Style::default().fg(Color::Rgb(140, 145, 165)).bg(Color::Rgb(20, 22, 32)),
-                )
+                item.label.to_string()
+            };
+
+            let label_len = display_label.chars().count();
+            let gap_len = width.saturating_sub(cursor_len + label_len + badge_len);
+            let gap = " ".repeat(gap_len);
+
+            let row_bg = if is_focused {
+                Color::Rgb(36, 42, 60)
+            } else {
+                Color::Reset
+            };
+
+            let cursor_style = if is_focused {
+                Style::default().fg(Color::Rgb(255, 120, 140)).bg(row_bg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(90, 95, 115)).bg(row_bg)
+            };
+
+            let label_style = if is_focused {
+                Style::default().fg(Color::White).bg(row_bg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(215, 220, 235)).bg(row_bg)
+            };
+
+            let gap_style = Style::default().bg(row_bg);
+
+            let badge_style = if is_focused {
+                Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(150, 155, 175)).bg(Color::Rgb(22, 25, 36))
             };
 
             let line = Line::from(vec![
-                Span::styled(cursor, style),
-                Span::styled(format!("{:<28} ", item.label), style),
-                Span::styled(format!(" {} ", item.badge), badge_style),
+                Span::styled(cursor, cursor_style),
+                Span::styled(display_label, label_style),
+                Span::styled(gap, gap_style),
+                Span::styled(badge_str, badge_style),
             ]);
             action_lines.push(line);
         }
@@ -410,7 +444,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
     frame.render_widget(footer_p, root_chunks[2]);
 }
 
-/// Renders the rich contextual inspection card on the right pane.
+/// Renders the right-hand inspection card for whichever item is currently focused.
 fn render_inspector_card(
     area: Rect,
     frame: &mut Frame,
@@ -440,11 +474,11 @@ fn render_inspector_card(
     ];
     frame.render_widget(Paragraph::new(header_lines), chunks[0]);
 
-    // 2. Description
+    // 2. Description with wrapping
     frame.render_widget(
         Paragraph::new(item.description)
             .style(Style::default().fg(Color::Rgb(180, 185, 205)))
-            .wrap(ratatui::widgets::Wrap { trim: true }),
+            .wrap(Wrap { trim: true }),
         chunks[1],
     );
 
@@ -469,15 +503,15 @@ fn render_inspector_card(
                     Span::styled("  ◈ Signage Guard: ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
                     Span::styled(
                         if cfg.subtitle_style.collision_avoidance {
-                            "Active (Detects bottom signs & shifts text {\\an8})"
+                            "Active (Auto-shifts text {\\an8} over signage)"
                         } else {
-                            "Inactive (Overlapping signs possible)"
+                            "Inactive (Sign collisions unhandled)"
                         },
                         Style::default().fg(Color::Rgb(170, 175, 195)),
                     ),
                 ]),
             ];
-            frame.render_widget(Paragraph::new(preview_lines), chunks[2]);
+            frame.render_widget(Paragraph::new(preview_lines).wrap(Wrap { trim: true }), chunks[2]);
         }
         HubActionId::CastScan => {
             let cast_lines = vec![
@@ -487,19 +521,19 @@ fn render_inspector_card(
                 ]),
                 Line::from(vec![
                     Span::styled("  Transmission: ", Style::default().fg(theme.accent)),
-                    Span::styled("Direct HLS Passthrough (Hardware Decoded on TV)", Style::default().fg(Color::Rgb(80, 250, 123))),
+                    Span::styled("Direct HLS Passthrough (Hardware Decoded)", Style::default().fg(Color::Rgb(80, 250, 123))),
                 ]),
                 Line::from(vec![
                     Span::styled("  Device Targets: ", Style::default().fg(theme.accent)),
-                    Span::styled("Apple TV 4K, LG webOS, Samsung Tizen, Sony Bravia", Style::default().fg(Color::Rgb(180, 185, 205))),
+                    Span::styled("Apple TV 4K, LG webOS, Samsung, Sony Bravia", Style::default().fg(Color::Rgb(180, 185, 205))),
                 ]),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("  ◈ Action: ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-                    Span::styled("Pressing [Enter] immediately broadcasts SSDP and AirPlay probes to discover screens.", Style::default().fg(Color::Rgb(200, 205, 220))),
+                    Span::styled("Press [Enter] to scan local Wi-Fi and beam playback directly.", Style::default().fg(Color::Rgb(200, 205, 220))),
                 ]),
             ];
-            frame.render_widget(Paragraph::new(cast_lines), chunks[2]);
+            frame.render_widget(Paragraph::new(cast_lines).wrap(Wrap { trim: true }), chunks[2]);
         }
         HubActionId::RemoteQrModal | HubActionId::RemoteOpenBrowser | HubActionId::RemoteToggleServer => {
             let remote_lines = vec![
@@ -508,12 +542,12 @@ fn render_inspector_card(
                     Span::styled(format!("http://{}:8484", crate::services::remote::get_local_ip()), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Listener Status: ", Style::default().fg(theme.accent)),
-                    Span::styled("● Active Wi-Fi Companion Daemon", Style::default().fg(Color::Rgb(80, 250, 123))),
+                    Span::styled("  Daemon Status: ", Style::default().fg(theme.accent)),
+                    Span::styled("● Active Wi-Fi Companion Listener", Style::default().fg(Color::Rgb(80, 250, 123))),
                 ]),
                 Line::from(vec![
                     Span::styled("  Touch Controls: ", Style::default().fg(theme.accent)),
-                    Span::styled("Live scrub slider, ±10s seek, Sub/Dub, Volume", Style::default().fg(Color::Rgb(180, 185, 205))),
+                    Span::styled("Live scrub bar, ±10s seek, Sub/Dub, Volume", Style::default().fg(Color::Rgb(180, 185, 205))),
                 ]),
                 Line::from(""),
                 Line::from(vec![
@@ -521,7 +555,7 @@ fn render_inspector_card(
                     Span::styled("Press [Enter] to display the high-contrast ASCII QR code.", Style::default().fg(Color::Rgb(200, 205, 220))),
                 ]),
             ];
-            frame.render_widget(Paragraph::new(remote_lines), chunks[2]);
+            frame.render_widget(Paragraph::new(remote_lines).wrap(Wrap { trim: true }), chunks[2]);
         }
         HubActionId::Anime4kMode => {
             let a4k_lines = vec![
@@ -538,7 +572,7 @@ fn render_inspector_card(
                     Span::styled("Restores fine lines, eliminates compression artifacts, 4K upscale.", Style::default().fg(Color::Rgb(80, 250, 123))),
                 ]),
             ];
-            frame.render_widget(Paragraph::new(a4k_lines), chunks[2]);
+            frame.render_widget(Paragraph::new(a4k_lines).wrap(Wrap { trim: true }), chunks[2]);
         }
         HubActionId::CheckUpdates | HubActionId::AutoUpdateMode => {
             let update_lines = vec![
@@ -562,7 +596,7 @@ fn render_inspector_card(
                     ),
                 ]),
             ];
-            frame.render_widget(Paragraph::new(update_lines), chunks[2]);
+            frame.render_widget(Paragraph::new(update_lines).wrap(Wrap { trim: true }), chunks[2]);
         }
         _ => {
             let generic_lines = vec![
@@ -576,7 +610,7 @@ fn render_inspector_card(
                     Span::styled("Press [Enter] to toggle or execute this action immediately.", Style::default().fg(Color::Rgb(200, 205, 220))),
                 ]),
             ];
-            frame.render_widget(Paragraph::new(generic_lines), chunks[2]);
+            frame.render_widget(Paragraph::new(generic_lines).wrap(Wrap { trim: true }), chunks[2]);
         }
     }
 
@@ -645,10 +679,10 @@ mod tests {
         let labels: Vec<&str> = items.iter().map(|i| i.label).collect();
         assert!(labels.iter().any(|l| l.contains("Typography Preset")));
         assert!(labels.iter().any(|l| l.contains("Signage Collision Guard")));
-        assert!(labels.iter().any(|l| l.contains("Mobile LAN Remote Server")));
-        assert!(labels.iter().any(|l| l.contains("Launch Mobile Remote QR Modal")));
+        assert!(labels.iter().any(|l| l.contains("Mobile Remote Daemon")));
+        assert!(labels.iter().any(|l| l.contains("Mobile Remote QR Code")));
         assert!(labels.iter().any(|l| l.contains("Scan & Beam to TV")));
-        assert!(labels.iter().any(|l| l.contains("Real-Time Anime4K Upscaler")));
+        assert!(labels.iter().any(|l| l.contains("Anime4K")));
     }
 
     #[test]
@@ -678,6 +712,6 @@ mod tests {
         state.settings_query = "sub".to_string();
         let res_sub = get_filtered_items(&cfg, &state);
         assert!(!res_sub.is_empty());
-        assert!(res_sub.iter().any(|i| i.label.contains("Preset") || i.label.contains("Subtitle")));
+        assert!(res_sub.iter().any(|i| i.label.contains("Preset") || i.label.contains("Typography")));
     }
 }

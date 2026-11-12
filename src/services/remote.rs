@@ -76,18 +76,67 @@ pub fn generate_terminal_qr(url: &str) -> Option<String> {
     Some(qr_str)
 }
 
+/// Locates the active mpv IPC Unix domain socket, checking preferred paths and active /tmp sockets.
+pub async fn resolve_active_socket(preferred: &str) -> Option<String> {
+    // 1. Direct path check
+    if std::path::Path::new(preferred).exists() {
+        return Some(preferred.to_string());
+    }
+
+    // 2. Canonical symlink check
+    if std::path::Path::new("/tmp/solus-mpv.sock").exists() {
+        return Some("/tmp/solus-mpv.sock".to_string());
+    }
+
+    // 3. Scan /tmp for any active solus-mpv-*.sock files (newest by modified time)
+    if let Ok(entries) = std::fs::read_dir("/tmp") {
+        let mut socks: Vec<(std::time::SystemTime, String)> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with("solus-mpv") && name.ends_with(".sock")
+            })
+            .filter_map(|e| {
+                let meta = e.metadata().ok()?;
+                let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                Some((modified, e.path().to_string_lossy().to_string()))
+            })
+            .collect();
+
+        socks.sort_by_key(|a| std::cmp::Reverse(a.0));
+        if let Some((_, path)) = socks.first() {
+            return Some(path.clone());
+        }
+    }
+
+    None
+}
+
 /// Dispatches an mpv JSON-RPC command directly over the local Unix domain socket.
-pub async fn send_mpv_command(sock_path: &str, command: &[&str]) -> bool {
-    let mut stream = match UnixStream::connect(sock_path).await {
+pub async fn send_mpv_json_command(sock_path: &str, cmd_value: serde_json::Value) -> bool {
+    let target = match resolve_active_socket(sock_path).await {
+        Some(t) => t,
+        None => return false,
+    };
+
+    let mut stream = match UnixStream::connect(&target).await {
         Ok(s) => s,
         Err(_) => return false,
     };
 
+    let payload = format!("{}\n", cmd_value);
+    if stream.write_all(payload.as_bytes()).await.is_err() {
+        return false;
+    }
+    stream.flush().await.is_ok()
+}
+
+/// Dispatches an mpv JSON-RPC string command array.
+pub async fn send_mpv_command(sock_path: &str, command: &[&str]) -> bool {
     let cmd_json = serde_json::json!({
         "command": command
     });
-    let payload = format!("{}\n", cmd_json);
-    stream.write_all(payload.as_bytes()).await.is_ok()
+    send_mpv_json_command(sock_path, cmd_json).await
 }
 
 /// Spawns the background HTTP server for the mobile remote companion.
@@ -176,7 +225,7 @@ pub fn spawn_remote_server(
                     };
 
                     if let Ok(req) = serde_json::from_str::<RemoteActionRequest>(body) {
-                        handle_remote_action(&req, &sock_path_clone).await;
+                        handle_remote_action(&req, &sock_path_clone, &state_clone).await;
                     }
 
                     let resp = "HTTP/1.1 200 OK\r\n\
@@ -202,36 +251,65 @@ pub fn spawn_remote_server(
     });
 }
 
-/// Executes an incoming touch remote command against mpv IPC.
-async fn handle_remote_action(req: &RemoteActionRequest, sock_path: &str) {
+/// Executes an incoming touch remote command against mpv IPC with optimistic local state sync.
+async fn handle_remote_action(
+    req: &RemoteActionRequest,
+    sock_path: &str,
+    state: &Arc<RwLock<RemotePlaybackState>>,
+) {
     match req.action.as_str() {
         "play_pause" => {
-            send_mpv_command(sock_path, &["cycle", "pause"]).await;
+            let cmd = serde_json::json!({ "command": ["cycle", "pause"] });
+            let _ = send_mpv_json_command(sock_path, cmd).await;
+            let mut st = state.write().await;
+            st.is_playing = !st.is_playing;
         }
         "seek" => {
             let delta = req.delta.unwrap_or(10.0);
-            let delta_str = delta.to_string();
-            send_mpv_command(sock_path, &["seek", &delta_str, "relative"]).await;
+            let cmd = serde_json::json!({ "command": ["seek", delta, "relative"] });
+            let _ = send_mpv_json_command(sock_path, cmd).await;
+            let mut st = state.write().await;
+            st.time_pos = (st.time_pos + delta).max(0.0);
         }
         "set_pos" => {
             if let Some(pos) = req.pos {
-                let pos_str = pos.to_string();
-                send_mpv_command(sock_path, &["set_property", "time-pos", &pos_str]).await;
+                let cmd = serde_json::json!({ "command": ["set_property", "time-pos", pos] });
+                let _ = send_mpv_json_command(sock_path, cmd).await;
+                let mut st = state.write().await;
+                st.time_pos = pos;
             }
         }
         "volume" => {
             let delta = req.delta.unwrap_or(5.0);
-            let delta_str = delta.to_string();
-            send_mpv_command(sock_path, &["add", "volume", &delta_str]).await;
+            let cmd = serde_json::json!({ "command": ["add", "volume", delta] });
+            let _ = send_mpv_json_command(sock_path, cmd).await;
+            let mut st = state.write().await;
+            st.volume = (st.volume + delta as i32).clamp(0, 100);
+        }
+        "set_volume" => {
+            if let Some(val) = req.value {
+                let clamped = val.clamp(0, 100);
+                let cmd = serde_json::json!({ "command": ["set_property", "volume", clamped] });
+                let _ = send_mpv_json_command(sock_path, cmd).await;
+                let mut st = state.write().await;
+                st.volume = clamped;
+            }
         }
         "skip_intro" => {
-            send_mpv_command(sock_path, &["seek", "85", "relative"]).await;
+            let cmd = serde_json::json!({ "command": ["seek", 85.0, "relative"] });
+            let _ = send_mpv_json_command(sock_path, cmd).await;
+            let mut st = state.write().await;
+            st.time_pos = (st.time_pos + 85.0).max(0.0);
         }
         "cycle_audio" => {
-            send_mpv_command(sock_path, &["cycle", "audio"]).await;
+            let cmd = serde_json::json!({ "command": ["cycle", "audio"] });
+            let _ = send_mpv_json_command(sock_path, cmd).await;
+            let mut st = state.write().await;
+            st.audio_mode = if st.audio_mode == "sub" { "dub".to_string() } else { "sub".to_string() };
         }
         "cycle_sub" => {
-            send_mpv_command(sock_path, &["cycle", "sub"]).await;
+            let cmd = serde_json::json!({ "command": ["cycle", "sub"] });
+            let _ = send_mpv_json_command(sock_path, cmd).await;
         }
         _ => {}
     }
@@ -259,7 +337,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     }
     .header {
       width: 100%;
-      max-width: 420px;
+      max-width: 440px;
       display: flex;
       justify-content: space-between;
       align-items: center;
@@ -277,97 +355,104 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       align-items: center;
       gap: 6px;
       font-weight: 600;
+      transition: all 0.2s ease;
     }
     .status-dot { width: 7px; height: 7px; border-radius: 50%; background: #50fa7b; }
     .card {
       width: 100%;
-      max-width: 420px;
+      max-width: 440px;
       background: #10121a;
       border: 1px solid #1f2330;
-      border-radius: 16px;
-      padding: 20px 18px;
+      border-radius: 20px;
+      padding: 22px 20px;
       margin-top: 20px;
-      box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+      box-shadow: 0 12px 32px rgba(0,0,0,0.5);
     }
-    .title { font-size: 1.25rem; font-weight: 700; color: #fff; margin-bottom: 4px; }
-    .subtitle { font-size: 0.9rem; color: #8a90a4; margin-bottom: 18px; }
-    .timeline { width: 100%; margin: 10px 0; }
+    .title { font-size: 1.3rem; font-weight: 800; color: #fff; margin-bottom: 4px; line-height: 1.25; }
+    .subtitle { font-size: 0.92rem; color: #8a90a4; margin-bottom: 20px; }
+    .timeline { width: 100%; margin: 12px 0; }
     .slider {
       width: 100%;
-      height: 6px;
-      border-radius: 3px;
+      height: 8px;
+      border-radius: 4px;
       background: #252a3a;
       outline: none;
       -webkit-appearance: none;
+      cursor: pointer;
     }
     .slider::-webkit-slider-thumb {
       -webkit-appearance: none;
-      width: 18px;
-      height: 18px;
+      width: 22px;
+      height: 22px;
       border-radius: 50%;
       background: #e63946;
       cursor: pointer;
+      box-shadow: 0 0 10px rgba(230, 57, 70, 0.6);
     }
     .time-labels {
       display: flex;
       justify-content: space-between;
-      font-size: 0.8rem;
-      color: #71778c;
-      margin-top: 6px;
+      font-size: 0.85rem;
+      color: #8b92a8;
+      margin-top: 8px;
       font-variant-numeric: tabular-nums;
+      font-weight: 600;
     }
     .controls {
       display: flex;
       justify-content: center;
       align-items: center;
-      gap: 16px;
-      margin: 22px 0 10px;
+      gap: 18px;
+      margin: 24px 0 14px;
     }
     .btn {
       background: #191c28;
       border: 1px solid #2b3044;
       color: #fff;
-      border-radius: 12px;
+      border-radius: 14px;
       cursor: pointer;
       display: flex;
       justify-content: center;
       align-items: center;
-      font-weight: 600;
-      transition: background 0.15s, transform 0.1s;
+      font-weight: 700;
+      transition: background 0.12s, transform 0.08s;
+      outline: none;
     }
-    .btn:active { transform: scale(0.94); background: #222738; }
-    .btn-seek { width: 62px; height: 50px; font-size: 0.95rem; }
+    .btn:active { transform: scale(0.92); background: #262c3f; }
+    .btn-seek { width: 68px; height: 54px; font-size: 1rem; }
     .btn-play {
-      width: 80px;
-      height: 60px;
+      width: 86px;
+      height: 64px;
       background: #e63946;
       border: none;
-      font-size: 1.4rem;
-      border-radius: 16px;
+      font-size: 1.5rem;
+      border-radius: 18px;
+      box-shadow: 0 6px 18px rgba(230, 57, 70, 0.45);
     }
     .btn-play:active { background: #c52b37; }
     .quick-actions {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      gap: 10px;
-      margin-top: 16px;
-    }
-    .btn-action { height: 42px; font-size: 0.85rem; color: #cfd4e2; }
-    .volume-box {
+      gap: 12px;
       margin-top: 18px;
-      padding-top: 14px;
+    }
+    .btn-action { height: 46px; font-size: 0.88rem; color: #cfd4e2; }
+    .volume-box {
+      margin-top: 22px;
+      padding-top: 16px;
       border-top: 1px solid #1a1c24;
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 14px;
     }
-    .vol-icon { font-size: 1.1rem; color: #8a90a4; }
+    .vol-icon { font-size: 1.25rem; color: #8a90a4; cursor: pointer; padding: 4px; }
+    .vol-val { font-size: 0.8rem; font-weight: 700; color: #71778c; width: 38px; text-align: right; }
   </style>
 </head>
 <body>
   <div class="header">
     <div class="brand">❖ SOLUS REMOTE</div>
-    <div class="status-badge"><div class="status-dot"></div>LIVE</div>
+    <div class="status-badge" id="conn-badge"><div class="status-dot"></div><span id="conn-text">LIVE</span></div>
   </div>
 
   <div class="card">
@@ -384,7 +469,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
 
     <div class="controls">
       <button class="btn btn-seek" onclick="sendAction('seek', { delta: -10 })">-10s</button>
-      <button class="btn btn-play" id="play-btn" onclick="sendAction('play_pause')">▶</button>
+      <button class="btn btn-play" id="play-btn" onclick="togglePlay()">▶</button>
       <button class="btn btn-seek" onclick="sendAction('seek', { delta: 10 })">+10s</button>
     </div>
 
@@ -392,30 +477,60 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       <button class="btn btn-action" onclick="sendAction('skip_intro')">◈ Skip Intro</button>
       <button class="btn btn-action" onclick="sendAction('seek', { delta: 85 })">◈ Jump Recap</button>
       <button class="btn btn-action" onclick="sendAction('cycle_sub')">Subtitles ▾</button>
-      <button class="btn btn-action" onclick="sendAction('cycle_audio')">Audio ▾</button>
+      <button class="btn btn-action" onclick="sendAction('cycle_audio')">Audio (Sub/Dub)</button>
     </div>
 
     <div class="volume-box">
       <span class="vol-icon" onclick="sendAction('volume', { delta: -5 })">󰕿</span>
-      <input type="range" min="0" max="100" value="80" class="slider" id="volume-slider" oninput="sendAction('volume', { delta: 0 })">
+      <input type="range" min="0" max="100" value="80" class="slider" id="volume-slider">
       <span class="vol-icon" onclick="sendAction('volume', { delta: 5 })">󰕾</span>
+      <span class="vol-val" id="vol-val">80%</span>
     </div>
   </div>
 
   <script>
     let isDragging = false;
+    let localIsPlaying = false;
+    let localTimePos = 0;
+    let localDuration = 0;
     const scrubber = document.getElementById('scrubber');
     const playBtn = document.getElementById('play-btn');
+    const volSlider = document.getElementById('volume-slider');
+    const volVal = document.getElementById('vol-val');
 
-    scrubber.addEventListener('mousedown', () => isDragging = true);
-    scrubber.addEventListener('touchstart', () => isDragging = true);
-    scrubber.addEventListener('change', () => {
-      isDragging = false;
-      sendAction('set_pos', { pos: parseFloat(scrubber.value) });
+    scrubber.addEventListener('input', () => {
+      isDragging = true;
+      document.getElementById('time-pos').innerText = formatTime(scrubber.value);
     });
 
+    scrubber.addEventListener('change', () => {
+      const pos = parseFloat(scrubber.value);
+      localTimePos = pos;
+      sendAction('set_pos', { pos: pos });
+      setTimeout(() => { isDragging = false; }, 300);
+    });
+
+    scrubber.addEventListener('touchend', () => {
+      setTimeout(() => { isDragging = false; }, 350);
+    });
+
+    volSlider.addEventListener('input', () => {
+      volVal.innerText = volSlider.value + '%';
+    });
+
+    volSlider.addEventListener('change', () => {
+      const val = parseInt(volSlider.value);
+      sendAction('set_volume', { value: val });
+    });
+
+    function togglePlay() {
+      localIsPlaying = !localIsPlaying;
+      playBtn.innerText = localIsPlaying ? '❚❚' : '▶';
+      sendAction('play_pause');
+    }
+
     function formatTime(s) {
-      if (!s || isNaN(s)) return '00:00';
+      if (!s || isNaN(s) || s < 0) return '00:00';
       const m = Math.floor(s / 60);
       const sec = Math.floor(s % 60);
       return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
@@ -424,33 +539,64 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     async function updateStatus() {
       try {
         const res = await fetch('/api/status');
-        if (!res.ok) return;
-        const data = await res.json();
-        document.getElementById('title').innerText = data.title || 'Solus Anime';
-        document.getElementById('subtitle').innerText = `Episode ${data.episode} — ${data.episode_title}`;
-        document.getElementById('time-pos').innerText = formatTime(data.time_pos);
-        document.getElementById('time-dur').innerText = formatTime(data.duration);
-        playBtn.innerText = data.is_playing ? '❚❚' : '▶';
-
-        if (!isDragging && data.duration > 0) {
-          scrubber.max = data.duration;
-          scrubber.value = data.time_pos;
+        if (!res.ok) {
+          document.getElementById('conn-badge').style.background = '#2a1a14';
+          document.getElementById('conn-badge').style.color = '#ffb86c';
+          document.getElementById('conn-text').innerText = 'STANDBY';
+          return;
         }
-      } catch (e) {}
+        document.getElementById('conn-badge').style.background = '#142a1e';
+        document.getElementById('conn-badge').style.color = '#50fa7b';
+        document.getElementById('conn-text').innerText = 'LIVE';
+
+        const data = await res.json();
+        localIsPlaying = data.is_playing;
+        localTimePos = data.time_pos;
+        localDuration = data.duration;
+
+        document.getElementById('title').innerText = data.title || 'Solus Anime Theatre';
+        document.getElementById('subtitle').innerText = data.is_playing 
+          ? `Episode ${data.episode} — ${data.episode_title}`
+          : 'Ready for playback';
+
+        if (!isDragging) {
+          document.getElementById('time-pos').innerText = formatTime(data.time_pos);
+          document.getElementById('time-dur').innerText = formatTime(data.duration);
+          playBtn.innerText = data.is_playing ? '❚❚' : '▶';
+
+          if (data.duration > 0) {
+            scrubber.max = data.duration;
+            scrubber.value = data.time_pos;
+          }
+        }
+
+        if (!volSlider.matches(':active')) {
+          volSlider.value = data.volume;
+          volVal.innerText = data.volume + '%';
+        }
+      } catch (e) {
+        document.getElementById('conn-badge').style.background = '#2a1a14';
+        document.getElementById('conn-badge').style.color = '#ffb86c';
+        document.getElementById('conn-text').innerText = 'STANDBY';
+      }
     }
 
     async function sendAction(action, payload = {}) {
+      if (navigator.vibrate) {
+        try { navigator.vibrate(25); } catch (e) {}
+      }
+
       try {
         await fetch('/api/action', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action, ...payload })
         });
-        setTimeout(updateStatus, 150);
+        setTimeout(updateStatus, 120);
       } catch (e) {}
     }
 
-    setInterval(updateStatus, 800);
+    setInterval(updateStatus, 750);
     updateStatus();
   </script>
 </body>
