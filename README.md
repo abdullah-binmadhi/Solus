@@ -2,8 +2,7 @@
 
 **The fast, featherlight anime player with zero ads, built-in AniList sync, and no browser required.**
 
-[![Watch Solus in Action](docs/videos/solus-demo.gif)](https://cap.so/s/7wa4j3rj83nt2ew)
-*(▸ Plays automatically above — click the preview to watch the full 1080p 60fps walkthrough)*
+https://github.com/user-attachments/assets/7f520a34-a56e-4465-b31e-c7046d798322
 
 `Solus` is an anime theatre that lives directly inside your terminal. You get crisp cover art, real episode thumbnails, multiple subtitle languages, and full AniList integration—all without opening a single browser tab, installing three ad-blockers, or fighting pop-up windows just to click Play.
 
