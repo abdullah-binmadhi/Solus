@@ -40,7 +40,7 @@ pub fn default_providers() -> Vec<ProviderOption> {
         ProviderOption {
             id: "zoko".to_string(),
             name: "ZokoAnime".to_string(),
-            server_label: "ZokoAnime [Direct 1080p]".to_string(),
+            server_label: "ZokoAnime".to_string(),
             master_url: None,
             qualities: vec![
                 QualityOption { label: "1080p".to_string(), url: String::new() },
@@ -55,7 +55,7 @@ pub fn default_providers() -> Vec<ProviderOption> {
         ProviderOption {
             id: "hd1".to_string(),
             name: "HD-1".to_string(),
-            server_label: "HD-1 [MegaPlay Cloud]".to_string(),
+            server_label: "HD-1".to_string(),
             master_url: None,
             qualities: vec![
                 QualityOption { label: "1080p".to_string(), url: String::new() },
@@ -69,7 +69,7 @@ pub fn default_providers() -> Vec<ProviderOption> {
         ProviderOption {
             id: "pahe".to_string(),
             name: "AnimePahe".to_string(),
-            server_label: "AnimePahe [ani-cli]".to_string(),
+            server_label: "AnimePahe".to_string(),
             master_url: None,
             qualities: vec![
                 QualityOption { label: "1080p BD".to_string(), url: String::new() },
@@ -83,7 +83,7 @@ pub fn default_providers() -> Vec<ProviderOption> {
         ProviderOption {
             id: "gogo".to_string(),
             name: "GogoAnime".to_string(),
-            server_label: "GogoAnime [ani-cli]".to_string(),
+            server_label: "GogoAnime".to_string(),
             master_url: None,
             qualities: vec![
                 QualityOption { label: "1080p".to_string(), url: String::new() },
@@ -344,11 +344,7 @@ pub async fn fetch_stream_info(
                 prov.subtitles = all_subtitles.clone();
                 prov.supports_sub = true;
                 prov.supports_dub = dub_avail;
-                if is_dub && !dub_avail {
-                    prov.server_label = "ZokoAnime (No Dub)".to_string();
-                } else {
-                    prov.server_label = "ZokoAnime [Direct 1080p]".to_string();
-                }
+                prov.server_label = "ZokoAnime".to_string();
             }
             "hd1" => {
                 prov.qualities = vec![
@@ -359,11 +355,7 @@ pub async fn fetch_stream_info(
                 prov.subtitles = all_subtitles.clone();
                 prov.supports_sub = true;
                 prov.supports_dub = dub_avail;
-                if is_dub && !dub_avail {
-                    prov.server_label = "HD-1 (No Dub)".to_string();
-                } else {
-                    prov.server_label = "HD-1 [MegaPlay Cloud]".to_string();
-                }
+                prov.server_label = "HD-1".to_string();
             }
             "pahe" => {
                 prov.qualities = vec![
@@ -374,11 +366,7 @@ pub async fn fetch_stream_info(
                 prov.subtitles = all_subtitles.clone();
                 prov.supports_sub = true;
                 prov.supports_dub = false;
-                if is_dub {
-                    prov.server_label = "AnimePahe (No Dub)".to_string();
-                } else {
-                    prov.server_label = "AnimePahe [ani-cli]".to_string();
-                }
+                prov.server_label = "AnimePahe".to_string();
             }
             "gogo" => {
                 prov.qualities = vec![
@@ -390,11 +378,7 @@ pub async fn fetch_stream_info(
                 prov.subtitles = all_subtitles.clone();
                 prov.supports_sub = true;
                 prov.supports_dub = dub_avail;
-                if is_dub && !dub_avail {
-                    prov.server_label = "GogoAnime (No Dub)".to_string();
-                } else {
-                    prov.server_label = "GogoAnime [ani-cli]".to_string();
-                }
+                prov.server_label = "GogoAnime".to_string();
             }
             _ => {}
         }

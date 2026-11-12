@@ -156,7 +156,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                 let label = if is_unsupported_dub {
                     format!("{} (No Dub)", provider.name)
                 } else {
-                    provider.server_label.clone()
+                    provider.name.clone()
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(radio, radio_style),
