@@ -527,6 +527,17 @@ pub async fn delete_offline_episode(
 
 // ─── Analytics / Personal Anime Wrapped ───────────────────────────────────────
 
+/// Individual show summary in the user's top watched rotation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopWatchedAnime {
+    pub id: i64,
+    pub title: String,
+    pub episodes_watched: usize,
+    pub total_episodes: Option<usize>,
+    pub total_hours: f64,
+    pub completion_pct: f64,
+}
+
 /// Aggregated telemetry and taste metrics for the user's viewing history.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserAnalytics {
@@ -541,6 +552,10 @@ pub struct UserAnalytics {
     pub format_distribution: Vec<(String, usize)>,
     pub recent_activity: Vec<u64>, // last 14 days activity counts
     pub taste_archetype: &'static str,
+    pub top_shows: Vec<TopWatchedAnime>,
+    pub viewing_cadence: &'static str,
+    pub active_streak_days: usize,
+    pub audio_preference: &'static str,
 }
 
 /// Query local SQLite watch history and anime metadata to generate personalized analytics.
@@ -576,9 +591,9 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     let total_seconds = tracked_seconds + (untracked_episodes as f64 * 24.0 * 60.0);
     let total_hours = total_seconds / 3600.0;
 
-    // 3. Watched anime statistics (genres, eras, formats, scores)
+    // 3. Watched anime statistics (genres, eras, formats, scores, top rotation)
     let rows = sqlx::query(
-        "SELECT a.id, a.genres, a.season_year, a.format, a.score, a.episodes,
+        "SELECT a.id, a.title_english, a.title_romaji, a.genres, a.season_year, a.format, a.score, a.episodes,
                 COUNT(h.episode) as watched_count
          FROM history h
          JOIN anime a ON h.anime_id = a.id
@@ -586,6 +601,23 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     )
     .fetch_all(pool)
     .await?;
+
+    let progress_rows = sqlx::query(
+        "SELECT anime_id, COALESCE(SUM(position_secs), 0.0) as dur, COUNT(*) as cnt
+         FROM playback_progress
+         GROUP BY anime_id"
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut anime_durations: HashMap<i64, (f64, i64)> = HashMap::new();
+    for r in progress_rows {
+        let aid: i64 = r.try_get("anime_id").unwrap_or(0);
+        let dur: f64 = r.try_get("dur").unwrap_or(0.0);
+        let cnt: i64 = r.try_get("cnt").unwrap_or(0);
+        anime_durations.insert(aid, (dur, cnt));
+    }
 
     let mut completed_shows = 0usize;
     let mut in_progress_shows = 0usize;
@@ -602,14 +634,41 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     let mut total_dated_shows = 0usize;
 
     let mut format_counts: HashMap<String, usize> = HashMap::new();
+    let mut top_shows: Vec<TopWatchedAnime> = Vec::new();
 
     for row in &rows {
+        let aid: i64 = row.try_get("id").unwrap_or(0);
+        let title_eng: Option<String> = row.try_get("title_english").unwrap_or(None);
+        let title_rom: String = row.try_get("title_romaji").unwrap_or_else(|_| "Unknown".to_string());
+        let display_title = title_eng.filter(|s| !s.trim().is_empty()).unwrap_or(title_rom);
+
         let watched: i64 = row.try_get("watched_count").unwrap_or(0);
         let ep_opt: Option<i64> = row.try_get("episodes").unwrap_or(None);
         let score_opt: Option<i64> = row.try_get("score").unwrap_or(None);
         let year_opt: Option<i64> = row.try_get("season_year").unwrap_or(None);
         let format_opt: Option<String> = row.try_get("format").unwrap_or(None);
         let genres_raw: String = row.try_get("genres").unwrap_or_else(|_| "[]".to_string());
+
+        let eps_watched = watched as usize;
+        let total_eps = ep_opt.map(|e| e as usize);
+        let completion_pct = match total_eps {
+            Some(t) if t > 0 => ((eps_watched as f64 / t as f64) * 100.0).min(100.0),
+            _ => 0.0,
+        };
+
+        let (tracked_sec, tracked_cnt) = anime_durations.get(&aid).copied().unwrap_or((0.0, 0));
+        let untracked = watched.saturating_sub(tracked_cnt).max(0);
+        let anime_total_sec = tracked_sec + (untracked as f64 * 1440.0);
+        let anime_hours = anime_total_sec / 3600.0;
+
+        top_shows.push(TopWatchedAnime {
+            id: aid,
+            title: display_title,
+            episodes_watched: eps_watched,
+            total_episodes: total_eps,
+            total_hours: anime_hours,
+            completion_pct,
+        });
 
         if let Some(total_eps) = ep_opt {
             if total_eps > 0 && watched >= total_eps {
@@ -652,6 +711,13 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
         }
     }
 
+    top_shows.sort_by(|a, b| {
+        b.episodes_watched
+            .cmp(&a.episodes_watched)
+            .then_with(|| b.total_hours.partial_cmp(&a.total_hours).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    top_shows.truncate(4);
+
     let total_shows = completed_shows + in_progress_shows;
     let completion_rate = if total_shows > 0 {
         (completed_shows as f64 / total_shows as f64) * 100.0
@@ -677,7 +743,7 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
         })
         .collect();
     top_genres.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    top_genres.truncate(8);
+    top_genres.truncate(10);
 
     let dated_div = total_dated_shows.max(1) as f64;
     let era_distribution = vec![
@@ -690,28 +756,82 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     let mut format_distribution: Vec<(String, usize)> = format_counts.into_iter().collect();
     format_distribution.sort_by_key(|a| std::cmp::Reverse(a.1));
 
-    // 4. Activity across last 14 days
+    // 4. Activity across last 14 days, viewing window cadence, and active streak
     let day_seconds = 86400i64;
     let mut recent_activity = vec![0u64; 14];
-    let start_14_days_ago = now - (14 * day_seconds);
+    let _start_14_days_ago = now - (14 * day_seconds);
 
-    let history_timestamps: Vec<i64> = sqlx::query_scalar(
-        "SELECT watched_at FROM history WHERE watched_at >= ?"
+    let all_history_timestamps: Vec<i64> = sqlx::query_scalar(
+        "SELECT watched_at FROM history ORDER BY watched_at DESC"
     )
-    .bind(start_14_days_ago)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
 
-    for ts in history_timestamps {
+    let mut hour_buckets = [0usize; 4]; // [Night (22-04), Morning (05-11), Afternoon (12-17), Prime (18-21)]
+    let mut day_set = std::collections::BTreeSet::new();
+
+    for &ts in &all_history_timestamps {
         let diff = now - ts;
         if diff >= 0 {
             let day_idx = (diff / day_seconds) as usize;
             if day_idx < 14 {
                 recent_activity[13 - day_idx] += 1;
             }
+            day_set.insert(ts / day_seconds);
+        }
+
+        let hour = ((ts.rem_euclid(day_seconds)) / 3600) as usize;
+        match hour {
+            22..=23 | 0..=4 => hour_buckets[0] += 1,
+            5..=11 => hour_buckets[1] += 1,
+            12..=17 => hour_buckets[2] += 1,
+            _ => hour_buckets[3] += 1,
         }
     }
+
+    let viewing_cadence = if hour_buckets[0] >= hour_buckets[1] && hour_buckets[0] >= hour_buckets[2] && hour_buckets[0] >= hour_buckets[3] {
+        "❖ Night Owl (23:00 - 04:00)"
+    } else if hour_buckets[3] >= hour_buckets[1] && hour_buckets[3] >= hour_buckets[2] {
+        "◈ Prime Time (18:00 - 22:00)"
+    } else if hour_buckets[2] >= hour_buckets[1] {
+        "✦ Afternoon Binger (12:00 - 18:00)"
+    } else {
+        "⬡ Morning Ritual (06:00 - 11:00)"
+    };
+
+    let today_day = now / day_seconds;
+    let mut active_streak_days = 0usize;
+    let mut check_day = today_day;
+    if !day_set.contains(&check_day) {
+        check_day = today_day.saturating_sub(1);
+    }
+    while day_set.contains(&check_day) {
+        active_streak_days += 1;
+        check_day = check_day.saturating_sub(1);
+    }
+
+    let sub_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM playback_prefs WHERE audio_mode = 'sub'"
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    let dub_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM playback_prefs WHERE audio_mode = 'dub'"
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+
+    let audio_preference = if dub_count > sub_count {
+        "English Dub"
+    } else if sub_count > 0 || total_episodes > 0 {
+        "Japanese Sub"
+    } else {
+        "Sub / Dub"
+    };
 
     // 5. Determine personality archetype based on leading genre
     let taste_archetype = match top_genres.first().map(|(g, _, _)| g.as_str()) {
@@ -740,6 +860,10 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
         format_distribution,
         recent_activity,
         taste_archetype,
+        top_shows,
+        viewing_cadence,
+        active_streak_days,
+        audio_preference,
     })
 }
 
@@ -1144,5 +1268,10 @@ mod tests {
         assert_eq!(analytics.taste_archetype, "✦ The Narrative Philosopher");
         assert_eq!(analytics.era_distribution[0].0, "Pre-2000 (Golden Age)");
         assert!(analytics.era_distribution[0].1 >= 1);
+        assert_eq!(analytics.top_shows.len(), 2);
+        assert_eq!(analytics.top_shows[0].title, "Serial Experiments Lain");
+        assert_eq!(analytics.top_shows[0].episodes_watched, 13);
+        assert!(!analytics.viewing_cadence.is_empty());
+        assert_eq!(analytics.audio_preference, "Japanese Sub");
     }
 }
