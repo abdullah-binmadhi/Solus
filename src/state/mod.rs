@@ -397,6 +397,18 @@ pub struct AppState {
 
     /// Personal Anime Wrapped & viewing telemetry data
     pub analytics_data: Option<crate::db::user::UserAnalytics>,
+
+    /// Metadata for an available application update if one was detected
+    pub available_update: Option<crate::services::updater::UpdateInfo>,
+
+    /// Whether an update check is actively in-flight
+    pub is_checking_update: bool,
+
+    /// Whether a self-update download is actively in progress
+    pub is_updating: bool,
+
+    /// Live update download progress: (percentage, speed_str)
+    pub update_progress: Option<(f32, String)>,
 }
 
 impl AppState {
@@ -515,6 +527,10 @@ impl AppState {
             ambilight_enabled: true,
             anime4k_mode:     crate::config::Anime4KMode::Off,
             analytics_data:   None,
+            available_update: None,
+            is_checking_update: false,
+            is_updating:      false,
+            update_progress:  None,
         }
     }
 
@@ -831,8 +847,7 @@ impl AppState {
                 self.episode_list
                     .iter()
                     .copied()
-                    .filter(|ep| *ep <= max_aired)
-                    .last()
+                    .rfind(|ep| *ep <= max_aired)
             })
             .or_else(|| self.episode_list.first().copied())
             .unwrap_or(1)

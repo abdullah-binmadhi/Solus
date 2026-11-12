@@ -16,6 +16,7 @@ const AUDIO_CHOICES: [&str; 2] = ["sub", "dub"];
 const SKIP_CHOICES: [&str; 2] = ["enabled", "disabled"];
 const ANIME4K_CHOICES: [&str; 3] = ["off", "balanced 2x", "ultra 4k"];
 const AMBILIGHT_CHOICES: [&str; 2] = ["enabled", "disabled"];
+const UPDATE_CHOICES: [&str; 3] = ["check only", "auto-install", "off"];
 pub const SUBTITLE_CHOICES: [&str; 11] = [
     "English",
     "Arabic",
@@ -49,15 +50,16 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(0),
+            Constraint::Length(2), // 0: Header
+            Constraint::Length(3), // 1: Player
+            Constraint::Length(3), // 2: Quality
+            Constraint::Length(3), // 3: Audio
+            Constraint::Length(3), // 4: Subtitle
+            Constraint::Length(3), // 5: Auto-Skip
+            Constraint::Length(3), // 6: Anime4K
+            Constraint::Length(3), // 7: Ambilight
+            Constraint::Length(3), // 8: Auto-Update
+            Constraint::Min(0),    // 9: Footer
         ])
         .split(inner);
 
@@ -68,7 +70,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
-                "Use j/k to focus a row, h/l to change it, Esc to close.",
+                "Use j/k to focus a row, h/l to change it, u to check updates, Esc to close.",
                 Style::default().fg(Color::Rgb(150, 150, 170)),
             )),
         ]),
@@ -82,12 +84,32 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
     render_setting_row(rows[5], "Auto-Skip", &SKIP_CHOICES, if cfg.auto_skip_intro { 0 } else { 1 }, state.settings_cursor == 4, frame);
     render_setting_row(rows[6], "Anime4K", &ANIME4K_CHOICES, anime4k_index(&cfg.anime4k_mode), state.settings_cursor == 5, frame);
     render_setting_row(rows[7], "Ambilight", &AMBILIGHT_CHOICES, if cfg.ambilight_enabled { 0 } else { 1 }, state.settings_cursor == 6, frame);
+    render_setting_row(rows[8], "Auto-Update", &UPDATE_CHOICES, update_index(&cfg.update), state.settings_cursor == 7, frame);
 
     let preferred_ready = match cfg.player {
         config::Player::Mpv => state.has_mpv || state.has_iina,
         config::Player::Iina => state.has_iina,
         config::Player::Vlc => state.has_vlc,
     };
+
+    let update_line = if state.is_checking_update {
+        Line::from(Span::styled("󰑮 Checking GitHub for latest Solus updates...", Style::default().fg(Color::Rgb(125, 207, 255))))
+    } else if state.is_updating {
+        let (pct, ref spd) = state.update_progress.as_ref().cloned().unwrap_or((0.0, String::new()));
+        Line::from(Span::styled(format!("󰚰 Downloading update: {:.0}% ({})", pct, spd), Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)))
+    } else if let Some(ref info) = state.available_update {
+        Line::from(vec![
+            Span::styled("❖ Update available: ", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
+            Span::styled(&info.latest_version, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(if info.is_homebrew { " (brew upgrade solus)" } else { " · Press [u] or [U] to install now." }, Style::default().fg(Color::Rgb(180, 0, 255))),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(format!("Solus v{} · ", env!("CARGO_PKG_VERSION")), Style::default().fg(Color::Rgb(130, 140, 160))),
+            Span::styled("Press [u] to check for updates", Style::default().fg(Color::Rgb(180, 0, 255))),
+        ])
+    };
+
     let footer = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -112,12 +134,14 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
             ),
         ]),
         Line::from(""),
+        update_line,
+        Line::from(""),
         Line::from(Span::styled(
             "Changes save immediately to config.toml",
             Style::default().fg(Color::Rgb(120, 120, 140)),
         )),
     ]);
-    frame.render_widget(footer, rows[6]);
+    frame.render_widget(footer, rows[9]);
 }
 
 fn render_setting_row(
@@ -208,6 +232,16 @@ fn sub_index(lang: &str) -> usize {
         .iter()
         .position(|&l| l.eq_ignore_ascii_case(lang))
         .unwrap_or(0)
+}
+
+fn update_index(update: &config::UpdateConfig) -> usize {
+    if !update.check_on_startup {
+        2
+    } else if update.auto_install {
+        1
+    } else {
+        0
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

@@ -194,9 +194,9 @@ solus
 
 Solus creates its config file automatically on your first launch:
 
-- **macOS**: `~/Library/Application Support/ani-tui/config.toml`
-- **Linux**: `~/.config/ani-tui/config.toml`
-- **Windows**: `%APPDATA%\ani-tui\config.toml`
+- **macOS**: `~/Library/Application Support/solus/config.toml`
+- **Linux**: `~/.config/solus/config.toml`
+- **Windows**: `%APPDATA%\solus\config.toml`
 
 ```toml
 quality          = "best"      # best | 1080p | 720p | 480p | 360p

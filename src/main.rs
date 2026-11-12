@@ -29,8 +29,8 @@ const QUALITY_CHOICES: [config::Quality; 5] = [
 
 /// Messages sent from background tokio tasks to the UI event loop.
 enum AppMessage {
-    /// Home screen data loaded / refreshed
-    HomeData(ui::home::HomeData),
+    /// Home screen data loaded / refreshed (boxed to shrink AppMessage enum size)
+    HomeData(Box<ui::home::HomeData>),
     /// A log line from ani-cli stdout or stderr
     PlaybackLog(String),
     /// ani-cli process exited
@@ -89,6 +89,14 @@ enum AppMessage {
     AnimeMalIdReady(i64, i64),
     /// Viewing telemetry and taste analytics loaded from local SQLite
     AnalyticsDataReady(db::user::UserAnalytics),
+    /// Background update check completed (Option<UpdateInfo>)
+    UpdateCheckResult(Option<services::updater::UpdateInfo>),
+    /// Background update download progress (percentage, speed_str)
+    UpdateProgress(f32, String),
+    /// Background update successfully applied to disk (new_version)
+    UpdateSuccess(String),
+    /// Background update failed (error message)
+    UpdateFailed(String),
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -149,10 +157,50 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
             match result {
-                Ok(data) => { let _ = tx2.send(AppMessage::HomeData(data)).await; }
+                Ok(data) => { let _ = tx2.send(AppMessage::HomeData(Box::new(data))).await; }
                 Err(e)   => {
                     eprintln!("Sync error: {e}");
-                    let _ = tx2.send(AppMessage::HomeData(ui::home::HomeData::empty())).await;
+                    let _ = tx2.send(AppMessage::HomeData(Box::new(ui::home::HomeData::empty()))).await;
+                }
+            }
+        });
+    }
+
+    // ── Startup: non-blocking background auto-update check ────────────────────
+    if cfg.update.check_on_startup {
+        let tx_update = tx.clone();
+        let pool_update = pool.clone();
+        let auto_install = cfg.update.auto_install;
+        let check_interval = cfg.update.check_interval;
+        tokio::spawn(async move {
+            let now = unix_now();
+            let should_check = match db::sync::last_synced(&pool_update, "update_check").await {
+                Ok(Some(last)) => (now - last) >= check_interval as i64,
+                _ => true,
+            };
+
+            if should_check {
+                let client = reqwest::Client::new();
+                let current_ver = env!("CARGO_PKG_VERSION");
+                if let Ok(update_opt) = services::updater::check_for_updates(&client, current_ver).await {
+                    let _ = db::sync::mark_synced(&pool_update, "update_check", now).await;
+                    if let Some(ref info) = update_opt {
+                        if auto_install && !info.is_homebrew {
+                            let download_url = info.download_url.clone();
+                            let target_ver = info.latest_version.clone();
+                            let tx_dl = tx_update.clone();
+                            tokio::spawn(async move {
+                                let _ = services::updater::download_and_install_update(
+                                    &client,
+                                    &download_url,
+                                    &target_ver,
+                                    tx_dl,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                    let _ = tx_update.send(AppMessage::UpdateCheckResult(update_opt)).await;
                 }
             }
         });
@@ -167,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
             needs_redraw = true;
             match msg {
                 AppMessage::HomeData(data) => {
-                    home_data        = data;
+                    home_data        = *data;
                     state.is_loading = false;
                     refresh_home_cover(&mut state, &home_data, &pool, &tx);
                     prefetch_all_home_covers(&home_data, &mut state, &pool, &tx);
@@ -365,7 +413,10 @@ async fn main() -> anyhow::Result<()> {
                 AppMessage::BackupExportCompleted(res) => {
                     match res {
                         Ok(count) => {
-                            state.login_status = Some(format!("❖ Backup generated: {} titles exported to ~/.config/ani-tui/solus_backup.json", count));
+                            let dest_str = config::Config::config_dir()
+                                .map(|d| d.join("solus_backup.json").display().to_string())
+                                .unwrap_or_else(|_| "solus_backup.json".to_string());
+                            state.login_status = Some(format!("❖ Backup generated: {} titles exported to {}", count, dest_str));
                             state.show_toast(format!("❖ Backup created: {} anime", count), unix_now());
                         }
                         Err(err) => {
@@ -479,6 +530,34 @@ async fn main() -> anyhow::Result<()> {
                 }
                 AppMessage::AnalyticsDataReady(analytics) => {
                     state.analytics_data = Some(analytics);
+                }
+                AppMessage::UpdateCheckResult(update_opt) => {
+                    state.is_checking_update = false;
+                    if let Some(info) = update_opt {
+                        let new_ver = info.latest_version.clone();
+                        let is_brew = info.is_homebrew;
+                        state.available_update = Some(info);
+                        if is_brew {
+                            state.show_toast(format!("❖ Solus {} available: brew upgrade solus", new_ver), unix_now());
+                        } else {
+                            state.show_toast(format!("❖ Solus {} is available! Press [U] to update.", new_ver), unix_now());
+                        }
+                    }
+                }
+                AppMessage::UpdateProgress(pct, spd) => {
+                    state.is_updating = true;
+                    state.update_progress = Some((pct, spd));
+                }
+                AppMessage::UpdateSuccess(version) => {
+                    state.is_updating = false;
+                    state.update_progress = None;
+                    state.available_update = None;
+                    state.show_toast(format!("󰄬 Solus updated to {}! Restart to apply.", version), unix_now());
+                }
+                AppMessage::UpdateFailed(err) => {
+                    state.is_updating = false;
+                    state.update_progress = None;
+                    state.show_toast(format!("Update failed: {}", err), unix_now());
                 }
             }
         }
@@ -604,7 +683,7 @@ async fn handle_key(
         Screen::Playback => handle_playback(key, state, pool, cfg, tx).await,
         Screen::Search   => handle_search(key, state, pool, tx).await,
         Screen::Help     => { state.go_back(); }
-        Screen::Settings => handle_settings(key, state, cfg).await,
+        Screen::Settings => handle_settings(key, state, cfg, tx).await,
         Screen::Setup    => handle_setup(key, state).await,
         Screen::AniListLogin => handle_login(key, state, home_data, pool, cfg, tx).await,
         Screen::TailoredWizard => handle_tailored_wizard(key, state),
@@ -678,6 +757,42 @@ async fn handle_home(
             state.theme_index = (state.theme_index + 1) % ui::theme::THEMES.len();
             let theme_name = state.theme().name;
             state.show_toast(format!("Theme: {}", theme_name), unix_now());
+        }
+        KeyCode::Char('U') => {
+            if let Some(ref info) = state.available_update.clone() {
+                if info.is_homebrew {
+                    state.show_toast("Installed via Homebrew: run 'brew upgrade solus'", unix_now());
+                } else if !state.is_updating {
+                    state.is_updating = true;
+                    state.show_toast(format!("Downloading Solus {}...", info.latest_version), unix_now());
+                    let download_url = info.download_url.clone();
+                    let target_ver = info.latest_version.clone();
+                    let tx_update = tx.clone();
+                    tokio::spawn(async move {
+                        let client = reqwest::Client::new();
+                        if let Err(e) = services::updater::download_and_install_update(
+                            &client,
+                            &download_url,
+                            &target_ver,
+                            tx_update.clone(),
+                        )
+                        .await
+                        {
+                            let _ = tx_update.send(AppMessage::UpdateFailed(e.to_string())).await;
+                        }
+                    });
+                }
+            } else if !state.is_checking_update {
+                state.is_checking_update = true;
+                state.show_toast("Checking GitHub for updates...", unix_now());
+                let tx_check = tx.clone();
+                tokio::spawn(async move {
+                    let client = reqwest::Client::new();
+                    let current_ver = env!("CARGO_PKG_VERSION");
+                    let res = services::updater::check_for_updates(&client, current_ver).await.unwrap_or(None);
+                    let _ = tx_check.send(AppMessage::UpdateCheckResult(res)).await;
+                });
+            }
         }
         // Remove highlighted anime from Continue Watching or Watchlist, or stop active player
         KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
@@ -821,10 +936,10 @@ async fn handle_home(
                 )
                 .await;
                 match result {
-                    Ok(data) => { let _ = tx2.send(AppMessage::HomeData(data)).await; }
+                    Ok(data) => { let _ = tx2.send(AppMessage::HomeData(Box::new(data))).await; }
                     Err(e)   => {
                         eprintln!("Refresh error: {e}");
-                        let _ = tx2.send(AppMessage::HomeData(ui::home::HomeData::empty())).await;
+                        let _ = tx2.send(AppMessage::HomeData(Box::new(ui::home::HomeData::empty()))).await;
                     }
                 }
             });
@@ -883,7 +998,7 @@ async fn open_detail_from_anime(
     let title_english = anime.title_english.clone();
     let should_check_airing = anime.status.as_deref() == Some("RELEASING") || anime.next_airing_episode.is_none();
     state.open_detail(anime);
-    if let Some(ref blob) = state.selected_anime.as_ref().and_then(|a| a.cover_blob.as_ref()) {
+    if let Some(blob) = state.selected_anime.as_ref().and_then(|a| a.cover_blob.as_ref()) {
         if let Ok(dyn_img) = image::load_from_memory(blob) {
             let card_img = prepare_card_cover(dyn_img.clone());
             let portrait_img = prepare_portrait_cover(dyn_img);
@@ -1258,6 +1373,34 @@ async fn handle_detail(
             state.is_download_modal_open = true;
             state.download_modal_mode = 0;
             state.download_range_input.clear();
+        }
+
+        // Install available update if present
+        KeyCode::Char('U') => {
+            if let Some(ref info) = state.available_update.clone() {
+                if info.is_homebrew {
+                    state.show_toast("Installed via Homebrew: run 'brew upgrade solus'", unix_now());
+                } else if !state.is_updating {
+                    state.is_updating = true;
+                    state.show_toast(format!("Downloading Solus {}...", info.latest_version), unix_now());
+                    let download_url = info.download_url.clone();
+                    let target_ver = info.latest_version.clone();
+                    let tx_update = tx.clone();
+                    tokio::spawn(async move {
+                        let client = reqwest::Client::new();
+                        if let Err(e) = services::updater::download_and_install_update(
+                            &client,
+                            &download_url,
+                            &target_ver,
+                            tx_update.clone(),
+                        )
+                        .await
+                        {
+                            let _ = tx_update.send(AppMessage::UpdateFailed(e.to_string())).await;
+                        }
+                    });
+                }
+            }
         }
 
         // Toggle Watched status for the highlighted episode
@@ -1780,11 +1923,12 @@ async fn handle_settings(
     key: event::KeyEvent,
     state: &mut AppState,
     cfg: &mut config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => state.go_back(),
         KeyCode::Char('j') | KeyCode::Down => {
-            state.settings_cursor = (state.settings_cursor + 1).min(6);
+            state.settings_cursor = (state.settings_cursor + 1).min(7);
         }
         KeyCode::Char('k') | KeyCode::Up => {
             state.settings_cursor = state.settings_cursor.saturating_sub(1);
@@ -1806,6 +1950,42 @@ async fn handle_settings(
                 state.show_toast("Settings saved", unix_now());
             }
             refresh_dependency_status(state);
+        }
+        KeyCode::Char('u') | KeyCode::Char('U') => {
+            if let Some(ref info) = state.available_update.clone() {
+                if info.is_homebrew {
+                    state.show_toast("Installed via Homebrew: run 'brew upgrade solus'", unix_now());
+                } else if !state.is_updating {
+                    state.is_updating = true;
+                    state.show_toast(format!("Downloading Solus {}...", info.latest_version), unix_now());
+                    let download_url = info.download_url.clone();
+                    let target_ver = info.latest_version.clone();
+                    let tx_update = tx.clone();
+                    tokio::spawn(async move {
+                        let client = reqwest::Client::new();
+                        if let Err(e) = services::updater::download_and_install_update(
+                            &client,
+                            &download_url,
+                            &target_ver,
+                            tx_update.clone(),
+                        )
+                        .await
+                        {
+                            let _ = tx_update.send(AppMessage::UpdateFailed(e.to_string())).await;
+                        }
+                    });
+                }
+            } else if !state.is_checking_update {
+                state.is_checking_update = true;
+                state.show_toast("Checking GitHub for updates...", unix_now());
+                let tx_check = tx.clone();
+                tokio::spawn(async move {
+                    let client = reqwest::Client::new();
+                    let current_ver = env!("CARGO_PKG_VERSION");
+                    let res = services::updater::check_for_updates(&client, current_ver).await.unwrap_or(None);
+                    let _ = tx_check.send(AppMessage::UpdateCheckResult(res)).await;
+                });
+            }
         }
         _ => {}
     }
@@ -1921,9 +2101,9 @@ async fn handle_login(
 
                     // Strip accidental wrapping quotes from file drag-and-drop
                     let clean_input = input.trim_matches('\'').trim_matches('"').trim();
-                    let resolved_path = if clean_input.starts_with("~/") {
+                    let resolved_path = if let Some(stripped) = clean_input.strip_prefix("~/") {
                         if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) {
-                            home.join(&clean_input[2..])
+                            home.join(stripped)
                         } else {
                             std::path::PathBuf::from(clean_input)
                         }
@@ -2063,6 +2243,30 @@ fn apply_settings_delta(
         6 => {
             cfg.ambilight_enabled = !cfg.ambilight_enabled;
         }
+        7 => {
+            let current = if !cfg.update.check_on_startup {
+                2
+            } else if cfg.update.auto_install {
+                1
+            } else {
+                0
+            };
+            let next = (current + delta).rem_euclid(3);
+            match next {
+                0 => {
+                    cfg.update.check_on_startup = true;
+                    cfg.update.auto_install = false;
+                }
+                1 => {
+                    cfg.update.check_on_startup = true;
+                    cfg.update.auto_install = true;
+                }
+                _ => {
+                    cfg.update.check_on_startup = false;
+                    cfg.update.auto_install = false;
+                }
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -2116,8 +2320,8 @@ async fn handle_playback(
             state.go_back();
         }
         // Next episode without leaving playback
-        KeyCode::Char('n') => {
-            if state.selected_anime.is_some() {
+        KeyCode::Char('n')
+            if state.selected_anime.is_some() => {
                 let ep  = state.selected_episode.unwrap_or(1);
                 let max = state.episode_list.last().copied().unwrap_or(1);
                 if ep < max {
@@ -2126,7 +2330,6 @@ async fn handle_playback(
                     begin_playback_flow(state, pool, cfg, false, tx).await;
                 }
             }
-        }
         _ => {}
     }
 }
@@ -2197,12 +2400,11 @@ fn handle_tailored_wizard(
                 }
             }
         }
-        KeyCode::Backspace | KeyCode::Char('b') => {
-            if state.tailored_step > 0 {
+        KeyCode::Backspace | KeyCode::Char('b')
+            if state.tailored_step > 0 => {
                 state.tailored_step -= 1;
                 state.tailored_cursor = state.tailored_answers.choices[state.tailored_step];
             }
-        }
         _ => {}
     }
 }

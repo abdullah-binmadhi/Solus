@@ -56,12 +56,11 @@ pub fn slugify_title(title: &str) -> String {
         if c.is_alphanumeric() {
             clean.push(c.to_ascii_lowercase());
             prev_dash = false;
-        } else if c.is_whitespace() || c == '-' || c == '_' {
-            if !prev_dash && !clean.is_empty() {
+        } else if (c.is_whitespace() || c == '-' || c == '_')
+            && !prev_dash && !clean.is_empty() {
                 clean.push('-');
                 prev_dash = true;
             }
-        }
     }
     clean.trim_end_matches('-').to_string()
 }

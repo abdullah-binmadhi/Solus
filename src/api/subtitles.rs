@@ -215,7 +215,7 @@ impl SubtitleOption {
 /// 3. Russian
 /// 4. Indonesian (Bahasa Indonesia)
 /// 5. Remaining languages in original order
-pub fn prioritize_subtitles(subtitles: &mut Vec<SubtitleOption>) {
+pub fn prioritize_subtitles(subtitles: &mut [SubtitleOption]) {
     let lang_priority = |code: &str| -> usize {
         if code.starts_with("eng") {
             0
@@ -276,7 +276,7 @@ pub fn parse_m3u8_qualities(master_url: &str, m3u8_content: &str) -> Vec<Quality
         i += 1;
     }
 
-    raw_qualities.sort_by(|a, b| b.0.cmp(&a.0));
+    raw_qualities.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     let mut seen = HashSet::new();
     let mut result = Vec::new();
@@ -661,9 +661,9 @@ pub async fn ensure_cached_subtitle(
         return sub_url.to_string();
     }
 
-    let cache_dir = directories::ProjectDirs::from("", "", "ani-tui")
-        .map(|dirs| dirs.cache_dir().join("subs"))
-        .unwrap_or_else(|| std::env::temp_dir().join("solus-subs"));
+    let cache_dir = crate::config::Config::cache_dir()
+        .map(|dir| dir.join("subs"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("solus-subs"));
 
     if std::fs::create_dir_all(&cache_dir).is_err() {
         return sub_url.to_string();
@@ -684,11 +684,10 @@ pub async fn ensure_cached_subtitle(
 
     if let Ok(resp) = client.get(sub_url).timeout(Duration::from_secs(6)).send().await {
         if let Ok(bytes) = resp.bytes().await {
-            if !bytes.is_empty() {
-                if std::fs::write(&file_path, &bytes).is_ok() {
+            if !bytes.is_empty()
+                && std::fs::write(&file_path, &bytes).is_ok() {
                     return file_path.to_string_lossy().into_owned();
                 }
-            }
         }
     }
 
@@ -1003,7 +1002,7 @@ fn extract_anime_id(html: &str) -> Option<String> {
             let after = &part[href_idx + 6..];
             if let Some(end_idx) = after.find('"') {
                 let url = &after[..end_idx];
-                let slug = url.split('/').last().unwrap_or("");
+                let slug = url.split('/').next_back().unwrap_or("");
                 if let Some(last_dash) = slug.rfind('-') {
                     let id_part = &slug[last_dash + 1..];
                     if id_part.chars().all(|c| c.is_ascii_digit()) && !id_part.is_empty() {

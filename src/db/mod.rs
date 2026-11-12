@@ -84,6 +84,23 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Performance indexes for instant local browsing, scrobbling, and history aggregation
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_history_anime_id ON history(anime_id);")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_continue_watching_last_watched ON continue_watching(last_watched DESC);")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_category_entries_cat_pos ON category_entries(category, position);")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_playback_progress_updated ON playback_progress(updated_at DESC);")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_anime_status ON anime(status);")
+        .execute(pool)
+        .await?;
+
     Ok(())
 }
 

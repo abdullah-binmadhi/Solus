@@ -207,9 +207,7 @@ pub fn calculate_optimal_alignment(
     for &(s, e) in ref_intervals {
         let s_idx = ((s / BIN_SIZE).max(0.0) as usize).min(num_bins - 1);
         let e_idx = ((e / BIN_SIZE).max(0.0) as usize).min(num_bins - 1);
-        for b in s_idx..=e_idx {
-            ref_grid[b] = true;
-        }
+        ref_grid[s_idx..=e_idx].fill(true);
     }
 
     let compute_score = |scale: f64, offset: f64| -> u64 {
@@ -440,9 +438,9 @@ pub async fn ensure_synchronized_subtitle(
         return (target_sub_url.to_string(), None);
     }
 
-    let cache_dir = directories::ProjectDirs::from("", "", "ani-tui")
-        .map(|dirs| dirs.cache_dir().join("subs"))
-        .unwrap_or_else(|| std::env::temp_dir().join("solus-subs"));
+    let cache_dir = crate::config::Config::cache_dir()
+        .map(|dir| dir.join("subs"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("solus-subs"));
 
     if std::fs::create_dir_all(&cache_dir).is_err() {
         return (target_sub_url.to_string(), None);

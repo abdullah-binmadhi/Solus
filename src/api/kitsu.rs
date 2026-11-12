@@ -144,10 +144,9 @@ pub async fn fetch_kitsu_episodes(
     let anime_id = match search_kitsu_id(client, title_primary).await {
         Some(id) => id,
         None => {
-            if let Some(fallback) = title_fallback {
+            {
+                let fallback = title_fallback?;
                 search_kitsu_id(client, fallback).await?
-            } else {
-                return None;
             }
         }
     };

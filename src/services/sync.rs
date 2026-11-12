@@ -40,9 +40,9 @@ pub fn season_from_timestamp(unix_ts: i64) -> (String, i64) {
     };
 
     let season = match month {
-        1 | 2 | 3  => "WINTER",
-        4 | 5 | 6  => "SPRING",
-        7 | 8 | 9  => "SUMMER",
+        1..=3  => "WINTER",
+        4..=6  => "SPRING",
+        7..=9  => "SUMMER",
         _           => "FALL",
     };
 
@@ -555,7 +555,7 @@ mod tests {
         // 2026-03-01 ≈ unix 1_740_787_200 → should be in 2025-2026 range
         let ts = 1_740_787_200i64;
         let (_, year) = season_from_timestamp(ts);
-        assert!(year >= 2025 && year <= 2026);
+        assert!((2025..=2026).contains(&year));
     }
 
     // ── sync_category (SQLite path, no HTTP) ─────────────────────────────────

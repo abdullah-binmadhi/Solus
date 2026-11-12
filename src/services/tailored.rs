@@ -35,6 +35,7 @@ pub struct TailoredQuestion {
 
 /// User choices for all 10 questions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct TailoredAnswers {
     pub choices: [usize; 9],
     pub deal_breakers: HashSet<usize>,
@@ -52,14 +53,6 @@ pub struct TailoredRefinement {
     pub anchor_title: Option<String>,
 }
 
-impl Default for TailoredAnswers {
-    fn default() -> Self {
-        Self {
-            choices: [0; 9],
-            deal_breakers: HashSet::new(),
-        }
-    }
-}
 
 /// Dynamic Anime Soul Persona calculated from user answers.
 #[derive(Debug, Clone)]
@@ -1078,7 +1071,7 @@ pub fn score_anime_refined(
     }
 
     // 1. Refinement Tropes (Multi-select)
-    if let Some(q) = refinement_questions.get(0) {
+    if let Some(q) = refinement_questions.first() {
         for &idx in &refinement.trope_selections {
             if let Some(opt) = q.options.get(idx) {
                 for &(tag, weight) in opt.tags_pos {
@@ -1221,7 +1214,7 @@ pub async fn generate_tailored_matches_advanced(
     if let Some(refine) = refinement {
         let refine_questions = get_refinement_questions(answers.choices[0]);
         // Tropes
-        if let Some(q) = refine_questions.get(0) {
+        if let Some(q) = refine_questions.first() {
             for &idx in &refine.trope_selections {
                 if let Some(opt) = q.options.get(idx) {
                     for &(tag, _) in opt.tags_pos {
@@ -1430,8 +1423,11 @@ pub fn get_dimension_descriptor(gauge_name: &str, value: u8) -> &'static str {
     }
 }
 
+/// Type alias for FFXIV Primal Elemental affinities: (Fire/Lightning, Wind/Ice, Earth/Water, Dominant).
+pub type PrimalElements = ((u8, &'static str), (u8, &'static str), (u8, &'static str), &'static str);
+
 /// Compute FFXIV Primal Elemental affinities: (Fire/Lightning, Wind/Ice, Earth/Water, Dominant).
-pub fn get_primal_elements(persona: &Persona) -> ((u8, &'static str), (u8, &'static str), (u8, &'static str), &'static str) {
+pub fn get_primal_elements(persona: &Persona) -> PrimalElements {
     let int_val = persona.gauges[0].1 as f32;
     let lore_val = persona.gauges[1].1 as f32;
     let emo_val = persona.gauges[2].1 as f32;
@@ -1817,7 +1813,7 @@ pub fn truncate_at_word_boundary(text: &str, max_chars: usize) -> String {
     if let Some(last_space) = slice.rfind(' ') {
         if last_space > max_chars / 2 {
             let trimmed = slice[..last_space]
-                .trim_end_matches(|c: char| matches!(c, ',' | ';' | ':' | '-' | '·'));
+                .trim_end_matches([',', ';', ':', '-', '·']);
             return format!("{}…", trimmed);
         }
     }
@@ -1885,9 +1881,11 @@ mod tests {
         let mut answers = TailoredAnswers::default();
         answers.deal_breakers.insert(0); // Exclude Ecchi
 
-        let mut anime = Anime::default();
-        anime.genres = serde_json::to_string(&vec!["Action", "Ecchi"]).unwrap();
-        anime.episodes = Some(12);
+        let anime = Anime {
+            genres: serde_json::to_string(&vec!["Action", "Ecchi"]).unwrap(),
+            episodes: Some(12),
+            ..Default::default()
+        };
 
         let scored = score_anime(&anime, &answers);
         assert!(scored.is_none());
@@ -1900,13 +1898,15 @@ mod tests {
         answers.choices[1] = 1; // 10-14 episodes
         answers.choices[2] = 0; // Fantasy -> Fantasy +40
 
-        let mut anime = Anime::default();
-        anime.title_romaji = "Test Fantasy Action".to_string();
-        anime.genres = serde_json::to_string(&vec!["Action", "Fantasy"]).unwrap();
-        anime.episodes = Some(12);
-        anime.status = Some("FINISHED".to_string());
-        anime.season_year = Some(2022);
-        anime.score = Some(88);
+        let anime = Anime {
+            title_romaji: "Test Fantasy Action".to_string(),
+            genres: serde_json::to_string(&vec!["Action", "Fantasy"]).unwrap(),
+            episodes: Some(12),
+            status: Some("FINISHED".to_string()),
+            season_year: Some(2022),
+            score: Some(88),
+            ..Default::default()
+        };
 
         let scored = score_anime(&anime, &answers);
         assert!(scored.is_some());
@@ -1969,14 +1969,16 @@ mod tests {
         answers.choices[1] = 1; // 10-14 episodes
         answers.choices[2] = 1; // Cyberpunk
 
-        let mut anime = Anime::default();
-        anime.id = 999;
-        anime.title_romaji = "Ghost in the Machine".to_string();
-        anime.genres = serde_json::to_string(&vec!["Psychological", "Sci-Fi", "Mind Games", "Fast Paced"]).unwrap();
-        anime.episodes = Some(12);
-        anime.status = Some("FINISHED".to_string());
-        anime.season_year = Some(2022);
-        anime.score = Some(86);
+        let anime = Anime {
+            id: 999,
+            title_romaji: "Ghost in the Machine".to_string(),
+            genres: serde_json::to_string(&vec!["Psychological", "Sci-Fi", "Mind Games", "Fast Paced"]).unwrap(),
+            episodes: Some(12),
+            status: Some("FINISHED".to_string()),
+            season_year: Some(2022),
+            score: Some(86),
+            ..Default::default()
+        };
 
         let base_score = score_anime(&anime, &answers).unwrap();
 
@@ -2004,13 +2006,15 @@ mod tests {
     fn test_score_anime_refined_peer_of_anchor_boost() {
         let mut answers = TailoredAnswers::default();
         answers.choices[1] = 2; // Full Season Arc (20-28 eps)
-        let mut anime = Anime::default();
-        anime.id = 1575;
-        anime.title_romaji = "Code Geass".to_string();
-        anime.genres = serde_json::to_string(&vec!["Action", "Mecha", "Super Power"]).unwrap();
-        anime.episodes = Some(25);
-        anime.status = Some("FINISHED".to_string());
-        anime.score = Some(85);
+        let anime = Anime {
+            id: 1575,
+            title_romaji: "Code Geass".to_string(),
+            genres: serde_json::to_string(&vec!["Action", "Mecha", "Super Power"]).unwrap(),
+            episodes: Some(25),
+            status: Some("FINISHED".to_string()),
+            score: Some(85),
+            ..Default::default()
+        };
 
         let mut peers = HashSet::new();
         peers.insert(1575);

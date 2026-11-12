@@ -320,7 +320,12 @@ fn render_tab_backup_export(frame: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled("Destination: ~/.config/ani-tui/solus_backup.json", Style::default().fg(theme.accent))),
+        Line::from(Span::styled(
+            format!("Destination: {}", crate::config::Config::config_dir()
+                .map(|d| d.join("solus_backup.json").display().to_string())
+                .unwrap_or_else(|_| "~/.config/solus/solus_backup.json".to_string())),
+            Style::default().fg(theme.accent),
+        )),
         Line::from(""),
         Line::from(Span::styled("This backup can be imported into another Solus install or archived safely.", Style::default().fg(theme.text_dim))),
         Line::from(""),

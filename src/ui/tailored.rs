@@ -426,9 +426,8 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
         ]),
     ];
 
-    for idx in 0..10 {
+    for (idx, q) in questions.iter().enumerate().take(10) {
         let is_cursor = state.tailored_summary_cursor == idx;
-        let q = &questions[idx];
 
         let answer_text = if idx == 9 {
             if state.tailored_answers.deal_breakers.is_empty() {
@@ -852,10 +851,8 @@ pub fn render_tailored_results(frame: &mut Frame, state: &mut AppState) {
         let title = anime.display_title();
         let subtitle = if anime.title_romaji != title && !anime.title_romaji.is_empty() {
             Some(anime.title_romaji.clone())
-        } else if let Some(ref nat) = anime.title_native {
-            Some(nat.clone())
         } else {
-            None
+            anime.title_native.clone()
         };
         let score_str = anime.score.map(|s| format!(" {:.1}", s as f32 / 10.0)).unwrap_or_else(|| " ?".to_string());
         let eps_str = anime.episodes.map(|e| format!("{} eps", e)).unwrap_or_else(|| "? eps".to_string());

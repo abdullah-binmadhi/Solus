@@ -1,4 +1,4 @@
-# ani-tui Release Checklist
+# Solus Release Checklist
 
 Use this checklist before publishing a production release tag.
 
@@ -6,31 +6,32 @@ Use this checklist before publishing a production release tag.
 
 - Stable release target: `v1.x.y`
 - Official release source: GitHub Releases
-- Primary macOS install path: Homebrew tap
-- Primary Linux install path: GitHub binary or `cargo install ani-tui-app`
+- Primary macOS install path: Homebrew tap (`brew install abdullah-binmadhi/tap/solus`)
+- Primary Linux install path: GitHub binary or `cargo install --git https://github.com/abdullah-binmadhi/Solus.git`
 
 ## Pre-Release Validation
 
 ```bash
 cargo check
 cargo test
+cargo clippy --all-targets
 ```
 
 Manual smoke test:
 
-- Launch in Ghostty
+- Launch in Kitty / WezTerm / Ghostty
 - Verify `Home`, `Detail`, `Search`, `Help`, `Settings`, and `Setup` overlays
-- Verify banner and detail cover rendering
-- Verify `Home` row cards remain stable with halfblock covers
-- Verify `Because You Watched` and `More Like This` populate from local heuristic scoring
-- Verify detached playback opens the external player
-- Verify setup overlay appears when dependencies are missing
+- Verify banner, card covers, and episode preview stills rendering
+- Verify `Split-Deck` episode browser (`v`), `AniSkip` intro skips, and `AnimeFillerList` badges
+- Verify `Tailored Discovery` questionnaire (`w` or `t`) and `Anime Wrapped` telemetry (`a`)
+- Verify playback opens cleanly in `mpv` with live timestamp tracking and exact resume
+- Verify offline episode downloader (`Shift+D`)
 
 ## Versioning
 
 1. Update the version in `Cargo.toml`
 2. Confirm the README install instructions match the current release plan
-3. Confirm the Homebrew formula template version and checksum placeholders are ready to update
+3. Confirm `Formula/solus.rb` version and URL matches the new release tag
 
 ## Tag + Release
 
@@ -38,30 +39,28 @@ Manual smoke test:
 2. Create the tag:
 
 ```bash
-git tag v1.0.4
-git push origin v1.0.4
+git tag v1.0.6
+git push origin v1.0.6
 ```
 
 3. Wait for the GitHub Actions release workflow to build and attach:
-   - `ani-tui-macos-aarch64`
-   - `ani-tui-macos-x86_64`
-   - `ani-tui-linux-x86_64`
+   - `solus-macos-aarch64`
+   - `solus-macos-x86_64`
+   - `solus-linux-x86_64`
 
 ## Release Notes Checklist
 
 Include:
 
 - Stable TUI browsing, search, and resume flow
-- Heuristic recommendation engine:
-  - `Because You Watched`
-  - `More Like This`
-  - local-first scoring from watch history, genre overlap, format, recency, and cached popularity rows
+- Astrological Persona Matrix & Tailored Recommendation Crucible
+- Offline batch episode downloader into `~/Movies/Solus/`
+- Real-time Anime4K GLSL upscaling toggle
+- Multi-source subtitle harvester and 2-tier automated sync engine
+- Exact timestamp resume and 85% scrobble threshold via mpv IPC
 - Settings overlay (`s`)
 - Setup / dependency checks (`!`)
 - Supported players: `mpv`, `iina`, `vlc`
-- Runtime dependency note: `ani-cli` is still required
-
-Do not position the release as a full self-contained streamer.
 
 ## Post-Release
 
@@ -72,7 +71,7 @@ Do not position the release as a full self-contained streamer.
 3. Open a fresh shell and verify:
 
 ```bash
-ani-tui
+solus
 ```
 
 4. Confirm the setup overlay and help overlay reflect the released keybindings

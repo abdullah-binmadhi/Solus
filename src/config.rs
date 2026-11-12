@@ -6,6 +6,7 @@ use std::path::PathBuf;
 /// Video quality preference
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Quality {
     #[serde(rename = "360p")]
     P360,
@@ -14,6 +15,7 @@ pub enum Quality {
     #[serde(rename = "720p")]
     P720,
     #[serde(rename = "1080p")]
+    #[default]
     P1080,
     Best,
 }
@@ -30,11 +32,6 @@ impl Quality {
     }
 }
 
-impl Default for Quality {
-    fn default() -> Self {
-        Quality::P1080
-    }
-}
 
 /// Sub or dub preference
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -137,6 +134,8 @@ pub struct Config {
     pub anime4k_mode:     Anime4KMode,
     #[serde(default = "default_true")]
     pub ambilight_enabled: bool,
+    #[serde(default)]
+    pub update:           UpdateConfig,
     pub cache:            CacheConfig,
 }
 
@@ -150,18 +149,92 @@ impl Default for Config {
             auto_skip_intro:  default_auto_skip_intro(),
             anime4k_mode:     default_anime4k(),
             ambilight_enabled: default_true(),
+            update:           UpdateConfig::default(),
             cache:            CacheConfig::default(),
         }
     }
 }
 
+/// Auto-update configuration preferences
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    #[serde(default = "default_true")]
+    pub check_on_startup: bool,
+    #[serde(default)]
+    pub auto_install: bool,
+    #[serde(default = "default_update_interval")]
+    pub check_interval: u64,
+}
+
+fn default_update_interval() -> u64 {
+    14400 // 4 hours
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check_on_startup: true,
+            auto_install: false,
+            check_interval: 14400,
+        }
+    }
+}
+
 impl Config {
-    /// Returns the platform-appropriate config directory path.
-    /// e.g. ~/.config/ani-tui/ on Linux
+    /// Returns the platform-appropriate config directory path for Solus:
+    /// e.g. ~/.config/solus/ on Linux, ~/Library/Application Support/solus/ on macOS.
+    /// Performs a seamless, transparent migration if legacy ~/.config/ani-tui/ exists.
     pub fn config_dir() -> Result<PathBuf> {
-        ProjectDirs::from("", "", "ani-tui")
-            .map(|dirs| dirs.config_dir().to_path_buf())
-            .ok_or_else(|| AppError::Config("Could not determine config directory".into()))
+        let solus_dirs = ProjectDirs::from("", "", "solus")
+            .ok_or_else(|| AppError::Config("Could not determine config directory".into()))?;
+        let target_dir = solus_dirs.config_dir().to_path_buf();
+
+        // Perform transparent migration from legacy ani-tui directory if target does not yet exist
+        if !target_dir.exists() {
+            if let Some(legacy_dirs) = ProjectDirs::from("", "", "ani-tui") {
+                let legacy_dir = legacy_dirs.config_dir();
+                if legacy_dir.exists() {
+                    let _ = std::fs::create_dir_all(&target_dir);
+                    let legacy_cfg = legacy_dir.join("config.toml");
+                    let target_cfg = target_dir.join("config.toml");
+                    if legacy_cfg.exists() && !target_cfg.exists() {
+                        let _ = std::fs::copy(&legacy_cfg, &target_cfg);
+                    }
+                    let legacy_auth = legacy_dir.join("auth.json");
+                    let target_auth = target_dir.join("auth.json");
+                    if legacy_auth.exists() && !target_auth.exists() {
+                        let _ = std::fs::copy(&legacy_auth, &target_auth);
+                    }
+                    let legacy_db = legacy_dir.join("ani-tui.db");
+                    let target_db = target_dir.join("solus.db");
+                    if legacy_db.exists() && !target_db.exists() {
+                        let _ = std::fs::copy(&legacy_db, &target_db);
+                    }
+                    let legacy_backup = legacy_dir.join("solus_backup.json");
+                    let target_backup = target_dir.join("solus_backup.json");
+                    if legacy_backup.exists() && !target_backup.exists() {
+                        let _ = std::fs::copy(&legacy_backup, &target_backup);
+                    }
+                }
+            }
+        }
+
+        // Also migrate ani-tui.db if present inside target_dir into solus.db
+        let legacy_in_target = target_dir.join("ani-tui.db");
+        let target_db = target_dir.join("solus.db");
+        if legacy_in_target.exists() && !target_db.exists() {
+            let _ = std::fs::copy(&legacy_in_target, &target_db);
+        }
+
+        Ok(target_dir)
+    }
+
+    /// Returns the platform-appropriate cache directory path for Solus:
+    /// e.g. ~/.cache/solus/ on Linux, ~/Library/Caches/solus/ on macOS.
+    pub fn cache_dir() -> Result<PathBuf> {
+        ProjectDirs::from("", "", "solus")
+            .map(|dirs| dirs.cache_dir().to_path_buf())
+            .ok_or_else(|| AppError::Config("Could not determine cache directory".into()))
     }
 
     /// Returns the path to config.toml
@@ -169,9 +242,17 @@ impl Config {
         Ok(Self::config_dir()?.join("config.toml"))
     }
 
-    /// Returns the path to the SQLite database file
+    /// Returns the path to the SQLite database file (solus.db with ani-tui.db migration)
     pub fn db_path() -> Result<PathBuf> {
-        Ok(Self::config_dir()?.join("ani-tui.db"))
+        let dir = Self::config_dir()?;
+        let target_db = dir.join("solus.db");
+        if !target_db.exists() {
+            let legacy_db = dir.join("ani-tui.db");
+            if legacy_db.exists() {
+                let _ = std::fs::copy(&legacy_db, &target_db);
+            }
+        }
+        Ok(target_db)
     }
 
     /// Load config from disk. Returns default config if file doesn't exist.
@@ -300,6 +381,7 @@ mod tests {
             auto_skip_intro:  true,
             anime4k_mode:     Anime4KMode::Balanced,
             ambilight_enabled: true,
+            update:           UpdateConfig::default(),
             cache:            CacheConfig::default(),
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
@@ -326,6 +408,7 @@ mod tests {
             auto_skip_intro:  true,
             anime4k_mode:     Anime4KMode::Off,
             ambilight_enabled: false,
+            update:           UpdateConfig::default(),
             cache:            CacheConfig::default(),
         };
 

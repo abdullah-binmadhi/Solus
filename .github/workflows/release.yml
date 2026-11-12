@@ -22,15 +22,15 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             label: macos-aarch64
-            artifact_name: ani-tui-macos-aarch64
+            artifact_name: solus-macos-aarch64
           - os: macos-latest
             target: x86_64-apple-darwin
             label: macos-x86_64
-            artifact_name: ani-tui-macos-x86_64
+            artifact_name: solus-macos-x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             label: linux-x86_64
-            artifact_name: ani-tui-linux-x86_64
+            artifact_name: solus-linux-x86_64
 
     steps:
       - name: checkout
@@ -49,14 +49,20 @@ jobs:
 
       - name: prepare artifact
         run: |
-          cp target/${{ matrix.target }}/release/ani-tui ${{ matrix.artifact_name }}
+          cp target/${{ matrix.target }}/release/solus ${{ matrix.artifact_name }}
           chmod +x ${{ matrix.artifact_name }}
+          # Also generate legacy ani-tui-* alias for backward compatibility:
+          legacy_name=$(echo "${{ matrix.artifact_name }}" | sed 's/^solus-/ani-tui-/')
+          cp target/${{ matrix.target }}/release/solus "$legacy_name"
+          chmod +x "$legacy_name"
 
       - name: upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}
+            ani-tui-*
           retention-days: 1
 
   release:

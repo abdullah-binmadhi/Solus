@@ -68,6 +68,11 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Span::raw(" Search  "),
         Span::styled("?", Style::default().fg(Color::Rgb(180, 0, 255))),
         Span::raw(" Help"),
+        if state.available_update.is_some() {
+            Span::styled("  󰚰 U Update", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw("")
+        },
     ]));
 
     let chunks = Layout::default()
@@ -710,7 +715,7 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
     frame.render_widget(insp_block, cols[1]);
 
     // Split inspector into: Top 16:9 thumbnail frame + Quick specs, Bottom: text details
-    let max_thumb_h = (insp_inner.height / 2).min(11).max(6);
+    let max_thumb_h = (insp_inner.height / 2).clamp(6, 11);
     let insp_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -996,27 +1001,13 @@ fn compose_anime_synopsis(anime: &Anime, max_chars: usize) -> String {
     };
 
     let genre_coda_2 = match voice {
-        GenreVoice::GloomyNoir => format!(
-            "Every episode tightens the psychological vise a little further, trading comfort for cold atmosphere, moral rot, and a haunting sense of inevitability as the darkness closes in around the cast."
-        ),
-        GenreVoice::ComedicRiot => format!(
-            "No matter how simple the setup looks on paper, you can count on this crew to overcomplicate it into a glorious, laugh-out-loud catastrophe before the opening scene is even halfway done."
-        ),
-        GenreVoice::FierceArena => format!(
-            "As rivalries sharpen and the margin for error vanishes, every match becomes a crucible of ego, teamwork, and relentless physical evolution under pressure."
-        ),
-        GenreVoice::WarmHeartfelt => format!(
-            "With an unhurried pace and genuine affection for its cast, the story turns small everyday detours and shared smiles into deeply comforting chapters."
-        ),
-        GenreVoice::CyberDystopia => format!(
-            "Layered with speculative intrigue and atmospheric tension, each revelation peels back another circuit of the mystery governing their world."
-        ),
-        GenreVoice::VisceralEpic => format!(
-            "Blending high-stakes action with unyielding personal stakes, the journey pushes its cast through a gauntlet where every choice echoes across the realm."
-        ),
-        GenreVoice::MelancholicElegy => format!(
-            "Through quiet introspection and deeply felt character drama, every chapter lingers on the fragile beauty and bittersweet cost of human connection."
-        ),
+        GenreVoice::GloomyNoir => "Every episode tightens the psychological vise a little further, trading comfort for cold atmosphere, moral rot, and a haunting sense of inevitability as the darkness closes in around the cast.".to_string(),
+        GenreVoice::ComedicRiot => "No matter how simple the setup looks on paper, you can count on this crew to overcomplicate it into a glorious, laugh-out-loud catastrophe before the opening scene is even halfway done.".to_string(),
+        GenreVoice::FierceArena => "As rivalries sharpen and the margin for error vanishes, every match becomes a crucible of ego, teamwork, and relentless physical evolution under pressure.".to_string(),
+        GenreVoice::WarmHeartfelt => "With an unhurried pace and genuine affection for its cast, the story turns small everyday detours and shared smiles into deeply comforting chapters.".to_string(),
+        GenreVoice::CyberDystopia => "Layered with speculative intrigue and atmospheric tension, each revelation peels back another circuit of the mystery governing their world.".to_string(),
+        GenreVoice::VisceralEpic => "Blending high-stakes action with unyielding personal stakes, the journey pushes its cast through a gauntlet where every choice echoes across the realm.".to_string(),
+        GenreVoice::MelancholicElegy => "Through quiet introspection and deeply felt character drama, every chapter lingers on the fragile beauty and bittersweet cost of human connection.".to_string(),
     };
 
     let mut combined = if base.chars().count() < max_chars.saturating_sub(60) {
@@ -1381,23 +1372,27 @@ mod tests {
         state.episode_titles.insert(1, "The First Disaster".to_string());
         state.episode_synopses.insert(1, "Kazuma and Aqua arrive in a new town and immediately get into debt.".to_string());
 
-        let mut comedy_anime = Anime::default();
-        comedy_anime.id = 30831;
-        comedy_anime.title_romaji = "KonoSuba".to_string();
-        comedy_anime.genres = serde_json::to_string(&vec!["Adventure", "Comedy", "Fantasy"]).unwrap();
-        comedy_anime.episodes = Some(10);
+        let comedy_anime = Anime {
+            id: 30831,
+            title_romaji: "KonoSuba".to_string(),
+            genres: serde_json::to_string(&vec!["Adventure", "Comedy", "Fantasy"]).unwrap(),
+            episodes: Some(10),
+            ..Default::default()
+        };
 
         assert_eq!(detect_genre_voice(&comedy_anime), GenreVoice::ComedicRiot);
         let comedy_syn = episode_synopsis_text(&state, &comedy_anime, 1, true);
         assert!(comedy_syn.chars().count() >= 750, "Synopsis should be expanded to Terror in Resonance length: got {} chars", comedy_syn.chars().count());
         assert!(comedy_syn.contains("Kazuma and Aqua"));
 
-        let mut dark_anime = Anime::default();
-        dark_anime.id = 20661;
-        dark_anime.title_romaji = "Zankyou no Terror".to_string();
-        dark_anime.title_english = Some("Terror in Resonance".to_string());
-        dark_anime.genres = serde_json::to_string(&vec!["Drama", "Mystery", "Psychological", "Thriller"]).unwrap();
-        dark_anime.episodes = Some(11);
+        let dark_anime = Anime {
+            id: 20661,
+            title_romaji: "Zankyou no Terror".to_string(),
+            title_english: Some("Terror in Resonance".to_string()),
+            genres: serde_json::to_string(&vec!["Drama", "Mystery", "Psychological", "Thriller"]).unwrap(),
+            episodes: Some(11),
+            ..Default::default()
+        };
 
         assert_eq!(detect_genre_voice(&dark_anime), GenreVoice::GloomyNoir);
         let dark_syn = episode_synopsis_text(&state, &dark_anime, 1, true);

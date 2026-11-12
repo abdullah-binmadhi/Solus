@@ -182,11 +182,10 @@ impl RawAnime {
         let mut combined_genres = self.genres;
         if let Some(tags) = self.tags {
             for t in tags {
-                if !t.is_media_spoiler.unwrap_or(false) && t.rank.unwrap_or(0) >= 45 {
-                    if !combined_genres.iter().any(|g| g.eq_ignore_ascii_case(&t.name)) {
+                if !t.is_media_spoiler.unwrap_or(false) && t.rank.unwrap_or(0) >= 45
+                    && !combined_genres.iter().any(|g| g.eq_ignore_ascii_case(&t.name)) {
                         combined_genres.push(t.name);
                     }
-                }
             }
         }
 

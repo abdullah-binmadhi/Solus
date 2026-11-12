@@ -688,7 +688,7 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     ];
 
     let mut format_distribution: Vec<(String, usize)> = format_counts.into_iter().collect();
-    format_distribution.sort_by(|a, b| b.1.cmp(&a.1));
+    format_distribution.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     // 4. Activity across last 14 days
     let day_seconds = 86400i64;

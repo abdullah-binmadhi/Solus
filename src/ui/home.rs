@@ -81,10 +81,21 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
     }
 
-    if state.active_row == CategoryRow::ContinueWatching {
-        spans.push(Span::styled("󰅖 [x] Remove", Style::default().fg(Color::Rgb(255, 85, 85)).add_modifier(Modifier::BOLD)));
+    if let Some((pct, ref spd)) = state.update_progress {
+        spans.push(Span::styled(
+            format!("󰚰 Updating: {:.0}% ({}) ", pct, spd),
+            Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD),
+        ));
         spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
-    } else if state.active_row == CategoryRow::Watchlist {
+    } else if let Some(ref update) = state.available_update {
+        spans.push(Span::styled(
+            format!("󰚰 [U] Update ({}) ", update.latest_version),
+            Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
+    }
+
+    if state.active_row == CategoryRow::ContinueWatching || state.active_row == CategoryRow::Watchlist {
         spans.push(Span::styled("󰅖 [x] Remove", Style::default().fg(Color::Rgb(255, 85, 85)).add_modifier(Modifier::BOLD)));
         spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
     }
@@ -462,6 +473,7 @@ fn render_rows(frame: &mut Frame, area: Rect, state: &mut AppState, data: &HomeD
 }
 
 /// Render a single horizontal category row with a label and cards.
+#[allow(clippy::too_many_arguments)]
 fn render_row(
     frame:     &mut Frame,
     area:      Rect,
