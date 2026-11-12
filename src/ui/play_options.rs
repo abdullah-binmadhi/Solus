@@ -81,17 +81,76 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     );
     frame.render_widget(header, chunks[0]);
 
-    // Split body into Quality (left) and Subtitle Languages (right)
+    // Split body into 3 columns: Provider (left), Quality (center), and Subtitles (right)
     let body_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(42),
-            Constraint::Percentage(58),
+            Constraint::Percentage(28),
+            Constraint::Percentage(26),
+            Constraint::Percentage(46),
         ])
         .split(chunks[1]);
 
-    // ── Left: Quality Selection ──────────────────────────────────────────
-    let q_focused = !state.playback_sub_focused;
+    // ── Col 0: Streaming Provider Selection ──────────────────────────────
+    let p_focused = state.playback_focus_column == 0;
+    let p_border_style = if p_focused {
+        Style::default().fg(Color::Rgb(180, 0, 255))
+    } else {
+        Style::default().fg(Color::Rgb(80, 80, 100))
+    };
+
+    let p_block = Block::default()
+        .title(Span::styled(
+            if p_focused { " 󰢹 Provider (Active) " } else { " 󰢹 Provider " },
+            p_border_style.add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(p_border_style);
+
+    let p_inner = p_block.inner(body_cols[0]);
+    frame.render_widget(p_block, body_cols[0]);
+
+    if state.playback_providers.is_empty() {
+        let empty_p = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Default Provider",
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )),
+        ]);
+        frame.render_widget(empty_p, p_inner);
+    } else {
+        let p_items: Vec<ListItem> = state
+            .playback_providers
+            .iter()
+            .enumerate()
+            .map(|(i, provider)| {
+                let is_selected = i == state.playback_provider_cursor;
+                let radio = if is_selected { " [●] " } else { " [○] " };
+                let style = if is_selected {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Rgb(160, 160, 175))
+                };
+                let radio_style = if is_selected {
+                    Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Rgb(100, 100, 115))
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(radio, radio_style),
+                    Span::styled(&provider.server_label, style),
+                ]))
+            })
+            .collect();
+
+        let mut p_state = ListState::default().with_selected(Some(state.playback_provider_cursor));
+        frame.render_stateful_widget(List::new(p_items), p_inner, &mut p_state);
+    }
+
+    // ── Col 1: Quality Selection ──────────────────────────────────────────
+    let q_focused = state.playback_focus_column == 1;
     let q_border_style = if q_focused {
         Style::default().fg(Color::Rgb(180, 0, 255))
     } else {
@@ -107,8 +166,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         .border_type(BorderType::Rounded)
         .border_style(q_border_style);
 
-    let q_inner = q_block.inner(body_cols[0]);
-    frame.render_widget(q_block, body_cols[0]);
+    let q_inner = q_block.inner(body_cols[1]);
+    frame.render_widget(q_block, body_cols[1]);
 
     if state.is_loading_subs {
         let loading_q = Paragraph::new(vec![
@@ -164,8 +223,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         frame.render_stateful_widget(List::new(q_items), q_inner, &mut q_state);
     }
 
-    // ── Right: Subtitle Language Selection ───────────────────────────────
-    let sub_focused = state.playback_sub_focused;
+    // ── Col 2: Subtitle Language Selection ───────────────────────────────
+    let sub_focused = state.playback_focus_column == 2;
     let sub_border_style = if sub_focused {
         Style::default().fg(Color::Rgb(180, 0, 255))
     } else {
@@ -181,8 +240,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         .border_type(BorderType::Rounded)
         .border_style(sub_border_style);
 
-    let sub_inner = sub_block.inner(body_cols[1]);
-    frame.render_widget(sub_block, body_cols[1]);
+    let sub_inner = sub_block.inner(body_cols[2]);
+    frame.render_widget(sub_block, body_cols[2]);
 
     if state.is_loading_subs {
         let loading_p = Paragraph::new(vec![
@@ -235,7 +294,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         Span::styled(" Enter ", Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)),
         Span::raw(" Launch  "),
         Span::styled(" Tab/h/l ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
-        Span::raw(" Focus  "),
+        Span::raw(" Column  "),
+        Span::styled(" 1/2/3 ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        Span::raw(" Jump  "),
         Span::styled(" j/k ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
         Span::raw(" Select  "),
         Span::styled(" a ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),

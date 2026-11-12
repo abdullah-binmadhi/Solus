@@ -24,10 +24,48 @@ pub struct SubtitleOption {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderOption {
+    pub id: String,
+    pub name: String,
+    pub server_label: String,
+    pub master_url: Option<String>,
+}
+
+pub fn default_providers() -> Vec<ProviderOption> {
+    vec![
+        ProviderOption {
+            id: "zoko".to_string(),
+            name: "ZokoAnime".to_string(),
+            server_label: "ZokoAnime [Direct 1080p]".to_string(),
+            master_url: None,
+        },
+        ProviderOption {
+            id: "hd1".to_string(),
+            name: "HD-1".to_string(),
+            server_label: "HD-1 [MegaPlay Cloud]".to_string(),
+            master_url: None,
+        },
+        ProviderOption {
+            id: "pahe".to_string(),
+            name: "AnimePahe".to_string(),
+            server_label: "AnimePahe [ani-cli]".to_string(),
+            master_url: None,
+        },
+        ProviderOption {
+            id: "gogo".to_string(),
+            name: "GogoAnime".to_string(),
+            server_label: "GogoAnime [ani-cli]".to_string(),
+            master_url: None,
+        },
+    ]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamInfo {
     pub master_url: Option<String>,
     pub qualities: Vec<QualityOption>,
     pub subtitles: Vec<SubtitleOption>,
+    pub providers: Vec<ProviderOption>,
 }
 
 impl StreamInfo {
@@ -39,6 +77,7 @@ impl StreamInfo {
                 QualityOption { label: "720p".to_string(), url: String::new() },
             ],
             subtitles: vec![SubtitleOption::default_english()],
+            providers: default_providers(),
         }
     }
 }
@@ -235,7 +274,7 @@ pub async fn fetch_stream_info(
     // Run stream resolution and external multi-language subtitle fetching in parallel!
     let (stream_res, ext_subs) = tokio::join!(
         resolve_primary_stream(&client, anilist_id, query_title, episode, is_dub),
-        fetch_external_subtitles(&client, anilist_id, episode)
+        fetch_external_subtitles(&client, anilist_id, query_title, episode)
     );
 
     let mut info = stream_res.unwrap_or_else(StreamInfo::fallback);
@@ -285,6 +324,8 @@ async fn resolve_primary_stream(
 struct AniZipMappingData {
     mappings: Option<AniZipMappingDetails>,
     #[serde(default)]
+    titles: HashMap<String, String>,
+    #[serde(default)]
     episodes: HashMap<String, AniZipEpDetails>,
 }
 
@@ -316,10 +357,70 @@ struct StremioSubtitleItem {
     subtitle_file_name: Option<String>,
 }
 
-/// Fetch community multi-language subtitle tracks for an anime episode via AniZip mapping + OpenSubtitles proxy.
+#[derive(Debug, Deserialize)]
+struct OpenSubtitlesItem {
+    #[serde(rename = "SubLanguageID")]
+    sub_language_id: Option<String>,
+    #[serde(rename = "SeriesEpisode")]
+    series_episode: Option<String>,
+    #[serde(rename = "SubFileName")]
+    sub_file_name: Option<String>,
+    #[serde(rename = "SubDownloadLink")]
+    sub_download_link: Option<String>,
+}
+
+/// Matches an episode number against SeriesEpisode tag or common anime fansub filename conventions.
+pub fn matches_episode(series_ep: &str, filename: &str, target_ep: u32) -> bool {
+    if let Ok(ep) = series_ep.trim().parse::<u32>() {
+        if ep == target_ep {
+            return true;
+        }
+    }
+
+    let lower = filename.to_lowercase();
+    let target_str = target_ep.to_string();
+    let target_pad = format!("{:02}", target_ep);
+
+    let patterns = [
+        format!("e{}", target_str),
+        format!("e{}", target_pad),
+        format!("ep{}", target_str),
+        format!("ep{}", target_pad),
+        format!("ep.{}", target_str),
+        format!("ep.{}", target_pad),
+        format!("ep {}", target_str),
+        format!("ep {}", target_pad),
+        format!("episode {}", target_str),
+        format!("episode {}", target_pad),
+        format!("layer {}", target_str),
+        format!("layer {}", target_pad),
+        format!("layer{}", target_pad),
+        format!(" - {}", target_str),
+        format!(" - {}", target_pad),
+        format!("-{}", target_pad),
+        format!(" {}", target_pad),
+        format!("_{}_", target_pad),
+        format!("_{}", target_pad),
+    ];
+
+    for p in &patterns {
+        if let Some(pos) = lower.find(p) {
+            let end = pos + p.len();
+            if end >= lower.len() || !lower.as_bytes()[end].is_ascii_digit() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Fetch community multi-language subtitle tracks for an anime episode via AniZip mapping,
+/// Stremio OpenSubtitles v3 addon, and direct OpenSubtitles REST search across English and Romaji titles.
 pub async fn fetch_external_subtitles(
     client: &reqwest::Client,
     anilist_id: i64,
+    query_title: &str,
     episode: u32,
 ) -> Vec<SubtitleOption> {
     let anizip_url = format!("https://api.ani.zip/mappings?anilist_id={}", anilist_id);
@@ -330,57 +431,111 @@ pub async fn fetch_external_subtitles(
         return Vec::new();
     };
 
-    let Some(imdb_id) = parsed.mappings.as_ref().and_then(|m| m.imdb_id.clone()).filter(|id| !id.is_empty()) else {
-        return Vec::new();
-    };
-
-    let is_movie = parsed
-        .mappings
-        .as_ref()
-        .and_then(|m| m.media_type.as_deref())
-        .map(|t| t.eq_ignore_ascii_case("movie"))
-        .unwrap_or(false);
-
-    let query_url = if is_movie {
-        format!("https://opensubtitles-v3.strem.io/subtitles/movie/{}.json", imdb_id)
-    } else {
-        let ep_key = episode.to_string();
-        let (season, ep_num) = if let Some(ep_info) = parsed.episodes.get(&ep_key) {
-            (ep_info.season_number.unwrap_or(1), ep_info.episode_number.unwrap_or(episode))
-        } else {
-            (1, episode)
-        };
-        format!("https://opensubtitles-v3.strem.io/subtitles/series/{}:{}:{}.json", imdb_id, season, ep_num)
-    };
-
-    let Ok(sub_resp) = client.get(&query_url).timeout(Duration::from_secs(4)).send().await else {
-        return Vec::new();
-    };
-    let Ok(sub_data) = sub_resp.json::<StremioSubtitlesPayload>().await else {
-        return Vec::new();
-    };
-
     let mut options = Vec::new();
     let mut seen = HashSet::new();
 
-    for item in sub_data.subtitles {
-        let Some(url) = item.url.filter(|u| !u.is_empty()) else {
-            continue;
-        };
-        let lang = item.lang.as_deref().unwrap_or("eng");
-        let label = item.subtitle_file_name.as_deref().unwrap_or(lang);
-        let (code, name) = resolve_lang_meta(label, lang);
+    // 1. Stremio OpenSubtitles v3 addon via IMDb ID (if available)
+    if let Some(imdb_id) = parsed.mappings.as_ref().and_then(|m| m.imdb_id.clone()).filter(|id| !id.is_empty()) {
+        let is_movie = parsed
+            .mappings
+            .as_ref()
+            .and_then(|m| m.media_type.as_deref())
+            .map(|t| t.eq_ignore_ascii_case("movie"))
+            .unwrap_or(false);
 
-        if seen.insert(code.clone()) {
-            options.push(SubtitleOption {
-                code,
-                name: name.clone(),
-                stream_label: format!("{} [Auto-Synced]", name),
-                url,
-            });
+        let query_url = if is_movie {
+            format!("https://opensubtitles-v3.strem.io/subtitles/movie/{}.json", imdb_id)
+        } else {
+            let ep_key = episode.to_string();
+            let (season, ep_num) = if let Some(ep_info) = parsed.episodes.get(&ep_key) {
+                (ep_info.season_number.unwrap_or(1), ep_info.episode_number.unwrap_or(episode))
+            } else {
+                (1, episode)
+            };
+            format!("https://opensubtitles-v3.strem.io/subtitles/series/{}:{}:{}.json", imdb_id, season, ep_num)
+        };
+
+        if let Ok(sub_resp) = client.get(&query_url).timeout(Duration::from_secs(4)).send().await {
+            if let Ok(sub_data) = sub_resp.json::<StremioSubtitlesPayload>().await {
+                for item in sub_data.subtitles {
+                    let Some(url) = item.url.filter(|u| !u.is_empty()) else {
+                        continue;
+                    };
+                    let lang = item.lang.as_deref().unwrap_or("eng");
+                    let label = item.subtitle_file_name.as_deref().unwrap_or(lang);
+                    let (code, name) = resolve_lang_meta(label, lang);
+
+                    if seen.insert(code.clone()) {
+                        options.push(SubtitleOption {
+                            code,
+                            name: name.clone(),
+                            stream_label: format!("{} [Auto-Synced]", name),
+                            url,
+                        });
+                    }
+                }
+            }
         }
     }
 
+    // 2. OpenSubtitles REST search API for Arabic, Russian, Indonesian, and wider community fansubs
+    let mut search_titles = Vec::new();
+    if !query_title.is_empty() {
+        search_titles.push(query_title.to_string());
+    }
+    if let Some(en) = parsed.titles.get("en").filter(|s| !s.is_empty()) {
+        if !search_titles.contains(en) {
+            search_titles.push(en.clone());
+        }
+    }
+    if let Some(xjat) = parsed.titles.get("x-jat").filter(|s| !s.is_empty()) {
+        if !search_titles.contains(xjat) {
+            search_titles.push(xjat.clone());
+        }
+    }
+
+    for title in search_titles {
+        for lang_filter in ["sublanguageid-ara", "sublanguageid-rus", "sublanguageid-ind", ""] {
+            let query_path = if lang_filter.is_empty() {
+                format!("https://rest.opensubtitles.org/search/query-{}", urlencoding::encode(&title))
+            } else {
+                format!("https://rest.opensubtitles.org/search/{}/query-{}", lang_filter, urlencoding::encode(&title))
+            };
+
+            let req = client
+                .get(&query_path)
+                .header("User-Agent", "TemporaryUserAgent")
+                .timeout(Duration::from_secs(3));
+
+            if let Ok(resp) = req.send().await {
+                if let Ok(items) = resp.json::<Vec<OpenSubtitlesItem>>().await {
+                    for it in items {
+                        let sep = it.series_episode.as_deref().unwrap_or("");
+                        let fn_str = it.sub_file_name.as_deref().unwrap_or("");
+                        let Some(dl_url) = it.sub_download_link.filter(|u| !u.is_empty()) else {
+                            continue;
+                        };
+
+                        if matches_episode(sep, fn_str, episode) {
+                            let lang_id = it.sub_language_id.as_deref().unwrap_or("eng");
+                            let (code, name) = resolve_lang_meta(fn_str, lang_id);
+
+                            if seen.insert(code.clone()) {
+                                options.push(SubtitleOption {
+                                    code,
+                                    name: name.clone(),
+                                    stream_label: format!("{} [Auto-Synced]", name),
+                                    url: dl_url,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    prioritize_subtitles(&mut options);
     options
 }
 
@@ -540,10 +695,18 @@ async fn parse_stream_embed(client: &reqwest::Client, html: &str) -> Result<Stre
         }
     }
 
+    let mut providers = default_providers();
+    if let Some(ref m_url) = master_url {
+        if let Some(p0) = providers.get_mut(0) {
+            p0.master_url = Some(m_url.clone());
+        }
+    }
+
     Ok(StreamInfo {
         master_url,
         qualities,
         subtitles,
+        providers,
     })
 }
 
@@ -940,5 +1103,41 @@ mod tests {
 
         let codes: Vec<&str> = subs.iter().map(|s| s.code.as_str()).collect();
         assert_eq!(codes, vec!["eng", "ara", "rus", "ind", "spa", "fre"]);
+    }
+
+    #[test]
+    fn test_matches_episode() {
+        assert!(matches_episode("0", "[Para Exo] Serial Experiments Lain 01 [BD].ass", 1));
+        assert!(!matches_episode("0", "[Para Exo] Serial Experiments Lain 02 [BD].ass", 1));
+        assert!(matches_episode("0", "Serial.Experiments.Lain.Layer01.AR.srt", 1));
+        assert!(matches_episode("0", "Welcome To The NHK - 01.ass", 1));
+        assert!(!matches_episode("0", "Welcome To The NHK - 11.ass", 1));
+        assert!(matches_episode("1", "random_filename.srt", 1));
+        assert!(!matches_episode("2", "random_filename.srt", 1));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_external_subtitles_finds_arabic_for_lain() {
+        let client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let subs = fetch_external_subtitles(&client, 339, "Serial Experiments Lain", 1).await;
+        let has_ara = subs.iter().any(|s| s.code.starts_with("ara"));
+        assert!(has_ara, "Expected Arabic subtitle for Serial Experiments Lain Ep 1");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_external_subtitles_finds_languages_for_nhk() {
+        let client = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let subs = fetch_external_subtitles(&client, 1210, "Welcome to the N.H.K", 1).await;
+        let has_ara = subs.iter().any(|s| s.code.starts_with("ara"));
+        let has_rus = subs.iter().any(|s| s.code.starts_with("rus"));
+        assert!(has_ara || has_rus, "Expected Arabic or Russian subtitle for Welcome to the N.H.K Ep 1");
     }
 }

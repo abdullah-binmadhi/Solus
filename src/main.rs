@@ -238,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
                     {
                         state.playback_qualities = info.qualities;
                         state.playback_sub_languages = info.subtitles;
+                        state.playback_providers = info.providers;
                         state.pending_master_url = info.master_url;
 
                         let pref_str = cfg.quality.as_str();
@@ -1295,30 +1296,65 @@ async fn handle_playback_options(
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => state.go_back(),
         KeyCode::Tab => {
-            state.playback_sub_focused = !state.playback_sub_focused;
+            state.playback_focus_column = (state.playback_focus_column + 1) % 3;
+            state.playback_sub_focused = state.playback_focus_column == 2;
+        }
+        KeyCode::BackTab => {
+            state.playback_focus_column = if state.playback_focus_column == 0 { 2 } else { state.playback_focus_column - 1 };
+            state.playback_sub_focused = state.playback_focus_column == 2;
         }
         KeyCode::Left | KeyCode::Char('h') => {
-            state.playback_sub_focused = false;
+            state.playback_focus_column = state.playback_focus_column.saturating_sub(1);
+            state.playback_sub_focused = state.playback_focus_column == 2;
         }
         KeyCode::Right | KeyCode::Char('l') => {
-            if !state.playback_sub_languages.is_empty() {
-                state.playback_sub_focused = true;
+            if state.playback_focus_column < 2 {
+                state.playback_focus_column += 1;
+                state.playback_sub_focused = state.playback_focus_column == 2;
             }
         }
+        KeyCode::Char('1') => {
+            state.playback_focus_column = 0;
+            state.playback_sub_focused = false;
+        }
+        KeyCode::Char('2') => {
+            state.playback_focus_column = 1;
+            state.playback_sub_focused = false;
+        }
+        KeyCode::Char('3') => {
+            state.playback_focus_column = 2;
+            state.playback_sub_focused = true;
+        }
         KeyCode::Down | KeyCode::Char('j') => {
-            if state.playback_sub_focused {
-                if state.playback_sub_cursor + 1 < state.playback_sub_languages.len() {
-                    state.playback_sub_cursor += 1;
+            match state.playback_focus_column {
+                0 => {
+                    if state.playback_provider_cursor + 1 < state.playback_providers.len() {
+                        state.playback_provider_cursor += 1;
+                    }
                 }
-            } else if state.playback_quality_cursor + 1 < state.playback_qualities.len() {
-                state.playback_quality_cursor += 1;
+                1 => {
+                    if state.playback_quality_cursor + 1 < state.playback_qualities.len() {
+                        state.playback_quality_cursor += 1;
+                    }
+                }
+                _ => {
+                    if state.playback_sub_cursor + 1 < state.playback_sub_languages.len() {
+                        state.playback_sub_cursor += 1;
+                    }
+                }
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if state.playback_sub_focused {
-                state.playback_sub_cursor = state.playback_sub_cursor.saturating_sub(1);
-            } else {
-                state.playback_quality_cursor = state.playback_quality_cursor.saturating_sub(1);
+            match state.playback_focus_column {
+                0 => {
+                    state.playback_provider_cursor = state.playback_provider_cursor.saturating_sub(1);
+                }
+                1 => {
+                    state.playback_quality_cursor = state.playback_quality_cursor.saturating_sub(1);
+                }
+                _ => {
+                    state.playback_sub_cursor = state.playback_sub_cursor.saturating_sub(1);
+                }
             }
         }
         KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -1348,6 +1384,7 @@ async fn handle_playback_options(
                 };
                 let _ = db::user::set_audio_mode(pool, anime.id, audio.clone(), unix_now()).await;
 
+                let chosen_provider = state.playback_providers.get(state.playback_provider_cursor);
                 let chosen_sub = state.playback_sub_languages.get(state.playback_sub_cursor);
                 let sub_lang = chosen_sub.map(|s| s.lang_keyword().to_string());
                 let sub_url = chosen_sub.map(|s| s.url.clone()).filter(|u| !u.is_empty());
@@ -1356,7 +1393,20 @@ async fn handle_playback_options(
                 let quality_label = chosen_qual
                     .map(|q| q.label.clone())
                     .unwrap_or_else(|| quality_label(state.playback_quality_cursor).to_string());
-                let stream_url = chosen_qual.map(|q| q.url.clone()).filter(|u| !u.is_empty());
+                let mut stream_url = chosen_qual.map(|q| q.url.clone()).filter(|u| !u.is_empty());
+
+                // If user selected AnimePahe or GogoAnime (ani-cli provider scrapers), stream_url is None
+                // so ani-cli executes with its native multi-source engine.
+                // If ZokoAnime or HD-1 is selected, it uses direct verified master HLS stream.
+                if let Some(prov) = chosen_provider {
+                    if prov.id == "pahe" || prov.id == "gogo" {
+                        stream_url = None;
+                    } else if let Some(ref m_url) = prov.master_url {
+                        if stream_url.is_none() {
+                            stream_url = Some(m_url.clone());
+                        }
+                    }
+                }
 
                 let opts = api::player::PlayOptions {
                     title:   query,

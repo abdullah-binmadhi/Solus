@@ -76,7 +76,22 @@ pub fn is_valid_subtitle_content(content: &str) -> bool {
     {
         return false;
     }
-    content.contains("-->") || content.contains("WEBVTT")
+    content.contains("-->")
+        || content.contains("WEBVTT")
+        || content.contains("[Script Info]")
+        || content.contains("Dialogue:")
+}
+
+/// Format seconds into H:MM:SS.cs format for ASS subtitles.
+pub fn format_ass_timestamp(seconds: f64) -> String {
+    let total_cs = (seconds.max(0.0) * 100.0).round() as u64;
+    let cs = total_cs % 100;
+    let total_s = total_cs / 100;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    format!("{}:{:02}:{:02}.{:02}", h, m, s, cs)
 }
 
 /// Parse timestamp string in HH:MM:SS,mmm or HH:MM:SS.mmm format into seconds.
@@ -108,7 +123,7 @@ pub fn format_timestamp(seconds: f64, separator: char) -> String {
     format!("{:02}:{:02}:{:02}{}{:03}", h, m, s, separator, ms)
 }
 
-/// Extract dialogue/speech time intervals `(start_sec, end_sec)` from raw .srt or .vtt content.
+/// Extract dialogue/speech time intervals `(start_sec, end_sec)` from raw .srt, .vtt, or .ass content.
 pub fn parse_subtitle_intervals(content: &str) -> Vec<(f64, f64)> {
     let mut intervals = Vec::new();
     for line in content.lines() {
@@ -120,6 +135,17 @@ pub fn parse_subtitle_intervals(content: &str) -> Vec<(f64, f64)> {
             if let (Some(s), Some(e)) = (parse_timestamp(start_str), parse_timestamp(end_str)) {
                 if e > s && (e - s) < 30.0 {
                     intervals.push((s, e));
+                }
+            }
+        } else if trimmed.starts_with("Dialogue:") {
+            let parts: Vec<&str> = trimmed.splitn(10, ',').collect();
+            if parts.len() >= 3 {
+                let start_str = parts[1].trim();
+                let end_str = parts[2].trim();
+                if let (Some(s), Some(e)) = (parse_timestamp(start_str), parse_timestamp(end_str)) {
+                    if e > s && (e - s) < 30.0 {
+                        intervals.push((s, e));
+                    }
                 }
             }
         }
@@ -266,11 +292,12 @@ pub fn calculate_optimal_alignment(
     }
 }
 
-/// Apply scale and offset shift to all timestamp lines in subtitle text (supports SRT and VTT).
+/// Apply scale and offset shift to all timestamp lines in subtitle text (supports SRT, VTT, and ASS).
 pub fn apply_subtitle_shift(content: &str, offset_seconds: f64, scale_factor: f64) -> String {
     let mut out = String::with_capacity(content.len());
 
     for line in content.lines() {
+        let trimmed = line.trim();
         if let Some(arrow_idx) = line.find(" --> ") {
             let start_str = line[..arrow_idx].trim();
             let after_arrow = &line[arrow_idx + 5..];
@@ -287,6 +314,26 @@ pub fn apply_subtitle_shift(content: &str, offset_seconds: f64, scale_factor: f6
                         format_timestamp(new_s, sep),
                         format_timestamp(new_e, sep),
                         remainder
+                    ));
+                    continue;
+                }
+            }
+        } else if trimmed.starts_with("Dialogue:") {
+            let parts: Vec<&str> = line.splitn(10, ',').collect();
+            if parts.len() >= 3 {
+                let start_str = parts[1].trim();
+                let end_str = parts[2].trim();
+                if let (Some(s), Some(e)) = (parse_timestamp(start_str), parse_timestamp(end_str)) {
+                    let new_s = (s * scale_factor + offset_seconds).max(0.0);
+                    let new_e = (e * scale_factor + offset_seconds).max(0.0);
+                    let new_start = format_ass_timestamp(new_s);
+                    let new_end = format_ass_timestamp(new_e);
+                    out.push_str(&format!(
+                        "{},{},{},{}\n",
+                        parts[0],
+                        new_start,
+                        new_end,
+                        parts[3..].join(",")
                     ));
                     continue;
                 }
@@ -367,16 +414,17 @@ pub async fn ensure_synchronized_subtitle(
 
     let clean_code: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     let code_name = if clean_code.is_empty() { "sub" } else { &clean_code };
-    let synced_path = cache_dir.join(format!("{}_{}_{}_synced.srt", anime_id, episode, code_name));
 
-    // If already synchronized and cached, verify content is valid subtitle (not HTML error)
-    if synced_path.is_file() {
-        if let Ok(cached_content) = std::fs::read_to_string(&synced_path) {
-            if is_valid_subtitle_content(&cached_content) {
-                return (synced_path.to_string_lossy().into_owned(), None);
-            } else {
-                // Remove corrupted or 403 HTML cache entry
-                let _ = std::fs::remove_file(&synced_path);
+    // Check if valid cached version already exists (.ass, .srt, .vtt)
+    for ext in ["ass", "srt", "vtt"] {
+        let p = cache_dir.join(format!("{}_{}_{}_synced.{}", anime_id, episode, code_name, ext));
+        if p.is_file() {
+            if let Ok(cached_content) = std::fs::read_to_string(&p) {
+                if is_valid_subtitle_content(&cached_content) {
+                    return (p.to_string_lossy().into_owned(), None);
+                } else {
+                    let _ = std::fs::remove_file(&p);
+                }
             }
         }
     }
@@ -386,7 +434,7 @@ pub async fn ensure_synchronized_subtitle(
         .get(target_sub_url)
         .header("Referer", "https://zokoanime.video/")
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-        .timeout(Duration::from_secs(6))
+        .timeout(Duration::from_secs(8))
         .send()
         .await
     {
@@ -399,7 +447,22 @@ pub async fn ensure_synchronized_subtitle(
     if target_bytes.is_empty() {
         return (target_sub_url.to_string(), None);
     }
-    let target_text = decode_subtitle_bytes(&target_bytes);
+
+    // Transparent gzip decompression if payload is .gz
+    let raw_target_bytes = if target_bytes.starts_with(&[0x1f, 0x8b]) {
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(&target_bytes[..]);
+        let mut out = Vec::new();
+        if decoder.read_to_end(&mut out).is_ok() {
+            out
+        } else {
+            target_bytes.to_vec()
+        }
+    } else {
+        target_bytes.to_vec()
+    };
+
+    let target_text = decode_subtitle_bytes(&raw_target_bytes);
     if !is_valid_subtitle_content(&target_text) {
         return (target_sub_url.to_string(), None);
     }
@@ -414,12 +477,25 @@ pub async fn ensure_synchronized_subtitle(
                 .get(ref_url)
                 .header("Referer", "https://zokoanime.video/")
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-                .timeout(Duration::from_secs(5));
+                .timeout(Duration::from_secs(6));
 
             if let Ok(ref_resp) = ref_req.send().await {
                 if ref_resp.status().is_success() {
                     if let Ok(ref_bytes) = ref_resp.bytes().await {
-                        let ref_text = decode_subtitle_bytes(&ref_bytes);
+                        let raw_ref_bytes = if ref_bytes.starts_with(&[0x1f, 0x8b]) {
+                            use std::io::Read;
+                            let mut decoder = flate2::read::GzDecoder::new(&ref_bytes[..]);
+                            let mut out = Vec::new();
+                            if decoder.read_to_end(&mut out).is_ok() {
+                                out
+                            } else {
+                                ref_bytes.to_vec()
+                            }
+                        } else {
+                            ref_bytes.to_vec()
+                        };
+
+                        let ref_text = decode_subtitle_bytes(&raw_ref_bytes);
                         if is_valid_subtitle_content(&ref_text) {
                             let ref_intervals = parse_subtitle_intervals(&ref_text);
                             let target_intervals = parse_subtitle_intervals(&target_text);
@@ -435,6 +511,16 @@ pub async fn ensure_synchronized_subtitle(
             }
         }
     }
+
+    // Determine appropriate extension (.ass, .vtt, or .srt)
+    let ext = if final_content.contains("[Script Info]") || final_content.contains("Dialogue:") {
+        "ass"
+    } else if final_content.contains("WEBVTT") {
+        "vtt"
+    } else {
+        "srt"
+    };
+    let synced_path = cache_dir.join(format!("{}_{}_{}_synced.{}", anime_id, episode, code_name, ext));
 
     // Write final validated file to cache
     if is_valid_subtitle_content(&final_content) && std::fs::write(&synced_path, &final_content).is_ok() {
@@ -632,5 +718,18 @@ Lain's acting funny.
         // CP1251 bytes: 0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2 = "Привет"
         let cp1251_bytes = [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2];
         assert_eq!(decode_subtitle_bytes(&cp1251_bytes), "Привет");
+    }
+
+    #[test]
+    fn test_parse_and_shift_ass_subtitles() {
+        let ass = "[Script Info]\nTitle: Test\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:02:01.70,0:02:08.70,Default,,0,0,0,,Hello Arabic\n";
+        let intervals = parse_subtitle_intervals(ass);
+        assert_eq!(intervals.len(), 1);
+        assert!((intervals[0].0 - 121.70).abs() < 1e-3);
+        assert!((intervals[0].1 - 128.70).abs() < 1e-3);
+
+        let shifted = apply_subtitle_shift(ass, 2.0, 1.0);
+        assert!(shifted.contains("0:02:03.70,0:02:10.70"));
+        assert!(is_valid_subtitle_content(ass));
     }
 }

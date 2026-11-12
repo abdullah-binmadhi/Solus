@@ -168,6 +168,15 @@ pub struct AppState {
     /// Playback options: selected subtitle language index
     pub playback_sub_cursor: usize,
 
+    /// Playback options: available streaming providers / server mirrors
+    pub playback_providers: Vec<crate::api::subtitles::ProviderOption>,
+
+    /// Playback options: selected streaming provider index
+    pub playback_provider_cursor: usize,
+
+    /// Playback options: focused column index (0 = Provider, 1 = Quality, 2 = Subtitles)
+    pub playback_focus_column: usize,
+
     /// Playback options: which section is focused (false = Quality, true = Subtitles)
     pub playback_sub_focused: bool,
 
@@ -381,6 +390,9 @@ impl AppState {
             playback_quality_cursor: 0,
             playback_sub_languages: vec![crate::api::subtitles::SubtitleOption::default_english()],
             playback_sub_cursor: 0,
+            playback_providers: crate::api::subtitles::default_providers(),
+            playback_provider_cursor: 0,
+            playback_focus_column: 0,
             playback_sub_focused: false,
             is_loading_subs: false,
             pending_master_url: None,
@@ -662,6 +674,9 @@ impl AppState {
         self.playback_quality_cursor = quality_idx;
         self.pending_dub = dub;
         self.playback_sub_cursor = 0;
+        self.playback_providers = crate::api::subtitles::default_providers();
+        self.playback_provider_cursor = 0;
+        self.playback_focus_column = 0;
         self.playback_sub_focused = false;
         self.is_loading_subs = true;
         self.pending_master_url = None;
