@@ -29,6 +29,10 @@ pub struct ProviderOption {
     pub name: String,
     pub server_label: String,
     pub master_url: Option<String>,
+    pub qualities: Vec<QualityOption>,
+    pub subtitles: Vec<SubtitleOption>,
+    pub supports_sub: bool,
+    pub supports_dub: bool,
 }
 
 pub fn default_providers() -> Vec<ProviderOption> {
@@ -38,24 +42,58 @@ pub fn default_providers() -> Vec<ProviderOption> {
             name: "ZokoAnime".to_string(),
             server_label: "ZokoAnime [Direct 1080p]".to_string(),
             master_url: None,
+            qualities: vec![
+                QualityOption { label: "1080p".to_string(), url: String::new() },
+                QualityOption { label: "720p".to_string(), url: String::new() },
+                QualityOption { label: "480p".to_string(), url: String::new() },
+                QualityOption { label: "360p".to_string(), url: String::new() },
+            ],
+            subtitles: vec![SubtitleOption::default_english()],
+            supports_sub: true,
+            supports_dub: true,
         },
         ProviderOption {
             id: "hd1".to_string(),
             name: "HD-1".to_string(),
             server_label: "HD-1 [MegaPlay Cloud]".to_string(),
             master_url: None,
+            qualities: vec![
+                QualityOption { label: "1080p".to_string(), url: String::new() },
+                QualityOption { label: "720p".to_string(), url: String::new() },
+                QualityOption { label: "480p".to_string(), url: String::new() },
+            ],
+            subtitles: vec![SubtitleOption::default_english()],
+            supports_sub: true,
+            supports_dub: true,
         },
         ProviderOption {
             id: "pahe".to_string(),
             name: "AnimePahe".to_string(),
             server_label: "AnimePahe [ani-cli]".to_string(),
             master_url: None,
+            qualities: vec![
+                QualityOption { label: "1080p BD".to_string(), url: String::new() },
+                QualityOption { label: "720p BD".to_string(), url: String::new() },
+                QualityOption { label: "480p BD".to_string(), url: String::new() },
+            ],
+            subtitles: vec![SubtitleOption::default_english()],
+            supports_sub: true,
+            supports_dub: false,
         },
         ProviderOption {
             id: "gogo".to_string(),
             name: "GogoAnime".to_string(),
             server_label: "GogoAnime [ani-cli]".to_string(),
             master_url: None,
+            qualities: vec![
+                QualityOption { label: "1080p".to_string(), url: String::new() },
+                QualityOption { label: "720p".to_string(), url: String::new() },
+                QualityOption { label: "480p".to_string(), url: String::new() },
+                QualityOption { label: "360p".to_string(), url: String::new() },
+            ],
+            subtitles: vec![SubtitleOption::default_english()],
+            supports_sub: true,
+            supports_dub: true,
         },
     ]
 }
@@ -66,6 +104,7 @@ pub struct StreamInfo {
     pub qualities: Vec<QualityOption>,
     pub subtitles: Vec<SubtitleOption>,
     pub providers: Vec<ProviderOption>,
+    pub dub_available: bool,
 }
 
 impl StreamInfo {
@@ -78,6 +117,7 @@ impl StreamInfo {
             ],
             subtitles: vec![SubtitleOption::default_english()],
             providers: default_providers(),
+            dub_available: false,
         }
     }
 }
@@ -291,7 +331,86 @@ pub async fn fetch_stream_info(
     // Prioritize English, Arabic, Russian, and Bahasa Indonesia at the top of the track list
     prioritize_subtitles(&mut info.subtitles);
 
+    // Populate provider-specific capabilities dynamically
+    let zoko_qualities = info.qualities.clone();
+    let all_subtitles = info.subtitles.clone();
+    let dub_avail = info.dub_available;
+
+    for prov in &mut info.providers {
+        match prov.id.as_str() {
+            "zoko" => {
+                prov.master_url = info.master_url.clone();
+                prov.qualities = zoko_qualities.clone();
+                prov.subtitles = all_subtitles.clone();
+                prov.supports_sub = true;
+                prov.supports_dub = dub_avail;
+                if is_dub && !dub_avail {
+                    prov.server_label = "ZokoAnime (No Dub)".to_string();
+                } else {
+                    prov.server_label = "ZokoAnime [Direct 1080p]".to_string();
+                }
+            }
+            "hd1" => {
+                prov.qualities = vec![
+                    QualityOption { label: "1080p".to_string(), url: String::new() },
+                    QualityOption { label: "720p".to_string(), url: String::new() },
+                    QualityOption { label: "480p".to_string(), url: String::new() },
+                ];
+                prov.subtitles = all_subtitles.clone();
+                prov.supports_sub = true;
+                prov.supports_dub = dub_avail;
+                if is_dub && !dub_avail {
+                    prov.server_label = "HD-1 (No Dub)".to_string();
+                } else {
+                    prov.server_label = "HD-1 [MegaPlay Cloud]".to_string();
+                }
+            }
+            "pahe" => {
+                prov.qualities = vec![
+                    QualityOption { label: "1080p BD".to_string(), url: String::new() },
+                    QualityOption { label: "720p BD".to_string(), url: String::new() },
+                    QualityOption { label: "480p BD".to_string(), url: String::new() },
+                ];
+                prov.subtitles = all_subtitles.clone();
+                prov.supports_sub = true;
+                prov.supports_dub = false;
+                if is_dub {
+                    prov.server_label = "AnimePahe (No Dub)".to_string();
+                } else {
+                    prov.server_label = "AnimePahe [ani-cli]".to_string();
+                }
+            }
+            "gogo" => {
+                prov.qualities = vec![
+                    QualityOption { label: "1080p".to_string(), url: String::new() },
+                    QualityOption { label: "720p".to_string(), url: String::new() },
+                    QualityOption { label: "480p".to_string(), url: String::new() },
+                    QualityOption { label: "360p".to_string(), url: String::new() },
+                ];
+                prov.subtitles = all_subtitles.clone();
+                prov.supports_sub = true;
+                prov.supports_dub = dub_avail;
+                if is_dub && !dub_avail {
+                    prov.server_label = "GogoAnime (No Dub)".to_string();
+                } else {
+                    prov.server_label = "GogoAnime [ani-cli]".to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+
     info
+}
+
+async fn check_mal_dub_available(client: &reqwest::Client, mal_id: i64, episode: u32) -> bool {
+    let url = format!("https://zokoanime.video/stream/mal/{}/{}/dub", mal_id, episode);
+    if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(3)).send().await {
+        if let Ok(text) = resp.text().await {
+            return text.contains("window.__P=\"");
+        }
+    }
+    false
 }
 
 async fn resolve_primary_stream(
@@ -303,8 +422,13 @@ async fn resolve_primary_stream(
 ) -> Option<StreamInfo> {
     // 1. First attempt: resolve MAL ID via AniList GraphQL
     if let Some(mal_id) = fetch_mal_id(client, anilist_id).await {
-        if let Ok(info) = fetch_stream_for_mal(client, mal_id, episode, is_dub).await {
+        let (mal_res, dub_avail) = tokio::join!(
+            fetch_stream_for_mal(client, mal_id, episode, is_dub),
+            check_mal_dub_available(client, mal_id, episode)
+        );
+        if let Ok(mut info) = mal_res {
             if !info.subtitles.is_empty() || !info.qualities.is_empty() {
+                info.dub_available = dub_avail || is_dub;
                 return Some(info);
             }
         }
@@ -657,13 +781,16 @@ async fn fetch_stream_via_hianime(
     let srv_resp = client.get(&srv_url).send().await.map_err(|_| ())?;
     let srv_json: serde_json::Value = srv_resp.json().await.map_err(|_| ())?;
     let srv_html = srv_json.get("html").and_then(|v| v.as_str()).unwrap_or("");
+    let has_dub = srv_html.contains("data-type=\"dub\"");
 
     let embed_url = extract_zoko_embed_url(srv_html, is_dub).ok_or(())?;
 
     // 4. Fetch embed HTML
     let embed_resp = client.get(&embed_url).send().await.map_err(|_| ())?;
     let embed_html = embed_resp.text().await.map_err(|_| ())?;
-    parse_stream_embed(client, &embed_html).await
+    let mut info = parse_stream_embed(client, &embed_html).await?;
+    info.dub_available = has_dub;
+    Ok(info)
 }
 
 async fn parse_stream_embed(client: &reqwest::Client, html: &str) -> Result<StreamInfo, ()> {
@@ -707,6 +834,7 @@ async fn parse_stream_embed(client: &reqwest::Client, html: &str) -> Result<Stre
         qualities,
         subtitles,
         providers,
+        dub_available: false,
     })
 }
 

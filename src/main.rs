@@ -239,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
                         state.playback_qualities = info.qualities;
                         state.playback_sub_languages = info.subtitles;
                         state.playback_providers = info.providers;
+                        state.dub_available = Some(info.dub_available);
                         state.pending_master_url = info.master_url;
 
                         let pref_str = cfg.quality.as_str();
@@ -259,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
                             })
                             .unwrap_or(0);
 
+                        state.sync_active_provider();
                         state.is_loading_subs = false;
                     }
                 }
@@ -1330,6 +1332,7 @@ async fn handle_playback_options(
                 0 => {
                     if state.playback_provider_cursor + 1 < state.playback_providers.len() {
                         state.playback_provider_cursor += 1;
+                        state.sync_active_provider();
                     }
                 }
                 1 => {
@@ -1348,6 +1351,7 @@ async fn handle_playback_options(
             match state.playback_focus_column {
                 0 => {
                     state.playback_provider_cursor = state.playback_provider_cursor.saturating_sub(1);
+                    state.sync_active_provider();
                 }
                 1 => {
                     state.playback_quality_cursor = state.playback_quality_cursor.saturating_sub(1);
@@ -1358,6 +1362,10 @@ async fn handle_playback_options(
             }
         }
         KeyCode::Char('a') | KeyCode::Char('A') => {
+            if !state.pending_dub && state.dub_available == Some(false) {
+                state.show_toast("English Dub is not available for this anime (Sub only)", unix_now());
+                return;
+            }
             state.pending_dub = !state.pending_dub;
             state.is_loading_subs = true;
             state.playback_qualities.clear();
@@ -1382,6 +1390,17 @@ async fn handle_playback_options(
                 } else {
                     config::AudioMode::Sub
                 };
+
+                let chosen_provider = state.playback_providers.get(state.playback_provider_cursor);
+                if state.pending_dub {
+                    if let Some(prov) = chosen_provider {
+                        if !prov.supports_dub {
+                            state.show_toast(format!("{} does not support English Dub. Please switch to Sub.", prov.name), unix_now());
+                            return;
+                        }
+                    }
+                }
+
                 let _ = db::user::set_audio_mode(pool, anime.id, audio.clone(), unix_now()).await;
 
                 let chosen_provider = state.playback_providers.get(state.playback_provider_cursor);

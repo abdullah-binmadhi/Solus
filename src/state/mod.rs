@@ -171,6 +171,9 @@ pub struct AppState {
     /// Playback options: available streaming providers / server mirrors
     pub playback_providers: Vec<crate::api::subtitles::ProviderOption>,
 
+    /// Playback options: whether English dub audio is verified available for this episode
+    pub dub_available: Option<bool>,
+
     /// Playback options: selected streaming provider index
     pub playback_provider_cursor: usize,
 
@@ -391,6 +394,7 @@ impl AppState {
             playback_sub_languages: vec![crate::api::subtitles::SubtitleOption::default_english()],
             playback_sub_cursor: 0,
             playback_providers: crate::api::subtitles::default_providers(),
+            dub_available: None,
             playback_provider_cursor: 0,
             playback_focus_column: 0,
             playback_sub_focused: false,
@@ -675,6 +679,7 @@ impl AppState {
         self.pending_dub = dub;
         self.playback_sub_cursor = 0;
         self.playback_providers = crate::api::subtitles::default_providers();
+        self.dub_available = None;
         self.playback_provider_cursor = 0;
         self.playback_focus_column = 0;
         self.playback_sub_focused = false;
@@ -682,6 +687,46 @@ impl AppState {
         self.pending_master_url = None;
         self.playback_sub_languages = vec![crate::api::subtitles::SubtitleOption::default_english()];
         self.screen = Screen::PlaybackOptions;
+    }
+
+    /// Dynamically synchronize active quality and subtitle options with the highlighted provider.
+    pub fn sync_active_provider(&mut self) {
+        if let Some(prov) = self.playback_providers.get(self.playback_provider_cursor) {
+            let curr_quality_label = self
+                .playback_qualities
+                .get(self.playback_quality_cursor)
+                .map(|q| q.label.clone());
+            let curr_sub_code = self
+                .playback_sub_languages
+                .get(self.playback_sub_cursor)
+                .map(|s| s.code.clone());
+
+            if !prov.qualities.is_empty() {
+                self.playback_qualities = prov.qualities.clone();
+                if let Some(ref lbl) = curr_quality_label {
+                    self.playback_quality_cursor = self
+                        .playback_qualities
+                        .iter()
+                        .position(|q| q.label.starts_with(lbl) || lbl.starts_with(&q.label))
+                        .unwrap_or(0);
+                } else if self.playback_quality_cursor >= self.playback_qualities.len() {
+                    self.playback_quality_cursor = 0;
+                }
+            }
+
+            if !prov.subtitles.is_empty() {
+                self.playback_sub_languages = prov.subtitles.clone();
+                if let Some(ref code) = curr_sub_code {
+                    self.playback_sub_cursor = self
+                        .playback_sub_languages
+                        .iter()
+                        .position(|s| s.code == *code)
+                        .unwrap_or(0);
+                } else if self.playback_sub_cursor >= self.playback_sub_languages.len() {
+                    self.playback_sub_cursor = 0;
+                }
+            }
+        }
     }
 
     /// Update watched progress and set the selected episode to the next unwatched.
@@ -982,6 +1027,30 @@ mod tests {
 
         let msg = state.playback_error_message();
         assert_eq!(msg, Some("No valid sources. The provider may be down — try again later."));
+    }
+
+    #[test]
+    fn test_sync_active_provider_updates_qualities_and_subtitles() {
+        let mut state = AppState::new();
+        state.playback_providers = crate::api::subtitles::default_providers();
+        assert_eq!(state.playback_providers.len(), 4);
+
+        // Initially on Provider 0 (ZokoAnime)
+        state.playback_provider_cursor = 0;
+        state.sync_active_provider();
+        assert_eq!(state.playback_qualities[0].label, "1080p");
+
+        // Move to Provider 2 (AnimePahe: uses BD tags like "1080p BD")
+        state.playback_provider_cursor = 2;
+        state.sync_active_provider();
+        assert_eq!(state.playback_qualities[0].label, "1080p BD");
+        // Quality cursor should have preserved match on 1080p
+        assert_eq!(state.playback_quality_cursor, 0);
+
+        // Move back to Provider 0
+        state.playback_provider_cursor = 0;
+        state.sync_active_provider();
+        assert_eq!(state.playback_qualities[0].label, "1080p");
     }
 
     #[test]

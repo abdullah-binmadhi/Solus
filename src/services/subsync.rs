@@ -124,6 +124,10 @@ pub fn format_timestamp(seconds: f64, separator: char) -> String {
 }
 
 /// Extract dialogue/speech time intervals `(start_sec, end_sec)` from raw .srt, .vtt, or .ass content.
+/// Performs intelligent speech filtering:
+/// 1. Discards micro-intervals (< 0.35s) created by ASS karaoke syllable timing and frame-by-frame typesetting animations.
+/// 2. Discards ASS non-dialogue styling layers (OP/ED song romanizations, karaoke, logos, signs, and staff credits).
+/// 3. Deduplicates coincident timestamps produced by multi-layer ASS outline/blur effects.
 pub fn parse_subtitle_intervals(content: &str) -> Vec<(f64, f64)> {
     let mut intervals = Vec::new();
     for line in content.lines() {
@@ -133,17 +137,50 @@ pub fn parse_subtitle_intervals(content: &str) -> Vec<(f64, f64)> {
             let after_arrow = &trimmed[arrow_idx + 5..];
             let end_str = after_arrow.split_whitespace().next().unwrap_or("");
             if let (Some(s), Some(e)) = (parse_timestamp(start_str), parse_timestamp(end_str)) {
-                if e > s && (e - s) < 30.0 {
+                // Spoken dialogue is at least 0.35s and less than 30s
+                if e > s && (e - s) >= 0.35 && (e - s) < 30.0 {
                     intervals.push((s, e));
                 }
             }
         } else if trimmed.starts_with("Dialogue:") {
             let parts: Vec<&str> = trimmed.splitn(10, ',').collect();
             if parts.len() >= 3 {
+                // If style is available, filter out known karaoke, song, or typesetting animation styles
+                if parts.len() >= 4 {
+                    let style = parts[3].trim().to_lowercase();
+                    if style.contains("rom")
+                        || style.contains("op")
+                        || style.contains("ed")
+                        || style.contains("karaoke")
+                        || style.contains("hit the road")
+                        || style.contains("logo")
+                        || style.contains("effect")
+                        || style.contains("sign")
+                        || style.contains("staff")
+                    {
+                        continue;
+                    }
+                }
+
+                // If text contains karaoke tags \k or \K, skip
+                if parts.len() >= 10 {
+                    let text = parts[9].to_lowercase();
+                    if text.contains(r"\k") {
+                        continue;
+                    }
+                }
+
                 let start_str = parts[1].trim();
                 let end_str = parts[2].trim();
                 if let (Some(s), Some(e)) = (parse_timestamp(start_str), parse_timestamp(end_str)) {
-                    if e > s && (e - s) < 30.0 {
+                    // Ignore sub-350ms slices (particle effects, animated letter fades, karaoke syllable ticks)
+                    if e > s && (e - s) >= 0.35 && (e - s) < 30.0 {
+                        // Deduplicate layered styles with identical start timestamp (within 20ms)
+                        if let Some(&(last_s, _)) = intervals.last() {
+                            if (s - last_s).abs() < 0.02 {
+                                continue;
+                            }
+                        }
                         intervals.push((s, e));
                     }
                 }
@@ -266,12 +303,11 @@ pub fn calculate_optimal_alignment(
         }
     }
 
-    // Identity Guard: If at offset 0.0s (scale 1.0) the score already achieves >= 90%
+    // Identity Guard: If at offset 0.0s (scale 1.0) the score already achieves >= 82%
     // of the peak score, the subtitle is already in sync with the video release.
-    // Any minor offset differences (< 2s) are translator-pacing variations or song credits.
     // Suppress offset shift to prevent introducing an artificial delay on in-sync tracks.
     let score_zero = compute_score(1.0, 0.0);
-    if score_zero > 0 && score_zero >= ((best_score as f64 * 0.90) as u64) && (best_scale - 1.0).abs() < 0.001 {
+    if score_zero > 0 && score_zero >= ((best_score as f64 * 0.82) as u64) && (best_scale - 1.0).abs() < 0.001 {
         return SyncResult {
             offset_seconds: 0.0,
             scale_factor: 1.0,
@@ -280,8 +316,8 @@ pub fn calculate_optimal_alignment(
         };
     }
 
-    // Decision: only apply if the adjustment is noticeable (> 80ms or non-1.0 scale) and score is solid
-    let is_already_synced = best_offset.abs() < 0.08 && (best_scale - 1.0).abs() < 0.001;
+    // Decision: only apply if the adjustment is noticeable (> 150ms or non-1.0 scale) and score is solid
+    let is_already_synced = best_offset.abs() < 0.15 && (best_scale - 1.0).abs() < 0.001;
     let applied = !is_already_synced && best_score > 60;
 
     SyncResult {
@@ -718,6 +754,25 @@ Lain's acting funny.
         // CP1251 bytes: 0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2 = "Привет"
         let cp1251_bytes = [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2];
         assert_eq!(decode_subtitle_bytes(&cp1251_bytes), "Привет");
+    }
+
+    #[test]
+    fn test_parse_subtitle_intervals_filters_ass_karaoke_and_typesetting() {
+        let ass = r#"[Script Info]
+Title: NHK Sample
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:07.15,0:00:07.19,Hit the Road,,0,0,0,,{\bord1.5}Karaoke Frame 1
+Dialogue: 0,0:00:07.19,0:00:07.23,Hit the Road,,0,0,0,,{\bord1.5}Karaoke Frame 2
+Dialogue: 0,0:01:32.64,0:01:34.44,NHK Dialogue,,0,0,0,,Actual Spoken Dialogue 1
+Dialogue: 0,0:01:37.75,0:01:40.91,NHK Dialogue,,0,0,0,,Actual Spoken Dialogue 2
+Dialogue: 0,0:01:37.75,0:01:40.91,NHK Dialogue - Border,,0,0,0,,Outline duplicate
+"#;
+        let intervals = parse_subtitle_intervals(ass);
+        // Only the 2 actual spoken dialogue lines should remain!
+        assert_eq!(intervals.len(), 2);
+        assert!((intervals[0].0 - 92.64).abs() < 1e-2);
+        assert!((intervals[1].0 - 97.75).abs() < 1e-2);
     }
 
     #[test]

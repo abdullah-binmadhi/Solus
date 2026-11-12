@@ -40,6 +40,12 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         })
         .unwrap_or_else(|| "Choose options before launch".to_string());
 
+    let (dub_badge_text, dub_badge_style) = match state.dub_available {
+        Some(true) => (" [Sub + Dub] ", Style::default().fg(Color::Rgb(100, 255, 120)).add_modifier(Modifier::BOLD)),
+        Some(false) => (" [Sub only] ", Style::default().fg(Color::Rgb(255, 160, 80)).add_modifier(Modifier::BOLD)),
+        None => ("", Style::default()),
+    };
+
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -50,6 +56,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                 title_line,
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             ),
+            Span::raw("  "),
+            Span::styled(dub_badge_text, dub_badge_style),
         ]),
         Line::from(vec![
             Span::styled(" Audio Mode: ", Style::default().fg(Color::Rgb(160, 160, 175))),
@@ -62,8 +70,12 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             ),
             Span::raw("  "),
             Span::styled(
-                "([a] toggle)",
-                Style::default().fg(Color::Rgb(120, 120, 135)),
+                if state.dub_available == Some(false) {
+                    "([a] toggle — Dub not available)"
+                } else {
+                    "([a] toggle)"
+                },
+                Style::default().fg(if state.dub_available == Some(false) { Color::Rgb(220, 120, 80) } else { Color::Rgb(120, 120, 135) }),
             ),
         ]),
     ])
@@ -128,7 +140,10 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             .map(|(i, provider)| {
                 let is_selected = i == state.playback_provider_cursor;
                 let radio = if is_selected { " [●] " } else { " [○] " };
-                let style = if is_selected {
+                let is_unsupported_dub = state.pending_dub && !provider.supports_dub;
+                let style = if is_unsupported_dub {
+                    Style::default().fg(Color::Rgb(90, 90, 105))
+                } else if is_selected {
                     Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::Rgb(160, 160, 175))
@@ -138,9 +153,14 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                 } else {
                     Style::default().fg(Color::Rgb(100, 100, 115))
                 };
+                let label = if is_unsupported_dub {
+                    format!("{} (No Dub)", provider.name)
+                } else {
+                    provider.server_label.clone()
+                };
                 ListItem::new(Line::from(vec![
                     Span::styled(radio, radio_style),
-                    Span::styled(&provider.server_label, style),
+                    Span::styled(label, style),
                 ]))
             })
             .collect();
