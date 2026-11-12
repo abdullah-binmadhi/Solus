@@ -130,6 +130,17 @@ async fn main() -> anyhow::Result<()> {
         state.open_setup();
     }
 
+    // ── Local LAN Mobile Remote Companion ─────────────────────────────────────
+    let remote_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if cfg.remote.enabled {
+        services::remote::spawn_remote_server(
+            cfg.remote.port,
+            state.remote_state.clone(),
+            "/tmp/solus-mpv.sock".to_string(),
+            remote_shutdown.clone(),
+        );
+    }
+
     // ── Image picker (after alternate screen, before event loop) ──────────────
     // guess_protocol() probes the terminal — must happen after EnterAlternateScreen.
     let mut picker = ratatui_image::picker::Picker::from_termios()
@@ -482,6 +493,18 @@ async fn main() -> anyhow::Result<()> {
                     if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
                         state.anime_progress.insert(ep, (pos, dur));
                     }
+                    let remote_state_clone = state.remote_state.clone();
+                    let title = state.selected_anime.as_ref().map(|a| a.display_title().to_string()).unwrap_or_else(|| "Anime Stream".to_string());
+                    let ep_title = state.episode_titles.get(&ep).cloned().unwrap_or_else(|| format!("Episode {}", ep));
+                    tokio::spawn(async move {
+                        let mut st = remote_state_clone.write().await;
+                        st.is_playing = true;
+                        st.title = title;
+                        st.episode = ep;
+                        st.episode_title = ep_title;
+                        st.time_pos = pos;
+                        st.duration = dur;
+                    });
                 }
                 AppMessage::EpisodeAutoScrobbled(anime_id, ep) => {
                     if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
@@ -625,6 +648,17 @@ async fn main() -> anyhow::Result<()> {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
                         ui::analytics::render(frame, &state);
                     }
+                    Screen::RemoteModal => {
+                        render_base_screen(frame, &mut state, &home_data, &base_screen);
+                        ui::remote::render_remote_modal(frame, &state);
+                    }
+                    Screen::CastModal => {
+                        render_base_screen(frame, &mut state, &home_data, &base_screen);
+                        ui::cast::render_cast_modal(frame, &state);
+                    }
+                    Screen::CastDeck => {
+                        ui::cast::render_cast_deck(frame, &state);
+                    }
                 }
                 // Toast notification renders on top of everything
                 if let Some(ref msg) = toast_msg {
@@ -690,6 +724,9 @@ async fn handle_key(
         Screen::TailoredSummary => handle_tailored_summary(key, state, pool, tx).await,
         Screen::TailoredResults => handle_tailored_results(key, state, pool, cfg, tx).await,
         Screen::TasteAnalytics => handle_analytics(key, state, pool, tx).await,
+        Screen::RemoteModal => handle_remote_modal(key, state).await,
+        Screen::CastModal => handle_cast_modal(key, state, tx).await,
+        Screen::CastDeck => handle_cast_deck(key, state).await,
     }
 }
 
@@ -746,6 +783,13 @@ async fn handle_home(
         }
 
         KeyCode::Char('w') | KeyCode::Char('W') => state.open_tailored_wizard(),
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            state.overlay_base = Screen::Home;
+            if state.remote_qr.is_none() {
+                state.remote_qr = services::remote::generate_terminal_qr(&state.remote_url);
+            }
+            state.screen = Screen::RemoteModal;
+        }
         KeyCode::Char('/') => state.open_search(),
         KeyCode::Char('?') => state.open_help(),
         KeyCode::Char('s') => state.open_settings(),
@@ -1302,6 +1346,20 @@ async fn handle_detail(
         KeyCode::Char('/')                => state.open_search(),
         KeyCode::Char('?')               => state.open_help(),
         KeyCode::Char('s')               => state.open_settings(),
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            state.overlay_base = Screen::Detail;
+            if state.remote_qr.is_none() {
+                state.remote_qr = services::remote::generate_terminal_qr(&state.remote_url);
+            }
+            state.screen = Screen::RemoteModal;
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            state.overlay_base = Screen::Detail;
+            if state.cast_devices.is_empty() {
+                state.cast_devices = services::cast::scan_network(500).await;
+            }
+            state.screen = Screen::CastModal;
+        }
         KeyCode::Char('!')               => {
             refresh_dependency_status(state);
             state.open_setup();
@@ -1835,6 +1893,7 @@ async fn handle_playback_options(
                     ipc_socket: None,
                     start_pos:  None,
                     glsl_shaders,
+                    sub_style:  Some(cfg.subtitle_style.clone()),
                 };
                 start_playback(state, opts, title, ep, tx, pool, cfg).await;
             }
@@ -1925,33 +1984,173 @@ async fn handle_settings(
     cfg: &mut config::Config,
     tx: &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
+    let filtered = ui::settings::get_filtered_items(cfg, state);
+    let selected_idx = state.settings_cursor.min(filtered.len().saturating_sub(1));
+
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => state.go_back(),
-        KeyCode::Char('j') | KeyCode::Down => {
-            state.settings_cursor = (state.settings_cursor + 1).min(7);
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            state.settings_cursor = state.settings_cursor.saturating_sub(1);
-        }
-        KeyCode::Char('h') | KeyCode::Left => {
-            if apply_settings_delta(cfg, state.settings_cursor, -1).is_ok() {
-                let _ = cfg.save();
-                state.anime4k_mode = cfg.anime4k_mode;
-                state.ambilight_enabled = cfg.ambilight_enabled;
-                state.show_toast("Settings saved", unix_now());
+        KeyCode::Esc => {
+            if !state.settings_query.is_empty() {
+                state.settings_query.clear();
+                state.settings_cursor = 0;
+            } else {
+                state.go_back();
             }
-            refresh_dependency_status(state);
         }
-        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
-            if apply_settings_delta(cfg, state.settings_cursor, 1).is_ok() {
-                let _ = cfg.save();
-                state.anime4k_mode = cfg.anime4k_mode;
-                state.ambilight_enabled = cfg.ambilight_enabled;
-                state.show_toast("Settings saved", unix_now());
+        KeyCode::Backspace => {
+            state.settings_query.pop();
+            state.settings_cursor = 0;
+        }
+        KeyCode::Down => {
+            if !filtered.is_empty() {
+                state.settings_cursor = (selected_idx + 1).min(filtered.len() - 1);
             }
-            refresh_dependency_status(state);
         }
-        KeyCode::Char('u') | KeyCode::Char('U') => {
+        KeyCode::Up => {
+            state.settings_cursor = selected_idx.saturating_sub(1);
+        }
+        KeyCode::Char('n') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            if !filtered.is_empty() {
+                state.settings_cursor = (selected_idx + 1).min(filtered.len() - 1);
+            }
+        }
+        KeyCode::Char('p') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            state.settings_cursor = selected_idx.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            if let Some(item) = filtered.get(selected_idx).cloned() {
+                execute_hub_action(&item, cfg, state, 1, tx).await;
+            }
+        }
+        KeyCode::Left => {
+            if let Some(item) = filtered.get(selected_idx).cloned() {
+                execute_hub_action(&item, cfg, state, -1, tx).await;
+            }
+        }
+        KeyCode::Right => {
+            if let Some(item) = filtered.get(selected_idx).cloned() {
+                execute_hub_action(&item, cfg, state, 1, tx).await;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if state.settings_query.is_empty() {
+                if let Some(item) = filtered.get(selected_idx).cloned() {
+                    execute_hub_action(&item, cfg, state, 1, tx).await;
+                }
+            } else {
+                state.settings_query.push(' ');
+                state.settings_cursor = 0;
+            }
+        }
+        KeyCode::Char(c) => {
+            state.settings_query.push(c);
+            state.settings_cursor = 0;
+        }
+        _ => {}
+    }
+}
+
+async fn execute_hub_action(
+    item: &ui::settings::HubItem,
+    cfg: &mut config::Config,
+    state: &mut AppState,
+    delta: i32,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    use ui::settings::HubActionId::*;
+    use services::substyler::{SubtitlePreset, SubtitleStyleConfig};
+
+    match item.id {
+        SubPreset => {
+            let presets = [
+                SubtitlePreset::StudioMinimal,
+                SubtitlePreset::NetflixClean,
+                SubtitlePreset::AnimeFansub,
+                SubtitlePreset::OledPlate,
+            ];
+            let cur = presets.iter().position(|p| p == &cfg.subtitle_style.preset).unwrap_or(0) as i32;
+            let next = (cur + delta).rem_euclid(presets.len() as i32) as usize;
+            cfg.subtitle_style = SubtitleStyleConfig::from_preset(presets[next]);
+            let _ = cfg.save();
+            state.show_toast(format!("❖ Subtitle Preset: {}", presets[next].label()), unix_now());
+        }
+        SubCollisionGuard => {
+            cfg.subtitle_style.collision_avoidance = !cfg.subtitle_style.collision_avoidance;
+            let _ = cfg.save();
+            let msg = if cfg.subtitle_style.collision_avoidance {
+                "◈ Signage Collision Guard: Enabled"
+            } else {
+                "◈ Signage Collision Guard: Disabled"
+            };
+            state.show_toast(msg, unix_now());
+        }
+        CastScan => {
+            state.overlay_base = state.current_base_screen();
+            state.screen = Screen::CastModal;
+            state.is_scanning_cast = true;
+            let devs = services::cast::scan_network(500).await;
+            state.cast_devices = devs;
+            state.is_scanning_cast = false;
+        }
+        RemoteQrModal => {
+            state.overlay_base = state.current_base_screen();
+            if state.remote_qr.is_none() {
+                state.remote_qr = services::remote::generate_terminal_qr(&state.remote_url);
+            }
+            state.screen = Screen::RemoteModal;
+        }
+        RemoteOpenBrowser => {
+            let url = state.remote_url.clone();
+            #[cfg(target_os = "macos")]
+            let _ = std::process::Command::new("open").arg(&url).spawn();
+            #[cfg(target_os = "linux")]
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            state.show_toast(format!("Opened {}", url), unix_now());
+        }
+        RemoteToggleServer => {
+            cfg.remote.enabled = !cfg.remote.enabled;
+            let _ = cfg.save();
+            let msg = if cfg.remote.enabled {
+                "● Mobile LAN Remote: Enabled (Port 8484)"
+            } else {
+                "● Mobile LAN Remote: Disabled"
+            };
+            state.show_toast(msg, unix_now());
+        }
+        Anime4kMode => {
+            let modes = [
+                config::Anime4KMode::Off,
+                config::Anime4KMode::Balanced,
+                config::Anime4KMode::Ultra,
+            ];
+            let cur = modes.iter().position(|m| m == &cfg.anime4k_mode).unwrap_or(0) as i32;
+            let next = (cur + delta).rem_euclid(modes.len() as i32) as usize;
+            cfg.anime4k_mode = modes[next];
+            state.anime4k_mode = modes[next];
+            let _ = cfg.save();
+            state.show_toast(format!("❖ Anime4K: {}", modes[next].as_str()), unix_now());
+        }
+        AmbilightGlow => {
+            cfg.ambilight_enabled = !cfg.ambilight_enabled;
+            state.ambilight_enabled = cfg.ambilight_enabled;
+            let _ = cfg.save();
+            let msg = if cfg.ambilight_enabled {
+                "❖ Ambilight: Enabled"
+            } else {
+                "❖ Ambilight: Disabled"
+            };
+            state.show_toast(msg, unix_now());
+        }
+        AutoSkipIntro => {
+            cfg.auto_skip_intro = !cfg.auto_skip_intro;
+            let _ = cfg.save();
+            let msg = if cfg.auto_skip_intro {
+                "󰄬 Auto-Skip Intro: Enabled"
+            } else {
+                "󰄬 Auto-Skip Intro: Disabled"
+            };
+            state.show_toast(msg, unix_now());
+        }
+        CheckUpdates => {
             if let Some(ref info) = state.available_update.clone() {
                 if info.is_homebrew {
                     state.show_toast("Installed via Homebrew: run 'brew upgrade solus'", unix_now());
@@ -1987,7 +2186,40 @@ async fn handle_settings(
                 });
             }
         }
-        _ => {}
+        AutoUpdateMode => {
+            let next = if !cfg.update.check_on_startup {
+                0
+            } else if cfg.update.auto_install {
+                2
+            } else {
+                1
+            };
+            match next {
+                0 => {
+                    cfg.update.check_on_startup = true;
+                    cfg.update.auto_install = false;
+                    state.show_toast("❖ Auto-Update: Check Only", unix_now());
+                }
+                1 => {
+                    cfg.update.check_on_startup = true;
+                    cfg.update.auto_install = true;
+                    state.show_toast("❖ Auto-Update: Auto-Install", unix_now());
+                }
+                _ => {
+                    cfg.update.check_on_startup = false;
+                    cfg.update.auto_install = false;
+                    state.show_toast("❖ Auto-Update: Off", unix_now());
+                }
+            }
+            let _ = cfg.save();
+        }
+        HealthDoctor => {
+            refresh_dependency_status(state);
+            state.open_setup();
+        }
+        AniListSync => {
+            state.open_login();
+        }
     }
 }
 
@@ -2191,87 +2423,6 @@ async fn handle_login(
     }
 }
 
-fn apply_settings_delta(
-    cfg: &mut config::Config,
-    row: usize,
-    delta: i32,
-) -> anyhow::Result<()> {
-    match row {
-        0 => {
-            let values = [config::Player::Mpv, config::Player::Iina, config::Player::Vlc];
-            let current = values.iter().position(|value| value == &cfg.player).unwrap_or(0) as i32;
-            let next = (current + delta).rem_euclid(values.len() as i32) as usize;
-            cfg.player = values[next].clone();
-        }
-        1 => {
-            let values = [
-                config::Quality::Best,
-                config::Quality::P1080,
-                config::Quality::P720,
-                config::Quality::P480,
-                config::Quality::P360,
-            ];
-            let current = values.iter().position(|value| value == &cfg.quality).unwrap_or(1) as i32;
-            let next = (current + delta).rem_euclid(values.len() as i32) as usize;
-            cfg.quality = values[next].clone();
-        }
-        2 => {
-            cfg.audio_mode = match cfg.audio_mode {
-                config::AudioMode::Sub => config::AudioMode::Dub,
-                config::AudioMode::Dub => config::AudioMode::Sub,
-            };
-        }
-        3 => {
-            let values = ui::settings::SUBTITLE_CHOICES;
-            let current = values.iter().position(|&val| val.eq_ignore_ascii_case(&cfg.default_sub_lang)).unwrap_or(0) as i32;
-            let next = (current + delta).rem_euclid(values.len() as i32) as usize;
-            cfg.default_sub_lang = values[next].to_string();
-        }
-        4 => {
-            cfg.auto_skip_intro = !cfg.auto_skip_intro;
-        }
-        5 => {
-            let values = [
-                config::Anime4KMode::Off,
-                config::Anime4KMode::Balanced,
-                config::Anime4KMode::Ultra,
-            ];
-            let current = values.iter().position(|v| v == &cfg.anime4k_mode).unwrap_or(0) as i32;
-            let next = (current + delta).rem_euclid(values.len() as i32) as usize;
-            cfg.anime4k_mode = values[next];
-        }
-        6 => {
-            cfg.ambilight_enabled = !cfg.ambilight_enabled;
-        }
-        7 => {
-            let current = if !cfg.update.check_on_startup {
-                2
-            } else if cfg.update.auto_install {
-                1
-            } else {
-                0
-            };
-            let next = (current + delta).rem_euclid(3);
-            match next {
-                0 => {
-                    cfg.update.check_on_startup = true;
-                    cfg.update.auto_install = false;
-                }
-                1 => {
-                    cfg.update.check_on_startup = true;
-                    cfg.update.auto_install = true;
-                }
-                _ => {
-                    cfg.update.check_on_startup = false;
-                    cfg.update.auto_install = false;
-                }
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 // ── Anime Wrapped & Analytics screen ──────────────────────────────────────────
 
 async fn handle_analytics(
@@ -2287,6 +2438,113 @@ async fn handle_analytics(
         KeyCode::Char('r') | KeyCode::Char('R') => {
             state.show_toast("Refreshing viewing telemetry...", unix_now());
             trigger_analytics_fetch(state, pool.clone(), tx.clone());
+        }
+        _ => {}
+    }
+}
+
+async fn handle_remote_modal(
+    key: event::KeyEvent,
+    state: &mut AppState,
+) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('m') | KeyCode::Char('M') => {
+            state.go_back();
+        }
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            let url = state.remote_url.clone();
+            #[cfg(target_os = "macos")]
+            let _ = std::process::Command::new("open").arg(&url).spawn();
+            #[cfg(target_os = "linux")]
+            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            state.show_toast(format!("Opened {}", url), unix_now());
+        }
+        KeyCode::Char(' ') => {
+            services::remote::send_mpv_command("/tmp/solus-mpv.sock", &["cycle", "pause"]).await;
+        }
+        _ => {}
+    }
+}
+
+async fn handle_cast_modal(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    _tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Char('C') => {
+            state.go_back();
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if !state.cast_devices.is_empty() {
+                state.cast_selected_idx = (state.cast_selected_idx + 1).min(state.cast_devices.len() - 1);
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.cast_selected_idx = state.cast_selected_idx.saturating_sub(1);
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            state.is_scanning_cast = true;
+            let devs = services::cast::scan_network(500).await;
+            state.cast_devices = devs;
+            state.is_scanning_cast = false;
+        }
+        KeyCode::Enter => {
+            if let Some(dev) = state.cast_devices.get(state.cast_selected_idx).cloned() {
+                state.active_cast_device = Some(dev.clone());
+                state.is_casting = true;
+                state.screen = Screen::CastDeck;
+                state.show_toast(format!("Casting to {}...", dev.name), unix_now());
+
+                let ep = state.selected_episode.unwrap_or(1);
+                let start_pos = state.anime_progress.get(&ep).map(|(p, _)| *p).unwrap_or(0.0);
+                if let Some(ref anime) = state.selected_anime {
+                    let anime_id = anime.id;
+                    let title = anime.playback_query();
+                    tokio::spawn(async move {
+                        let stream_info = api::subtitles::fetch_stream_info(anime_id, &title, ep, false).await;
+                        let target_url = stream_info.qualities.first().map(|q| q.url.clone())
+                            .or(stream_info.master_url);
+                        if let Some(url) = target_url {
+                            let _ = services::cast::start_casting(&dev, &url, start_pos).await;
+                        }
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn handle_cast_deck(
+    key: event::KeyEvent,
+    state: &mut AppState,
+) {
+    let Some(ref dev) = state.active_cast_device.clone() else {
+        state.screen = Screen::Detail;
+        return;
+    };
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Char('C') => {
+            let _ = services::cast::send_tv_command(dev, services::cast::TvAction::Stop).await;
+            state.is_casting = false;
+            state.active_cast_device = None;
+            state.screen = Screen::Detail;
+            state.show_toast("TV Casting stopped", unix_now());
+        }
+        KeyCode::Char(' ') => {
+            let _ = services::cast::send_tv_command(dev, services::cast::TvAction::TogglePause(true)).await;
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            let new_pos = (state.cast_playback_pos - 10.0).max(0.0);
+            state.cast_playback_pos = new_pos;
+            let _ = services::cast::send_tv_command(dev, services::cast::TvAction::Seek(new_pos)).await;
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            let new_pos = state.cast_playback_pos + 10.0;
+            state.cast_playback_pos = new_pos;
+            let _ = services::cast::send_tv_command(dev, services::cast::TvAction::Seek(new_pos)).await;
         }
         _ => {}
     }

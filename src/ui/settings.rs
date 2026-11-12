@@ -1,247 +1,598 @@
-//! Settings overlay — persistent global preferences.
+//! Split-Deck Fuzzy Feature Command Hub & Settings Palette.
+//! Replaces the static preferences form with an omni-searchable control center
+//! allowing users to discover, configure, and launch features without cryptic keybinds.
 
+use crate::config;
+use crate::services::substyler::SubtitlePreset;
+use crate::state::AppState;
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
-use crate::{config, state::AppState};
+/// Identifiers for every dispatchable feature and preference in Solus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubActionId {
+    SubPreset,
+    SubCollisionGuard,
+    CastScan,
+    RemoteQrModal,
+    RemoteOpenBrowser,
+    RemoteToggleServer,
+    Anime4kMode,
+    AmbilightGlow,
+    AutoSkipIntro,
+    CheckUpdates,
+    AutoUpdateMode,
+    HealthDoctor,
+    AniListSync,
+}
 
-const PLAYER_CHOICES: [&str; 3] = ["mpv", "iina", "vlc"];
-const QUALITY_CHOICES: [&str; 5] = ["best", "1080p", "720p", "480p", "360p"];
-const AUDIO_CHOICES: [&str; 2] = ["sub", "dub"];
-const SKIP_CHOICES: [&str; 2] = ["enabled", "disabled"];
-const ANIME4K_CHOICES: [&str; 3] = ["off", "balanced 2x", "ultra 4k"];
-const AMBILIGHT_CHOICES: [&str; 2] = ["enabled", "disabled"];
-const UPDATE_CHOICES: [&str; 3] = ["check only", "auto-install", "off"];
-pub const SUBTITLE_CHOICES: [&str; 11] = [
-    "English",
-    "Arabic",
-    "Russian",
-    "Indonesian",
-    "Spanish",
-    "French",
-    "German",
-    "Italian",
-    "Portuguese",
-    "Japanese",
-    "Turkish",
-];
+/// The interaction type of each hub action.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum HubActionKind {
+    Cycle { options: Vec<&'static str>, current: usize },
+    Toggle(bool),
+    Launch(&'static str),
+    Execute(&'static str),
+}
 
-pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config) {
-    let area = centered_rect(68, 86, frame.area());
-    frame.render_widget(Clear, area);
+/// A searchable feature action entry in the command hub.
+#[derive(Debug, Clone)]
+pub struct HubItem {
+    pub id: HubActionId,
+    pub category: &'static str,
+    pub label: &'static str,
+    pub keywords: &'static str,
+    pub badge: String,
+    pub description: &'static str,
+    pub kind: HubActionKind,
+}
 
-    let block = Block::default()
-        .title(Span::styled(
-            " Settings ",
-            Style::default()
-                .fg(Color::Rgb(180, 0, 255))
-                .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Rgb(180, 0, 255)));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2), // 0: Header
-            Constraint::Length(3), // 1: Player
-            Constraint::Length(3), // 2: Quality
-            Constraint::Length(3), // 3: Audio
-            Constraint::Length(3), // 4: Subtitle
-            Constraint::Length(3), // 5: Auto-Skip
-            Constraint::Length(3), // 6: Anime4K
-            Constraint::Length(3), // 7: Ambilight
-            Constraint::Length(3), // 8: Auto-Update
-            Constraint::Min(0),    // 9: Footer
-        ])
-        .split(inner);
-
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                "Persisted defaults for every new playback session",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "Use j/k to focus a row, h/l to change it, u to check updates, Esc to close.",
-                Style::default().fg(Color::Rgb(150, 150, 170)),
-            )),
-        ]),
-        rows[0],
-    );
-
-    render_setting_row(rows[1], "Player", &PLAYER_CHOICES, player_index(&cfg.player), state.settings_cursor == 0, frame);
-    render_setting_row(rows[2], "Quality", &QUALITY_CHOICES, quality_index(&cfg.quality), state.settings_cursor == 1, frame);
-    render_setting_row(rows[3], "Audio", &AUDIO_CHOICES, audio_index(&cfg.audio_mode), state.settings_cursor == 2, frame);
-    render_setting_row(rows[4], "Subtitle", &SUBTITLE_CHOICES, sub_index(&cfg.default_sub_lang), state.settings_cursor == 3, frame);
-    render_setting_row(rows[5], "Auto-Skip", &SKIP_CHOICES, if cfg.auto_skip_intro { 0 } else { 1 }, state.settings_cursor == 4, frame);
-    render_setting_row(rows[6], "Anime4K", &ANIME4K_CHOICES, anime4k_index(&cfg.anime4k_mode), state.settings_cursor == 5, frame);
-    render_setting_row(rows[7], "Ambilight", &AMBILIGHT_CHOICES, if cfg.ambilight_enabled { 0 } else { 1 }, state.settings_cursor == 6, frame);
-    render_setting_row(rows[8], "Auto-Update", &UPDATE_CHOICES, update_index(&cfg.update), state.settings_cursor == 7, frame);
-
-    let preferred_ready = match cfg.player {
-        config::Player::Mpv => state.has_mpv || state.has_iina,
-        config::Player::Iina => state.has_iina,
-        config::Player::Vlc => state.has_vlc,
+/// Assembles the complete catalog of feature actions from current runtime state.
+pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
+    let sub_preset_idx = match cfg.subtitle_style.preset {
+        SubtitlePreset::StudioMinimal => 0,
+        SubtitlePreset::NetflixClean  => 1,
+        SubtitlePreset::AnimeFansub   => 2,
+        SubtitlePreset::OledPlate     => 3,
+        SubtitlePreset::Custom        => 0,
     };
 
-    let update_line = if state.is_checking_update {
-        Line::from(Span::styled("󰑮 Checking GitHub for latest Solus updates...", Style::default().fg(Color::Rgb(125, 207, 255))))
-    } else if state.is_updating {
-        let (pct, ref spd) = state.update_progress.as_ref().cloned().unwrap_or((0.0, String::new()));
-        Line::from(Span::styled(format!("󰚰 Downloading update: {:.0}% ({})", pct, spd), Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)))
-    } else if let Some(ref info) = state.available_update {
-        Line::from(vec![
-            Span::styled("❖ Update available: ", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
-            Span::styled(&info.latest_version, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled(if info.is_homebrew { " (brew upgrade solus)" } else { " · Press [u] or [U] to install now." }, Style::default().fg(Color::Rgb(180, 0, 255))),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(format!("Solus v{} · ", env!("CARGO_PKG_VERSION")), Style::default().fg(Color::Rgb(130, 140, 160))),
-            Span::styled("Press [u] to check for updates", Style::default().fg(Color::Rgb(180, 0, 255))),
-        ])
-    };
-
-    let footer = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(
-                " Status ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(if preferred_ready {
-                        Color::Rgb(235, 235, 235)
-                    } else {
-                        Color::Rgb(255, 190, 0)
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                if preferred_ready {
-                    "Ready for playback"
-                } else {
-                    "Current player missing, fallback may be used"
-                },
-                Style::default().fg(Color::Rgb(195, 195, 210)),
-            ),
-        ]),
-        Line::from(""),
-        update_line,
-        Line::from(""),
-        Line::from(Span::styled(
-            "Changes save immediately to config.toml",
-            Style::default().fg(Color::Rgb(120, 120, 140)),
-        )),
-    ]);
-    frame.render_widget(footer, rows[9]);
-}
-
-fn render_setting_row(
-    area: Rect,
-    label: &str,
-    values: &[&str],
-    selected: usize,
-    focused: bool,
-    frame: &mut Frame,
-) {
-    let row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(12), Constraint::Min(0)])
-        .split(area);
-
-    let label_style = if focused {
-        Style::default()
-            .fg(Color::Rgb(180, 0, 255))
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Rgb(170, 170, 185))
-    };
-    frame.render_widget(
-        Paragraph::new(Span::styled(format!("{label}:"), label_style)),
-        row[0],
-    );
-
-    let mut spans = Vec::new();
-    for (idx, value) in values.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::raw("  "));
-        }
-        let active = idx == selected;
-        spans.push(Span::styled(
-            format!(" {} ", value),
-            Style::default()
-                .fg(if active { Color::Black } else { Color::Rgb(220, 220, 230) })
-                .bg(if active {
-                    if focused { Color::Rgb(180, 0, 255) } else { Color::Rgb(235, 235, 235) }
-                } else {
-                    Color::Reset
-                })
-                .add_modifier(if active { Modifier::BOLD } else { Modifier::empty() }),
-        ));
-    }
-
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)),
-        row[1],
-    );
-}
-
-fn player_index(player: &config::Player) -> usize {
-    match player {
-        config::Player::Mpv => 0,
-        config::Player::Iina => 1,
-        config::Player::Vlc => 2,
-    }
-}
-
-fn quality_index(quality: &config::Quality) -> usize {
-    match quality {
-        config::Quality::Best => 0,
-        config::Quality::P1080 => 1,
-        config::Quality::P720 => 2,
-        config::Quality::P480 => 3,
-        config::Quality::P360 => 4,
-    }
-}
-
-fn audio_index(audio: &config::AudioMode) -> usize {
-    match audio {
-        config::AudioMode::Sub => 0,
-        config::AudioMode::Dub => 1,
-    }
-}
-
-fn anime4k_index(mode: &config::Anime4KMode) -> usize {
-    match mode {
+    let anime4k_idx = match cfg.anime4k_mode {
         config::Anime4KMode::Off => 0,
         config::Anime4KMode::Balanced => 1,
         config::Anime4KMode::Ultra => 2,
-    }
-}
+    };
 
-fn sub_index(lang: &str) -> usize {
-    SUBTITLE_CHOICES
-        .iter()
-        .position(|&l| l.eq_ignore_ascii_case(lang))
-        .unwrap_or(0)
-}
-
-fn update_index(update: &config::UpdateConfig) -> usize {
-    if !update.check_on_startup {
+    let update_idx = if !cfg.update.check_on_startup {
         2
-    } else if update.auto_install {
+    } else if cfg.update.auto_install {
         1
     } else {
         0
+    };
+
+    vec![
+        // ── ❖ CINEMATIC SUBTITLES ──────────────────────────────────────────
+        HubItem {
+            id: HubActionId::SubPreset,
+            category: "❖ CINEMATIC SUBTITLES",
+            label: "Subtitle Typography Preset",
+            keywords: "sub subtitle font styling preset appearance libass text minimal netflix fansub oled",
+            badge: format!("[ {} ▾ ]", cfg.subtitle_style.preset.label()),
+            description: "High-legibility typography presets with custom stroke outlines, drop shadows, and opacity plates.",
+            kind: HubActionKind::Cycle {
+                options: vec!["Studio Minimal", "Netflix Clean", "Anime Fansub", "OLED Plate"],
+                current: sub_preset_idx,
+            },
+        },
+        HubItem {
+            id: HubActionId::SubCollisionGuard,
+            category: "❖ CINEMATIC SUBTITLES",
+            label: "Signage Collision Guard",
+            keywords: "collision signage signs overlap lift avoid text bottom japanese",
+            badge: if cfg.subtitle_style.collision_avoidance { "[󰄬] Enabled".to_string() } else { "[ ] Disabled".to_string() },
+            description: "Auto-detects bottom-screen Japanese signage translations and shifts dialogue upward to eliminate overlapping text.",
+            kind: HubActionKind::Toggle(cfg.subtitle_style.collision_avoidance),
+        },
+
+        // ── ❖ TELEVISION & MOBILE REMOTE ───────────────────────────────────
+        HubItem {
+            id: HubActionId::CastScan,
+            category: "❖ TELEVISION & MOBILE REMOTE",
+            label: "Scan & Beam to TV (AirPlay / DLNA)",
+            keywords: "cast tv television airplay dlna upnp apple stream living room screen monitor",
+            badge: "Direct Play 󰄬".to_string(),
+            description: "Scans local Wi-Fi for Apple TV, LG webOS, Samsung Tizen, and Sony TVs to cast pristine 1080p/4K streams directly.",
+            kind: HubActionKind::Launch("CastModal"),
+        },
+        HubItem {
+            id: HubActionId::RemoteQrModal,
+            category: "❖ TELEVISION & MOBILE REMOTE",
+            label: "Launch Mobile Remote QR Modal",
+            keywords: "remote phone qr mobile companion touch web wifi lan couch bed",
+            badge: "QR Code ◈".to_string(),
+            description: "Displays a scannable ASCII QR code to control playback, volume, and episode switching from your smartphone.",
+            kind: HubActionKind::Launch("RemoteModal"),
+        },
+        HubItem {
+            id: HubActionId::RemoteOpenBrowser,
+            category: "❖ TELEVISION & MOBILE REMOTE",
+            label: "Open Touch Remote in Browser",
+            keywords: "browser web remote open http link localhost chrome safari",
+            badge: format!("http://{}:8484", crate::services::remote::get_local_ip()),
+            description: "Opens the zero-dependency OLED touch client in your local web browser.",
+            kind: HubActionKind::Execute("OpenBrowser"),
+        },
+        HubItem {
+            id: HubActionId::RemoteToggleServer,
+            category: "❖ TELEVISION & MOBILE REMOTE",
+            label: "Mobile LAN Remote Server",
+            keywords: "server daemon listener port 8484 background mobile",
+            badge: if cfg.remote.enabled { "[󰄬] Active (8484)".to_string() } else { "[ ] Disabled".to_string() },
+            description: "Toggles the background lightweight Tokio HTTP server on local port 8484.",
+            kind: HubActionKind::Toggle(cfg.remote.enabled),
+        },
+
+        // ── ❖ VISUAL & PLAYBACK ENGINE ─────────────────────────────────────
+        HubItem {
+            id: HubActionId::Anime4kMode,
+            category: "❖ VISUAL & PLAYBACK ENGINE",
+            label: "Real-Time Anime4K Upscaler",
+            keywords: "anime4k gpu shader upscale 4k 2x balanced ultra compute glsl mpv",
+            badge: format!("[ {} ▾ ]", cfg.anime4k_mode.as_str()),
+            description: "Direct OS GPU GLSL shaders reconstructing line-art and upscaling compressed streams to 4K in real time.",
+            kind: HubActionKind::Cycle {
+                options: vec!["off", "balanced 2x", "ultra 4k"],
+                current: anime4k_idx,
+            },
+        },
+        HubItem {
+            id: HubActionId::AmbilightGlow,
+            category: "❖ VISUAL & PLAYBACK ENGINE",
+            label: "Cover-Adaptive Ambilight Glow",
+            keywords: "ambilight color theme palette border glow dynamic dynamicimage hsl",
+            badge: if cfg.ambilight_enabled { "[󰄬] Enabled".to_string() } else { "[ ] Disabled".to_string() },
+            description: "Samples RGB color histograms from anime cover posters to dynamically tint Solus terminal borders per show.",
+            kind: HubActionKind::Toggle(cfg.ambilight_enabled),
+        },
+        HubItem {
+            id: HubActionId::AutoSkipIntro,
+            category: "❖ VISUAL & PLAYBACK ENGINE",
+            label: "Auto-Skip OP/ED (AniSkip)",
+            keywords: "aniskip skip intro outro opening ending theme automated",
+            badge: if cfg.auto_skip_intro { "[󰄬] Enabled".to_string() } else { "[ ] Disabled".to_string() },
+            description: "Queries public AniSkip API timestamps to seamlessly jump over opening and ending musical sequences.",
+            kind: HubActionKind::Toggle(cfg.auto_skip_intro),
+        },
+
+        // ── ❖ SYSTEM & MAINTENANCE ─────────────────────────────────────────
+        HubItem {
+            id: HubActionId::CheckUpdates,
+            category: "❖ SYSTEM & MAINTENANCE",
+            label: "Check for Solus Updates",
+            keywords: "update github release check version download upgrade",
+            badge: if state.is_checking_update {
+                "Checking... 󰑋".to_string()
+            } else if let Some(ref u) = state.available_update {
+                format!("New: {} 󰄬", u.latest_version)
+            } else {
+                format!("v{} (Latest)", env!("CARGO_PKG_VERSION"))
+            },
+            description: "Polls GitHub Releases for the latest binary and atomically replaces the executable in place.",
+            kind: HubActionKind::Execute("CheckUpdate"),
+        },
+        HubItem {
+            id: HubActionId::AutoUpdateMode,
+            category: "❖ SYSTEM & MAINTENANCE",
+            label: "Auto-Update Channel",
+            keywords: "auto update startup channel install check background",
+            badge: match update_idx {
+                0 => "[ Check Only ▾ ]".to_string(),
+                1 => "[ Auto-Install ▾ ]".to_string(),
+                _ => "[ Off ▾ ]".to_string(),
+            },
+            description: "Configures whether Solus checks for updates on startup or installs new releases automatically.",
+            kind: HubActionKind::Cycle {
+                options: vec!["check only", "auto-install", "off"],
+                current: update_idx,
+            },
+        },
+        HubItem {
+            id: HubActionId::HealthDoctor,
+            category: "❖ SYSTEM & MAINTENANCE",
+            label: "Dependency Health Doctor (!)",
+            keywords: "doctor dependencies setup ani-cli mpv iina vlc check health",
+            badge: if state.has_ani_cli && state.has_any_player() { "Healthy 󰄬".to_string() } else { "Action Needed ⚠".to_string() },
+            description: "Validates terminal prerequisites including ani-cli, mpv, ffmpeg, and graphical protocol drivers.",
+            kind: HubActionKind::Launch("Setup"),
+        },
+        HubItem {
+            id: HubActionId::AniListSync,
+            category: "❖ SYSTEM & MAINTENANCE",
+            label: "AniList Library Sync & Login (L)",
+            keywords: "anilist sync token account auth login backup import export",
+            badge: if state.auth.token.is_some() { "Connected 󰄬".to_string() } else { "Logged Out".to_string() },
+            description: "Synchronizes Watching, Completed, and Planning lists with AniList and manages offline JSON backups.",
+            kind: HubActionKind::Launch("AniListLogin"),
+        },
+    ]
+}
+
+/// Returns items matching the active fuzzy search query, sorted by score.
+pub fn get_filtered_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
+    let items = get_hub_items(cfg, state);
+    let query = state.settings_query.trim();
+
+    if query.is_empty() {
+        return items;
     }
+
+    let matcher = SkimMatcherV2::default();
+    let mut scored: Vec<(i64, HubItem)> = items
+        .into_iter()
+        .filter_map(|item| {
+            let corpus = format!("{} {} {}", item.category, item.label, item.keywords);
+            matcher.fuzzy_match(&corpus, query).map(|score| (score, item))
+        })
+        .collect();
+
+    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+    scored.into_iter().map(|(_, item)| item).collect()
+}
+
+/// Renders the Split-Deck Fuzzy Feature Command Hub.
+pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config) {
+    let area = centered_rect(84, 88, frame.area());
+    frame.render_widget(Clear, area);
+
+    let theme = state.theme();
+
+    let block = Block::default()
+        .title(Span::styled(
+            " ❖ SOLUS // CONTROL HUB & FEATURE PALETTE ",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.secondary));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let root_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Search Input Bar
+            Constraint::Min(10),   // Split Deck (Actions List + Contextual Inspector)
+            Constraint::Length(2), // Navigation Footer
+        ])
+        .split(inner);
+
+    // ── 1. Search Input Bar ───────────────────────────────────────────────────
+    let query_display = if state.settings_query.is_empty() {
+        Line::from(vec![
+            Span::styled(" 🔍 > ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("Type to filter features & commands (e.g. 'cast', 'remote', 'sub', 'update')...", Style::default().fg(Color::Rgb(120, 125, 145))),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" 🔍 > ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+            Span::styled(&state.settings_query, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("█", Style::default().fg(theme.primary)),
+        ])
+    };
+
+    let search_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if state.settings_query.is_empty() { Color::Rgb(45, 48, 65) } else { theme.primary }));
+
+    let search_inner = search_block.inner(root_chunks[0]);
+    frame.render_widget(search_block, root_chunks[0]);
+    frame.render_widget(Paragraph::new(query_display), search_inner);
+
+    // ── 2. Split Deck Body ────────────────────────────────────────────────────
+    let deck_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(54), // Left: Action List
+            Constraint::Percentage(46), // Right: Contextual Inspector
+        ])
+        .split(root_chunks[1]);
+
+    let filtered = get_filtered_items(cfg, state);
+    let selected_idx = state.settings_cursor.min(filtered.len().saturating_sub(1));
+
+    // Left Pane: Action List
+    let list_block = Block::default()
+        .title(Span::styled(
+            if state.settings_query.is_empty() {
+                " ◈ Categorized Actions "
+            } else {
+                " ◈ Filtered Actions "
+            },
+            Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Rgb(40, 44, 60)));
+
+    let list_inner = list_block.inner(deck_chunks[0]);
+    frame.render_widget(list_block, deck_chunks[0]);
+
+    let mut action_lines = Vec::new();
+    let mut last_category = "";
+
+    if filtered.is_empty() {
+        action_lines.push(Line::from(Span::styled(
+            "    No matching features or commands found.",
+            Style::default().fg(Color::Rgb(140, 140, 160)),
+        )));
+    } else {
+        for (idx, item) in filtered.iter().enumerate() {
+            // Category header (only when not searching for cleaner hierarchy)
+            if state.settings_query.is_empty() && item.category != last_category {
+                if !last_category.is_empty() {
+                    action_lines.push(Line::from(""));
+                }
+                action_lines.push(Line::from(Span::styled(
+                    format!("  ── {} ", item.category),
+                    Style::default().fg(Color::Rgb(110, 115, 135)).add_modifier(Modifier::BOLD),
+                )));
+                last_category = item.category;
+            }
+
+            let is_focused = idx == selected_idx;
+            let (cursor, style, badge_style) = if is_focused {
+                (
+                    " ▶ ",
+                    Style::default().fg(Color::White).bg(Color::Rgb(40, 45, 65)).add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                (
+                    "   ",
+                    Style::default().fg(Color::Rgb(210, 215, 230)),
+                    Style::default().fg(Color::Rgb(140, 145, 165)).bg(Color::Rgb(20, 22, 32)),
+                )
+            };
+
+            let line = Line::from(vec![
+                Span::styled(cursor, style),
+                Span::styled(format!("{:<28} ", item.label), style),
+                Span::styled(format!(" {} ", item.badge), badge_style),
+            ]);
+            action_lines.push(line);
+        }
+    }
+
+    frame.render_widget(Paragraph::new(action_lines), list_inner);
+
+    // Right Pane: Contextual Inspector
+    let inspector_block = Block::default()
+        .title(Span::styled(
+            " ❖ Contextual Feature Inspector ",
+            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary));
+
+    let inspector_inner = inspector_block.inner(deck_chunks[1]);
+    frame.render_widget(inspector_block, deck_chunks[1]);
+
+    if let Some(focused_item) = filtered.get(selected_idx) {
+        render_inspector_card(inspector_inner, frame, focused_item, cfg, state, &theme);
+    }
+
+    // ── 3. Footer Keybind Hints ───────────────────────────────────────────────
+    let footer_p = Paragraph::new(Line::from(vec![
+        Span::styled("[↑/↓] ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled("Select   ", Style::default().fg(Color::Rgb(140, 140, 160))),
+        Span::styled("[Enter] ", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
+        Span::styled("Execute / Cycle   ", Style::default().fg(Color::Rgb(140, 140, 160))),
+        Span::styled("[Backspace] ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("Delete Filter   ", Style::default().fg(Color::Rgb(140, 140, 160))),
+        Span::styled("[Esc] ", Style::default().fg(Color::Rgb(255, 85, 85)).add_modifier(Modifier::BOLD)),
+        Span::styled("Dismiss", Style::default().fg(Color::Rgb(140, 140, 160))),
+    ])).alignment(Alignment::Center);
+
+    frame.render_widget(footer_p, root_chunks[2]);
+}
+
+/// Renders the rich contextual inspection card on the right pane.
+fn render_inspector_card(
+    area: Rect,
+    frame: &mut Frame,
+    item: &HubItem,
+    cfg: &config::Config,
+    state: &AppState,
+    theme: &crate::ui::theme::ThemePalette,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header title + category badge
+            Constraint::Length(3), // Description paragraph
+            Constraint::Min(6),    // Feature-specific preview widget / specs
+            Constraint::Length(2), // Action trigger instruction
+        ])
+        .split(area);
+
+    // 1. Header
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled(format!(" {} ", item.category), Style::default().fg(Color::Black).bg(theme.secondary).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("❖ {}", item.label), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(header_lines), chunks[0]);
+
+    // 2. Description
+    frame.render_widget(
+        Paragraph::new(item.description)
+            .style(Style::default().fg(Color::Rgb(180, 185, 205)))
+            .wrap(ratatui::widgets::Wrap { trim: true }),
+        chunks[1],
+    );
+
+    // 3. Feature-Specific Rich Content
+    match item.id {
+        HubActionId::SubPreset | HubActionId::SubCollisionGuard => {
+            let preview_lines = vec![
+                Line::from(vec![
+                    Span::styled("  Font Family: ", Style::default().fg(theme.accent)),
+                    Span::styled(&cfg.subtitle_style.font_family, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  •  Size: {}pt  •  Border: {:.1}px", cfg.subtitle_style.font_size, cfg.subtitle_style.border_size), Style::default().fg(Color::Rgb(140, 140, 160))),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled("  ┌─ Live In-Terminal Typography Preview ──────────────┐", Style::default().fg(Color::Rgb(70, 75, 100)))),
+                Line::from(Span::styled("  │                                                    │", Style::default().fg(Color::Rgb(70, 75, 100)))),
+                Line::from(Span::styled("  │  \"I am the one who knocks...                       │", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled("  │   and the truth cannot be erased.\"                 │", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                Line::from(Span::styled("  │                                                    │", Style::default().fg(Color::Rgb(70, 75, 100)))),
+                Line::from(Span::styled("  └────────────────────────────────────────────────────┘", Style::default().fg(Color::Rgb(70, 75, 100)))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  ◈ Signage Guard: ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        if cfg.subtitle_style.collision_avoidance {
+                            "Active (Detects bottom signs & shifts text {\\an8})"
+                        } else {
+                            "Inactive (Overlapping signs possible)"
+                        },
+                        Style::default().fg(Color::Rgb(170, 175, 195)),
+                    ),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(preview_lines), chunks[2]);
+        }
+        HubActionId::CastScan => {
+            let cast_lines = vec![
+                Line::from(vec![
+                    Span::styled("  Protocols: ", Style::default().fg(theme.accent)),
+                    Span::styled("AirPlay 2  •  DLNA / UPnP AVTransport", Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Transmission: ", Style::default().fg(theme.accent)),
+                    Span::styled("Direct HLS Passthrough (Hardware Decoded on TV)", Style::default().fg(Color::Rgb(80, 250, 123))),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Device Targets: ", Style::default().fg(theme.accent)),
+                    Span::styled("Apple TV 4K, LG webOS, Samsung Tizen, Sony Bravia", Style::default().fg(Color::Rgb(180, 185, 205))),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  ◈ Action: ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                    Span::styled("Pressing [Enter] immediately broadcasts SSDP and AirPlay probes to discover screens.", Style::default().fg(Color::Rgb(200, 205, 220))),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(cast_lines), chunks[2]);
+        }
+        HubActionId::RemoteQrModal | HubActionId::RemoteOpenBrowser | HubActionId::RemoteToggleServer => {
+            let remote_lines = vec![
+                Line::from(vec![
+                    Span::styled("  Network URL: ", Style::default().fg(theme.accent)),
+                    Span::styled(format!("http://{}:8484", crate::services::remote::get_local_ip()), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Listener Status: ", Style::default().fg(theme.accent)),
+                    Span::styled("● Active Wi-Fi Companion Daemon", Style::default().fg(Color::Rgb(80, 250, 123))),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Touch Controls: ", Style::default().fg(theme.accent)),
+                    Span::styled("Live scrub slider, ±10s seek, Sub/Dub, Volume", Style::default().fg(Color::Rgb(180, 185, 205))),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  ◈ Instant Pairing: ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                    Span::styled("Press [Enter] to display the high-contrast ASCII QR code.", Style::default().fg(Color::Rgb(200, 205, 220))),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(remote_lines), chunks[2]);
+        }
+        HubActionId::Anime4kMode => {
+            let a4k_lines = vec![
+                Line::from(vec![
+                    Span::styled("  Current Shader: ", Style::default().fg(theme.accent)),
+                    Span::styled(cfg.anime4k_mode.as_str(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  GPU Pipeline: ", Style::default().fg(theme.accent)),
+                    Span::styled("Direct Metal / Vulkan GLSL compute shader injection", Style::default().fg(Color::Rgb(180, 185, 205))),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Effect: ", Style::default().fg(theme.accent)),
+                    Span::styled("Restores fine lines, eliminates compression artifacts, 4K upscale.", Style::default().fg(Color::Rgb(80, 250, 123))),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(a4k_lines), chunks[2]);
+        }
+        HubActionId::CheckUpdates | HubActionId::AutoUpdateMode => {
+            let update_lines = vec![
+                Line::from(vec![
+                    Span::styled("  Installed Version: ", Style::default().fg(theme.accent)),
+                    Span::styled(format!("Solus v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Channel: ", Style::default().fg(theme.accent)),
+                    Span::styled("GitHub Official Releases (Universal Multi-Arch)", Style::default().fg(Color::Rgb(180, 185, 205))),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Live Status: ", Style::default().fg(theme.accent)),
+                    Span::styled(
+                        if let Some(ref u) = state.available_update {
+                            format!("Update {} ready to install", u.latest_version)
+                        } else {
+                            "Up to date".to_string()
+                        },
+                        Style::default().fg(Color::Rgb(80, 250, 123)),
+                    ),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(update_lines), chunks[2]);
+        }
+        _ => {
+            let generic_lines = vec![
+                Line::from(vec![
+                    Span::styled("  Persistence: ", Style::default().fg(theme.accent)),
+                    Span::styled("Automatically saved to ~/.config/solus/config.toml", Style::default().fg(Color::Rgb(140, 140, 160))),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  ◈ Control: ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                    Span::styled("Press [Enter] to toggle or execute this action immediately.", Style::default().fg(Color::Rgb(200, 205, 220))),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(generic_lines), chunks[2]);
+        }
+    }
+
+    // 4. Action Trigger Hint
+    let trigger_text = match item.kind {
+        HubActionKind::Cycle { .. } => "[Enter] Cycle Forward   [h/l] Cycle Option",
+        HubActionKind::Toggle(_) => "[Enter / Space] Toggle Value",
+        HubActionKind::Launch(_) => "[Enter] Launch Screen Immediately",
+        HubActionKind::Execute(_) => "[Enter] Execute Action Now",
+    };
+
+    let trigger_p = Paragraph::new(Line::from(vec![
+        Span::styled(trigger_text, Style::default().fg(Color::Black).bg(Color::Rgb(240, 240, 245)).add_modifier(Modifier::BOLD)),
+    ])).alignment(Alignment::Right);
+
+    frame.render_widget(trigger_p, chunks[3]);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
@@ -262,4 +613,71 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vert[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    #[test]
+    fn test_hub_items_do_not_contain_redundant_selectors() {
+        let cfg = Config::default();
+        let state = AppState::default();
+        let items = get_hub_items(&cfg, &state);
+
+        // Player, quality, audio (sub/dub), and subtitle language must NOT be present
+        for item in &items {
+            assert!(!item.label.to_lowercase().contains("player binary"), "Redundant Player found");
+            assert!(!item.label.to_lowercase().contains("preferred quality"), "Redundant Quality found");
+            assert!(!item.label.to_lowercase().contains("preferred audio"), "Redundant Audio found");
+            assert!(!item.label.to_lowercase().contains("subtitle language"), "Redundant Subtitle Lang found");
+        }
+    }
+
+    #[test]
+    fn test_hub_items_contain_new_major_features() {
+        let cfg = Config::default();
+        let state = AppState::default();
+        let items = get_hub_items(&cfg, &state);
+
+        let labels: Vec<&str> = items.iter().map(|i| i.label).collect();
+        assert!(labels.iter().any(|l| l.contains("Typography Preset")));
+        assert!(labels.iter().any(|l| l.contains("Signage Collision Guard")));
+        assert!(labels.iter().any(|l| l.contains("Mobile LAN Remote Server")));
+        assert!(labels.iter().any(|l| l.contains("Launch Mobile Remote QR Modal")));
+        assert!(labels.iter().any(|l| l.contains("Scan & Beam to TV")));
+        assert!(labels.iter().any(|l| l.contains("Real-Time Anime4K Upscaler")));
+    }
+
+    #[test]
+    fn test_hub_filter_matches_and_ranks() {
+        let cfg = Config::default();
+        let mut state = AppState::default();
+
+        // Empty query returns all
+        state.settings_query = String::new();
+        let res_all = get_filtered_items(&cfg, &state);
+        let all_count = get_hub_items(&cfg, &state).len();
+        assert_eq!(res_all.len(), all_count);
+
+        // "cast" should match casting items at top (via keywords or label)
+        state.settings_query = "cast".to_string();
+        let res_cast = get_filtered_items(&cfg, &state);
+        assert!(!res_cast.is_empty());
+        assert_eq!(res_cast[0].id, HubActionId::CastScan);
+
+        // "remote" query
+        state.settings_query = "remote".to_string();
+        let res_remote = get_filtered_items(&cfg, &state);
+        assert!(!res_remote.is_empty());
+        assert!(res_remote[0].label.to_lowercase().contains("remote"));
+
+        // "sub" query
+        state.settings_query = "sub".to_string();
+        let res_sub = get_filtered_items(&cfg, &state);
+        assert!(!res_sub.is_empty());
+        assert!(res_sub.iter().any(|i| i.label.contains("Preset") || i.label.contains("Subtitle")));
+    }
 }

@@ -34,6 +34,8 @@ pub struct PlayOptions {
     pub start_pos:  Option<f64>,
     /// Optional Anime4K GLSL shaders argument string (colon-separated)
     pub glsl_shaders: Option<String>,
+    /// Optional cinema-grade subtitle styling and collision configuration
+    pub sub_style: Option<crate::services::substyler::SubtitleStyleConfig>,
 }
 
 /// Build the ani-cli command arguments for a given play request.
@@ -355,6 +357,12 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 }
             }
 
+            if let Some(ref style) = opts.sub_style {
+                for flag in style.to_mpv_flags() {
+                    cmd.arg(&flag);
+                }
+            }
+
             cmd.arg(direct_url);
 
             return cmd
@@ -455,6 +463,17 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
             }
         }
     }
+
+    if let Some(ref style) = opts.sub_style {
+        for flag in style.to_mpv_flags() {
+            if player.contains("iina") {
+                player_flags.push(format!("--mpv-{}", flag.trim_start_matches("--")));
+            } else if !player.contains("vlc") {
+                player_flags.push(flag);
+            }
+        }
+    }
+
     cmd.env("ANI_CLI_PLAYER_FLAGS", player_flags.join(" "));
 
     cmd.stdin(Stdio::null())
@@ -483,6 +502,7 @@ mod tests {
             ipc_socket: None,
             start_pos:  None,
             glsl_shaders: None,
+            sub_style: None,
         }
     }
 
@@ -543,6 +563,7 @@ mod tests {
             ipc_socket: None,
             start_pos:  None,
             glsl_shaders: None,
+            sub_style: None,
         });
         assert_eq!(
             args,
@@ -575,6 +596,7 @@ mod tests {
             ipc_socket: None,
             start_pos:  None,
             glsl_shaders: None,
+            sub_style: None,
         });
         assert_eq!(
             args,

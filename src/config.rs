@@ -137,6 +137,12 @@ pub struct Config {
     #[serde(default)]
     pub update:           UpdateConfig,
     pub cache:            CacheConfig,
+    #[serde(default)]
+    pub subtitle_style:   crate::services::substyler::SubtitleStyleConfig,
+    #[serde(default)]
+    pub remote:           RemoteConfig,
+    #[serde(default)]
+    pub cast:             CastConfig,
 }
 
 impl Default for Config {
@@ -151,6 +157,57 @@ impl Default for Config {
             ambilight_enabled: default_true(),
             update:           UpdateConfig::default(),
             cache:            CacheConfig::default(),
+            subtitle_style:   crate::services::substyler::SubtitleStyleConfig::default(),
+            remote:           RemoteConfig::default(),
+            cast:             CastConfig::default(),
+        }
+    }
+}
+
+/// Local LAN mobile companion remote configuration
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    #[serde(default = "default_remote_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_remote_port")]
+    pub port: u16,
+}
+
+fn default_remote_enabled() -> bool {
+    true
+}
+
+fn default_remote_port() -> u16 {
+    8484
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_remote_enabled(),
+            port: default_remote_port(),
+        }
+    }
+}
+
+/// AirPlay & DLNA TV casting configuration
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CastConfig {
+    #[serde(default = "default_true")]
+    pub auto_discover: bool,
+    #[serde(default = "default_cast_timeout")]
+    pub scan_timeout_ms: u64,
+}
+
+fn default_cast_timeout() -> u64 {
+    500
+}
+
+impl Default for CastConfig {
+    fn default() -> Self {
+        Self {
+            auto_discover: true,
+            scan_timeout_ms: default_cast_timeout(),
         }
     }
 }
@@ -383,6 +440,9 @@ mod tests {
             ambilight_enabled: true,
             update:           UpdateConfig::default(),
             cache:            CacheConfig::default(),
+            subtitle_style:   crate::services::substyler::SubtitleStyleConfig::default(),
+            remote:           RemoteConfig::default(),
+            cast:             CastConfig::default(),
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -410,6 +470,9 @@ mod tests {
             ambilight_enabled: false,
             update:           UpdateConfig::default(),
             cache:            CacheConfig::default(),
+            subtitle_style:   crate::services::substyler::SubtitleStyleConfig::default(),
+            remote:           RemoteConfig::default(),
+            cast:             CastConfig::default(),
         };
 
         // Save manually (bypassing config_path() which uses XDG dirs)

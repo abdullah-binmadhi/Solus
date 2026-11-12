@@ -35,6 +35,12 @@ pub enum Screen {
     TailoredResults,
     /// Personal Anime Wrapped & Taste Analytics Dashboard
     TasteAnalytics,
+    /// Mobile LAN remote companion QR code modal
+    RemoteModal,
+    /// AirPlay / DLNA TV device scanner & cast target picker
+    CastModal,
+    /// Active TV streaming command deck
+    CastDeck,
 }
 
 /// Which category row the cursor is on (Home screen).
@@ -151,6 +157,9 @@ pub struct AppState {
 
     /// Settings overlay: which preference row is focused
     pub settings_cursor: usize,
+
+    /// Settings overlay: fuzzy search query for instant filtering
+    pub settings_query: String,
 
     /// Playback query picker: candidate search queries to send to ani-cli
     pub playback_queries: Vec<String>,
@@ -409,6 +418,20 @@ pub struct AppState {
 
     /// Live update download progress: (percentage, speed_str)
     pub update_progress: Option<(f32, String)>,
+
+    /// Mobile LAN remote control state & rendered ASCII QR code
+    pub remote_state: std::sync::Arc<tokio::sync::RwLock<crate::services::remote::RemotePlaybackState>>,
+    pub remote_qr: Option<String>,
+    pub remote_url: String,
+
+    /// TV Casting state
+    pub cast_devices: Vec<crate::services::cast::CastDevice>,
+    pub cast_selected_idx: usize,
+    pub active_cast_device: Option<crate::services::cast::CastDevice>,
+    pub is_casting: bool,
+    pub is_scanning_cast: bool,
+    pub cast_playback_pos: f64,
+    pub cast_playback_dur: f64,
 }
 
 impl AppState {
@@ -437,6 +460,7 @@ impl AppState {
             search_results:   Vec::new(),
             search_cursor:    0,
             settings_cursor:  0,
+            settings_query:   String::new(),
             playback_queries: Vec::new(),
             playback_query_cursor: 0,
             playback_qualities: Vec::new(),
@@ -531,6 +555,16 @@ impl AppState {
             is_checking_update: false,
             is_updating:      false,
             update_progress:  None,
+            remote_state:     std::sync::Arc::new(tokio::sync::RwLock::new(crate::services::remote::RemotePlaybackState::default())),
+            remote_qr:        None,
+            remote_url:       format!("http://{}:8484", crate::services::remote::get_local_ip()),
+            cast_devices:     Vec::new(),
+            cast_selected_idx: 0,
+            active_cast_device: None,
+            is_casting:       false,
+            is_scanning_cast: false,
+            cast_playback_pos: 0.0,
+            cast_playback_dur: 0.0,
         }
     }
 
@@ -606,9 +640,10 @@ impl AppState {
                     Screen::Home
                 }
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics => {
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal => {
                 self.overlay_base.clone()
             }
+            Screen::CastDeck => Screen::Detail,
             Screen::TailoredSummary => {
                 if self.tailored_editing_step.is_some() {
                     self.tailored_editing_step = None;
@@ -682,6 +717,7 @@ impl AppState {
     pub fn open_settings(&mut self) {
         self.overlay_base = self.current_base_screen();
         self.settings_cursor = 0;
+        self.settings_query.clear();
         self.screen = Screen::Settings;
     }
 
@@ -906,7 +942,8 @@ impl AppState {
             Screen::Detail | Screen::Playback | Screen::PlaybackQuery | Screen::PlaybackOptions => {
                 Screen::Detail
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults | Screen::TasteAnalytics => self.overlay_base.clone(),
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal => self.overlay_base.clone(),
+            Screen::CastDeck => Screen::Detail,
             Screen::Home => Screen::Home,
         }
     }

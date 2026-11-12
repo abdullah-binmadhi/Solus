@@ -546,6 +546,8 @@ pub async fn ensure_synchronized_subtitle(
         }
     }
 
+    let final_content = crate::services::substyler::apply_signage_collision_avoidance(&final_content);
+
     // Determine appropriate extension (.ass, .vtt, or .srt)
     let ext = if final_content.contains("[Script Info]") || final_content.contains("Dialogue:") {
         "ass"
