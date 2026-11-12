@@ -13,6 +13,7 @@ use crate::{config, state::AppState};
 const PLAYER_CHOICES: [&str; 3] = ["mpv", "iina", "vlc"];
 const QUALITY_CHOICES: [&str; 5] = ["best", "1080p", "720p", "480p", "360p"];
 const AUDIO_CHOICES: [&str; 2] = ["sub", "dub"];
+const SKIP_CHOICES: [&str; 2] = ["enabled", "disabled"];
 pub const SUBTITLE_CHOICES: [&str; 11] = [
     "English",
     "Arabic",
@@ -28,7 +29,7 @@ pub const SUBTITLE_CHOICES: [&str; 11] = [
 ];
 
 pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config) {
-    let area = centered_rect(66, 68, frame.area());
+    let area = centered_rect(66, 74, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -47,6 +48,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -73,6 +75,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
     render_setting_row(rows[2], "Quality", &QUALITY_CHOICES, quality_index(&cfg.quality), state.settings_cursor == 1, frame);
     render_setting_row(rows[3], "Audio", &AUDIO_CHOICES, audio_index(&cfg.audio_mode), state.settings_cursor == 2, frame);
     render_setting_row(rows[4], "Subtitle", &SUBTITLE_CHOICES, sub_index(&cfg.default_sub_lang), state.settings_cursor == 3, frame);
+    render_setting_row(rows[5], "Auto-Skip", &SKIP_CHOICES, if cfg.auto_skip_intro { 0 } else { 1 }, state.settings_cursor == 4, frame);
 
     let preferred_ready = match cfg.player {
         config::Player::Mpv => state.has_mpv || state.has_iina,
@@ -108,7 +111,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
             Style::default().fg(Color::Rgb(120, 120, 140)),
         )),
     ]);
-    frame.render_widget(footer, rows[5]);
+    frame.render_widget(footer, rows[6]);
 }
 
 fn render_setting_row(

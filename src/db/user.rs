@@ -326,6 +326,205 @@ pub async fn get_audio_mode(pool: &SqlitePool, anime_id: i64) -> Result<Option<A
     }))
 }
 
+/// Update or insert continue_watching without marking episode in history as completed yet.
+pub async fn touch_continue_watching(
+    pool:     &SqlitePool,
+    anime_id: i64,
+    episode:  i64,
+    now:      i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO continue_watching (anime_id, last_episode, last_watched)
+         VALUES (?, ?, ?)
+         ON CONFLICT(anime_id) DO UPDATE SET
+             last_episode = excluded.last_episode,
+             last_watched = excluded.last_watched",
+    )
+    .bind(anime_id)
+    .bind(episode)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query(
+        "DELETE FROM dismissed_sync WHERE anime_id = ? AND list_type = 'continue_watching'",
+    )
+    .bind(anime_id)
+    .execute(pool)
+    .await;
+
+    Ok(())
+}
+
+/// Save live playback progress (second offset and duration) for an episode.
+pub async fn save_playback_progress(
+    pool:          &SqlitePool,
+    anime_id:      i64,
+    episode:       u32,
+    position_secs: f64,
+    duration_secs: f64,
+    now:           i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO playback_progress (anime_id, episode, position_secs, duration_secs, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(anime_id, episode) DO UPDATE SET
+             position_secs = excluded.position_secs,
+             duration_secs = excluded.duration_secs,
+             updated_at    = excluded.updated_at",
+    )
+    .bind(anime_id)
+    .bind(episode as i64)
+    .bind(position_secs)
+    .bind(duration_secs)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Retrieve the saved playback progress (position, duration) for an episode.
+pub async fn get_playback_progress(
+    pool:     &SqlitePool,
+    anime_id: i64,
+    episode:  u32,
+) -> Result<Option<(f64, f64)>> {
+    let row = sqlx::query_as::<_, (f64, f64)>(
+        "SELECT position_secs, duration_secs FROM playback_progress WHERE anime_id = ? AND episode = ?",
+    )
+    .bind(anime_id)
+    .bind(episode as i64)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
+/// Fetch playback progress for all episodes of an anime.
+pub async fn get_all_progress_for_anime(
+    pool:     &SqlitePool,
+    anime_id: i64,
+) -> Result<HashMap<u32, (f64, f64)>> {
+    let rows = sqlx::query_as::<_, (i64, f64, f64)>(
+        "SELECT episode, position_secs, duration_secs FROM playback_progress WHERE anime_id = ?",
+    )
+    .bind(anime_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut map = HashMap::new();
+    for (ep, pos, dur) in rows {
+        map.insert(ep as u32, (pos, dur));
+    }
+    Ok(map)
+}
+
+/// Save filler classifications for an anime.
+pub async fn save_anime_fillers(
+    pool:     &SqlitePool,
+    anime_id: i64,
+    fillers:  &HashMap<u32, String>,
+) -> Result<()> {
+    for (&ep, ftype) in fillers {
+        sqlx::query(
+            "INSERT INTO anime_fillers (anime_id, episode, filler_type)
+             VALUES (?, ?, ?)
+             ON CONFLICT(anime_id, episode) DO UPDATE SET filler_type = excluded.filler_type",
+        )
+        .bind(anime_id)
+        .bind(ep as i64)
+        .bind(ftype)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Fetch cached filler classifications for an anime.
+pub async fn get_anime_fillers(
+    pool:     &SqlitePool,
+    anime_id: i64,
+) -> Result<HashMap<u32, String>> {
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT episode, filler_type FROM anime_fillers WHERE anime_id = ?",
+    )
+    .bind(anime_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut map = HashMap::new();
+    for (ep, ftype) in rows {
+        map.insert(ep as u32, ftype);
+    }
+    Ok(map)
+}
+
+/// Save or update an offline downloaded episode record.
+pub async fn save_offline_episode(
+    pool:      &SqlitePool,
+    anime_id:  i64,
+    episode:   u32,
+    file_path: &str,
+    file_size: i64,
+    now:       i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO offline_episodes (anime_id, episode, file_path, file_size, downloaded_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(anime_id, episode) DO UPDATE SET
+             file_path     = excluded.file_path,
+             file_size     = excluded.file_size,
+             downloaded_at = excluded.downloaded_at",
+    )
+    .bind(anime_id)
+    .bind(episode as i64)
+    .bind(file_path)
+    .bind(file_size)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Fetch all offline downloaded episodes for an anime, returning map of episode -> file_path.
+pub async fn get_offline_episodes(
+    pool:     &SqlitePool,
+    anime_id: i64,
+) -> Result<HashMap<u32, String>> {
+    let rows = sqlx::query_as::<_, (i64, String)>(
+        "SELECT episode, file_path FROM offline_episodes WHERE anime_id = ?",
+    )
+    .bind(anime_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut map = HashMap::new();
+    for (ep, path) in rows {
+        map.insert(ep as u32, path);
+    }
+    Ok(map)
+}
+
+/// Remove an offline episode record.
+#[allow(dead_code)]
+pub async fn delete_offline_episode(
+    pool:     &SqlitePool,
+    anime_id: i64,
+    episode:  u32,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM offline_episodes WHERE anime_id = ? AND episode = ?",
+    )
+    .bind(anime_id)
+    .bind(episode as i64)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -604,5 +803,63 @@ mod tests {
 
         record_watched(&pool, 1, 2, 200).await.unwrap();
         assert!(!get_dismissed_ids(&pool, "continue_watching").await.unwrap().contains(&1));
+    }
+
+    #[tokio::test]
+    async fn test_playback_progress_round_trip() {
+        let pool = setup().await;
+        save_playback_progress(&pool, 1, 3, 142.5, 1420.0, 100).await.unwrap();
+
+        let prog = get_playback_progress(&pool, 1, 3).await.unwrap();
+        assert!(prog.is_some());
+        let (pos, dur) = prog.unwrap();
+        assert!((pos - 142.5).abs() < 1e-4);
+        assert!((dur - 1420.0).abs() < 1e-4);
+
+        let all = get_all_progress_for_anime(&pool, 1).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all.get(&3), Some(&(142.5, 1420.0)));
+    }
+
+    #[tokio::test]
+    async fn test_anime_fillers_round_trip() {
+        let pool = setup().await;
+        let mut fillers = HashMap::new();
+        fillers.insert(1, "manga_canon".to_string());
+        fillers.insert(7, "mixed".to_string());
+        fillers.insert(26, "filler".to_string());
+
+        save_anime_fillers(&pool, 1, &fillers).await.unwrap();
+        let loaded = get_anime_fillers(&pool, 1).await.unwrap();
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded.get(&1), Some(&"manga_canon".to_string()));
+        assert_eq!(loaded.get(&7), Some(&"mixed".to_string()));
+        assert_eq!(loaded.get(&26), Some(&"filler".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_offline_episodes_round_trip() {
+        let pool = setup().await;
+        save_offline_episode(&pool, 1, 2, "/path/to/ep2.mkv", 450_000_000, 100).await.unwrap();
+
+        let off = get_offline_episodes(&pool, 1).await.unwrap();
+        assert_eq!(off.len(), 1);
+        assert_eq!(off.get(&2), Some(&"/path/to/ep2.mkv".to_string()));
+
+        delete_offline_episode(&pool, 1, 2).await.unwrap();
+        let empty = get_offline_episodes(&pool, 1).await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_touch_continue_watching() {
+        let pool = setup().await;
+        touch_continue_watching(&pool, 1, 5, 150).await.unwrap();
+        let entries = get_continue_watching(&pool).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].anime_id, 1);
+        assert_eq!(entries[0].last_episode, 5);
+        // Does not add to watched history
+        assert!(get_watched_episodes(&pool, 1).await.unwrap().is_empty());
     }
 }

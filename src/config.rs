@@ -91,6 +91,10 @@ fn default_sub_lang_val() -> String {
     "English".to_string()
 }
 
+fn default_auto_skip_intro() -> bool {
+    true
+}
+
 /// Root config struct — persisted to ~/.config/ani-tui/config.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -99,6 +103,8 @@ pub struct Config {
     pub player:           Player,
     #[serde(default = "default_sub_lang_val")]
     pub default_sub_lang: String,
+    #[serde(default = "default_auto_skip_intro")]
+    pub auto_skip_intro:  bool,
     pub cache:            CacheConfig,
 }
 
@@ -109,6 +115,7 @@ impl Default for Config {
             audio_mode:       AudioMode::default(),
             player:           Player::default(),
             default_sub_lang: default_sub_lang_val(),
+            auto_skip_intro:  default_auto_skip_intro(),
             cache:            CacheConfig::default(),
         }
     }
@@ -256,6 +263,7 @@ mod tests {
             audio_mode:       AudioMode::Dub,
             player:           Player::Iina,
             default_sub_lang: "Arabic".to_string(),
+            auto_skip_intro:  true,
             cache:            CacheConfig::default(),
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
@@ -277,6 +285,7 @@ mod tests {
             audio_mode:       AudioMode::Sub,
             player:           Player::Mpv,
             default_sub_lang: "English".to_string(),
+            auto_skip_intro:  true,
             cache:            CacheConfig::default(),
         };
 

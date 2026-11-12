@@ -73,6 +73,14 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
         spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
     }
 
+    if let Some((_, ep, pct, ref spd)) = state.active_download {
+        spans.push(Span::styled(
+            format!("󰇚 Downloading Ep {}: {:.0}% ({}) ", ep, pct, spd),
+            Style::default().fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
+    }
+
     if state.active_row == CategoryRow::ContinueWatching {
         spans.push(Span::styled("󰅖 [x] Remove", Style::default().fg(Color::Rgb(255, 85, 85)).add_modifier(Modifier::BOLD)));
         spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));

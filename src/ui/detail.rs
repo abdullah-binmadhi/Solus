@@ -14,6 +14,17 @@ use crate::{
     ui::components::cover::HalfblockCover,
 };
 
+/// Helper to format miniature progress bar: [━━━━━━────]
+pub fn format_mini_bar(pos: f64, dur: f64, width: usize) -> String {
+    if dur <= 0.0 || width == 0 {
+        return String::new();
+    }
+    let ratio = (pos / dur).clamp(0.0, 1.0);
+    let filled = (ratio * width as f64).round() as usize;
+    let unfilled = width.saturating_sub(filled);
+    format!("[{}{}]", "━".repeat(filled), "─".repeat(unfilled))
+}
+
 /// Render the detail screen.
 pub fn render(frame: &mut Frame, state: &mut AppState) {
     let Some(anime) = state.selected_anime.clone() else {
@@ -47,6 +58,8 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         Span::raw(" Watched  "),
         Span::styled("p", Style::default().fg(Color::Rgb(180, 0, 255))),
         Span::raw(" Options  "),
+        Span::styled("D", Style::default().fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD)),
+        Span::raw(" Download  "),
         Span::styled("+", Style::default().fg(Color::Rgb(180, 0, 255))),
         Span::raw(" Watchlist  "),
         Span::styled("󰅖 Backspace", Style::default().fg(Color::Rgb(255, 85, 85))),
@@ -69,6 +82,10 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     frame.render_widget(hint, chunks[0]);
     render_info(frame, chunks[1], state, &anime);
     render_episodes(frame, chunks[2], state, &anime);
+
+    if state.is_download_modal_open {
+        crate::ui::download::render_download_modal(frame, state);
+    }
 }
 
 /// Top section: cover + metadata side by side.
@@ -482,15 +499,41 @@ fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anim
         };
 
         let mut lines = Vec::new();
-        // Line 1: Title + Status Badge + Stream Specs
-        lines.push(Line::from(vec![
+        let mut title_spans = vec![
             Span::styled(format!("{}. ", ep), Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
             Span::styled(ep_title, title_style),
             Span::raw("   "),
             status_badge,
-            Span::raw("  "),
-            Span::styled(audio_meta, Style::default().fg(Color::Rgb(140, 140, 160))),
-        ]));
+        ];
+
+        if state.offline_episodes.contains_key(&ep) {
+            title_spans.push(Span::raw(" "));
+            title_spans.push(Span::styled(" [ ❖ Offline ] ", Style::default().fg(Color::Rgb(80, 250, 123)).bg(Color::Rgb(20, 50, 30)).add_modifier(Modifier::BOLD)));
+        }
+
+        if let Some(ftype) = state.anime_fillers.get(&ep) {
+            title_spans.push(Span::raw(" "));
+            match ftype.as_str() {
+                "filler" => title_spans.push(Span::styled(" [ ◈ Filler ] ", Style::default().fg(Color::Rgb(255, 140, 40)).bg(Color::Rgb(55, 30, 15)).add_modifier(Modifier::BOLD))),
+                "mixed" => title_spans.push(Span::styled(" [ ◈ Mixed ] ", Style::default().fg(Color::Rgb(255, 215, 0)).bg(Color::Rgb(50, 45, 15)).add_modifier(Modifier::BOLD))),
+                _ => title_spans.push(Span::styled(" [ ❖ Canon ] ", Style::default().fg(Color::Rgb(139, 233, 253)).bg(Color::Rgb(20, 40, 55)))),
+            }
+        }
+
+        if let Some(&(pos, dur)) = state.anime_progress.get(&ep) {
+            if dur > 0.0 && pos > 5.0 && pos / dur < 0.85 {
+                let bar = format_mini_bar(pos, dur, 8);
+                title_spans.push(Span::raw(" "));
+                title_spans.push(Span::styled(
+                    format!("{} {:02}:{:02}", bar, (pos as u64) / 60, (pos as u64) % 60),
+                    Style::default().fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled(audio_meta, Style::default().fg(Color::Rgb(140, 140, 160))));
+        lines.push(Line::from(title_spans));
 
         // Lines 2..N: Full Episode Synopsis (never covered or shrunk when selected, and truncated cleanly at word boundaries)
         let syn_text = episode_synopsis_text(state, anime, ep, is_aired);
@@ -569,7 +612,7 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(38), // Left: Episode Queue
+            Constraint::Length(44), // Left: Episode Queue
             Constraint::Min(0),     // Right: Episode Inspector Theater
         ])
         .split(inner);
@@ -604,28 +647,53 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
 
         let default_title = format!("Episode {}", ep);
         let ep_title = state.episode_titles.get(&ep).unwrap_or(&default_title);
-        let truncated_title: String = ep_title.chars().take(16).collect();
+        let truncated_title: String = ep_title.chars().take(13).collect();
 
         let prefix = if is_selected { "▶ " } else { "  " };
-        let tag = if !is_aired {
-            " 󰌾 Airs"
-        } else if is_watched {
-            " 󰄬 24m"
-        } else {
-            " 󰄮 24m"
-        };
 
-        let line_text = format!("{prefix}E{ep:<2} {truncated_title:<16}{tag}");
-        let style = if is_selected {
-            Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)
-        } else if !is_aired {
-            Style::default().fg(Color::Rgb(85, 85, 100))
+        let mut spans = vec![
+            Span::styled(format!("{prefix}E{ep:<2} {truncated_title:<13}"), if is_selected {
+                Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)
+            } else if !is_aired {
+                Style::default().fg(Color::Rgb(85, 85, 100))
+            } else if is_watched {
+                Style::default().fg(Color::Rgb(110, 180, 130))
+            } else {
+                Style::default().fg(Color::Rgb(200, 200, 210))
+            }),
+        ];
+
+        // Offline badge
+        if state.offline_episodes.contains_key(&ep) {
+            spans.push(Span::styled(" 󰇚", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)));
+        }
+
+        // Filler badge
+        if let Some(ftype) = state.anime_fillers.get(&ep) {
+            if ftype == "filler" {
+                spans.push(Span::styled(" ◈", Style::default().fg(Color::Rgb(255, 140, 40)).add_modifier(Modifier::BOLD)));
+            } else if ftype == "mixed" {
+                spans.push(Span::styled(" ◈", Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD)));
+            }
+        }
+
+        // Progress or watched tag
+        if let Some(&(pos, dur)) = state.anime_progress.get(&ep) {
+            if dur > 0.0 && pos > 5.0 && pos / dur < 0.85 {
+                spans.push(Span::styled(
+                    format!(" {:02}:{:02}", (pos as u64) / 60, (pos as u64) % 60),
+                    Style::default().fg(Color::Rgb(139, 233, 253)),
+                ));
+            } else if is_watched {
+                spans.push(Span::styled(" 󰄬", Style::default().fg(Color::Rgb(110, 180, 130))));
+            }
         } else if is_watched {
-            Style::default().fg(Color::Rgb(110, 180, 130))
-        } else {
-            Style::default().fg(Color::Rgb(200, 200, 210))
-        };
-        q_lines.push(Line::from(Span::styled(line_text, style)));
+            spans.push(Span::styled(" 󰄬", Style::default().fg(Color::Rgb(110, 180, 130))));
+        } else if !is_aired {
+            spans.push(Span::styled(" 󰌾", Style::default().fg(Color::Rgb(85, 85, 100))));
+        }
+
+        q_lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(q_lines), q_inner);
 
@@ -718,7 +786,7 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
         } else {
             Style::default().fg(Color::Rgb(180, 180, 255))
         };
-        let specs_p = Paragraph::new(vec![
+        let mut spec_lines = vec![
             Line::from(Span::styled("❖ STREAM SPECIFICATION", Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD))),
             Line::from(Span::styled("  Resolution: 1080p Master HLS", Style::default().fg(Color::Rgb(220, 220, 230)))),
             Line::from(Span::styled(format!("  Audio: {}", audio_label), Style::default().fg(Color::Rgb(190, 190, 210)))),
@@ -727,23 +795,64 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
                 Span::styled("  Status: ", Style::default().fg(Color::Rgb(160, 160, 180))),
                 Span::styled(status_label, status_style),
             ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(" [  Enter Play ] ", Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::raw(" "),
-                Span::styled(" [ 󰗃 p Stream Options ] ", Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 80))),
-            ]),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    if is_watched { " [ w Mark Unwatched ] " } else { " [ w Mark Watched ] " },
-                    Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 55)),
-                ),
-                Span::raw(" "),
-                Span::styled(" [ v List View ] ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
-            ]),
-        ]);
+        ];
+
+        // Filler classification badge
+        if let Some(ftype) = state.anime_fillers.get(&selected_ep) {
+            let (label, color) = match ftype.as_str() {
+                "filler" => ("[ ◈ Filler ]", Color::Rgb(255, 140, 40)),
+                "mixed" => ("[ ◈ Mixed Canon/Filler ]", Color::Rgb(255, 215, 0)),
+                _ => ("[ ❖ Manga Canon ]", Color::Rgb(139, 233, 253)),
+            };
+            spec_lines.push(Line::from(vec![
+                Span::styled("  Canon: ", Style::default().fg(Color::Rgb(160, 160, 180))),
+                Span::styled(label, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            ]));
+        }
+
+        // Offline status badge
+        if state.offline_episodes.contains_key(&selected_ep) {
+            spec_lines.push(Line::from(vec![
+                Span::styled("  Vault: ", Style::default().fg(Color::Rgb(160, 160, 180))),
+                Span::styled("[ ❖ Offline Local — 0ms Launch ]", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
+            ]));
+        }
+
+        // Playback progress bar
+        if let Some(&(pos, dur)) = state.anime_progress.get(&selected_ep) {
+            if dur > 0.0 {
+                let pct = (pos / dur * 100.0).clamp(0.0, 100.0) as u32;
+                let bar = format_mini_bar(pos, dur, 10);
+                spec_lines.push(Line::from(vec![
+                    Span::styled("  Progress: ", Style::default().fg(Color::Rgb(160, 160, 180))),
+                    Span::styled(
+                        format!("{:02}:{:02} / {:02}:{:02} ({}%) {}", (pos as u64) / 60, (pos as u64) % 60, (dur as u64) / 60, (dur as u64) % 60, pct, bar),
+                        Style::default().fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+        }
+
+        spec_lines.push(Line::from(""));
+        spec_lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(" [  Enter Play ] ", Style::default().fg(Color::Black).bg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(" [ 󰇚 D Download ] ", Style::default().fg(Color::Rgb(180, 220, 255)).bg(Color::Rgb(40, 50, 70)).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(" [ 󰗃 p Options ] ", Style::default().fg(Color::White).bg(Color::Rgb(60, 60, 80))),
+        ]));
+        spec_lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                if is_watched { " [ w Mark Unwatched ] " } else { " [ w Mark Watched ] " },
+                Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 55)),
+            ),
+            Span::raw(" "),
+            Span::styled(" [ v List View ] ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        ]));
+
+        let specs_p = Paragraph::new(spec_lines);
         frame.render_widget(specs_p, specs_inner);
     }
 
@@ -1293,5 +1402,13 @@ mod tests {
         assert_eq!(detect_genre_voice(&dark_anime), GenreVoice::GloomyNoir);
         let dark_syn = episode_synopsis_text(&state, &dark_anime, 1, true);
         assert!(dark_syn.chars().count() >= 750, "Dark synopsis should be expanded to Terror in Resonance length: got {} chars", dark_syn.chars().count());
+    }
+
+    #[test]
+    fn test_format_mini_bar() {
+        assert_eq!(format_mini_bar(0.0, 100.0, 10), "[──────────]");
+        assert_eq!(format_mini_bar(50.0, 100.0, 10), "[━━━━━─────]");
+        assert_eq!(format_mini_bar(100.0, 100.0, 10), "[━━━━━━━━━━]");
+        assert_eq!(format_mini_bar(0.0, 0.0, 10), "");
     }
 }

@@ -359,6 +359,30 @@ pub struct AppState {
 
     /// Whether an anchor anime search is currently in-flight
     pub is_searching_anchor: bool,
+
+    /// Live playback second and duration progress per episode for the inspected anime
+    pub anime_progress: HashMap<u32, (f64, f64)>,
+
+    /// Filler classifications per episode (manga_canon, mixed, filler) for the inspected anime
+    pub anime_fillers: HashMap<u32, String>,
+
+    /// Downloaded offline episode file paths mapped by episode number
+    pub offline_episodes: HashMap<u32, String>,
+
+    /// Whether the offline episode download modal is open
+    pub is_download_modal_open: bool,
+
+    /// Download modal selected mode (0 = Current Episode, 1 = Range, 2 = All Unwatched)
+    pub download_modal_mode: usize,
+
+    /// Download modal episode range text input (e.g. "1-12")
+    pub download_range_input: String,
+
+    /// Live active background download status: (anime_id, episode, percentage, speed_str)
+    pub active_download: Option<(i64, u32, f32, String)>,
+
+    /// Cached MyAnimeList ID mapping for AniSkip lookup
+    pub anime_mal_ids: HashMap<i64, i64>,
 }
 
 impl AppState {
@@ -465,6 +489,14 @@ impl AppState {
             refine_anchor_cursor: 0,
             refine_anchor_selected: None,
             is_searching_anchor: false,
+            anime_progress:   HashMap::new(),
+            anime_fillers:    HashMap::new(),
+            offline_episodes: HashMap::new(),
+            is_download_modal_open: false,
+            download_modal_mode: 0,
+            download_range_input: String::new(),
+            active_download:  None,
+            anime_mal_ids:    HashMap::new(),
         }
     }
 
@@ -561,6 +593,12 @@ impl AppState {
         self.loading_episode_thumbnails.clear();
         self.current_card_img = None;
         self.loading_episode_metadata = true;
+        self.anime_progress.clear();
+        self.anime_fillers.clear();
+        self.offline_episodes.clear();
+        self.is_download_modal_open = false;
+        self.download_modal_mode = 0;
+        self.download_range_input.clear();
         self.detail_recommendations = Vec::new();
         self.detail_recommendation_reasons = HashMap::new();
         self.detail_focus = DetailFocus::Episodes;

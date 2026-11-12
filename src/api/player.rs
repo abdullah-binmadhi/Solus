@@ -28,6 +28,10 @@ pub struct PlayOptions {
     pub sub_url:  Option<String>,
     /// Direct verified stream URL (.m3u8) for 100% sync and instant launch
     pub stream_url: Option<String>,
+    /// IPC socket path to connect Solus to mpv for live progress tracking and skip cues
+    pub ipc_socket: Option<String>,
+    /// Playback start position in seconds (for exact resume)
+    pub start_pos:  Option<f64>,
 }
 
 /// Build the ani-cli command arguments for a given play request.
@@ -241,6 +245,24 @@ else
     fi
 fi
 
+if [ -n "$SOLUS_IPC_SOCKET" ]; then
+    if [ "$is_iina" -eq 1 ]; then
+        args+=("--mpv-input-ipc-server=$SOLUS_IPC_SOCKET")
+    elif [ "$is_vlc" -eq 0 ]; then
+        args+=("--input-ipc-server=$SOLUS_IPC_SOCKET")
+    fi
+fi
+
+if [ -n "$SOLUS_START_POS" ]; then
+    if [ "$is_iina" -eq 1 ]; then
+        args+=("--mpv-start=$SOLUS_START_POS")
+    elif [ "$is_vlc" -eq 1 ]; then
+        args+=(":start-time=$SOLUS_START_POS")
+    else
+        args+=("--start=$SOLUS_START_POS")
+    fi
+fi
+
 if [ -n "$video_link" ]; then
     args+=("$video_link")
 fi
@@ -314,6 +336,15 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 }
             }
 
+            if let Some(ref sock) = opts.ipc_socket {
+                cmd.env("SOLUS_IPC_SOCKET", sock);
+                cmd.arg(format!("--input-ipc-server={}", sock));
+            }
+            if let Some(pos) = opts.start_pos {
+                cmd.env("SOLUS_START_POS", pos.to_string());
+                cmd.arg(format!("--start={}", pos));
+            }
+
             cmd.arg(direct_url);
 
             return cmd
@@ -364,6 +395,27 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     }
 
     let mut player_flags = vec!["--input-terminal=no".to_string()];
+
+    if let Some(ref sock) = opts.ipc_socket {
+        cmd.env("SOLUS_IPC_SOCKET", sock);
+        if player.contains("iina") {
+            player_flags.push(format!("--mpv-input-ipc-server={}", sock));
+        } else if !player.contains("vlc") {
+            player_flags.push(format!("--input-ipc-server={}", sock));
+        }
+    }
+
+    if let Some(pos) = opts.start_pos {
+        cmd.env("SOLUS_START_POS", pos.to_string());
+        if player.contains("iina") {
+            player_flags.push(format!("--mpv-start={}", pos));
+        } else if player.contains("vlc") {
+            player_flags.push(format!(":start-time={}", pos));
+        } else {
+            player_flags.push(format!("--start={}", pos));
+        }
+    }
+
     if let Some(ref url) = opts.sub_url {
         if !url.is_empty() {
             if player.contains("iina") {
@@ -409,6 +461,8 @@ mod tests {
             sub_lang: None,
             sub_url:  None,
             stream_url: None,
+            ipc_socket: None,
+            start_pos:  None,
         }
     }
 
@@ -466,6 +520,8 @@ mod tests {
             sub_lang: None,
             sub_url:  None,
             stream_url: None,
+            ipc_socket: None,
+            start_pos:  None,
         });
         assert_eq!(
             args,
@@ -495,6 +551,8 @@ mod tests {
             sub_lang: Some("Arabic".to_string()),
             sub_url:  Some("https://example.com/sub.vtt".to_string()),
             stream_url: None,
+            ipc_socket: None,
+            start_pos:  None,
         });
         assert_eq!(
             args,

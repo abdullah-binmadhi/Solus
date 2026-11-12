@@ -67,6 +67,26 @@ enum AppMessage {
     EpisodeThumbnailReady(i64, u32, image::DynamicImage),
     /// Show's 16:9 banner image downloaded and decoded (anime_id, image)
     AnimeBannerReady(i64, image::DynamicImage),
+    /// Live playback progress updated via mpv IPC (anime_id, episode, pos_secs, duration_secs)
+    PlaybackProgressUpdated(i64, u32, f64, f64),
+    /// Episode reached 85% completion threshold and was auto-scrobbled
+    EpisodeAutoScrobbled(i64, u32),
+    /// Filler classifications loaded from AnimeFillerList (anime_id, map of ep -> filler_type)
+    AnimeFillersReady(i64, std::collections::HashMap<u32, String>),
+    /// Playback progress loaded from database for an anime (anime_id, map of ep -> (pos, dur))
+    #[allow(dead_code)]
+    AnimeProgressReady(i64, std::collections::HashMap<u32, (f64, f64)>),
+    /// Offline downloaded episodes loaded from database (anime_id, map of ep -> file_path)
+    #[allow(dead_code)]
+    AnimeOfflineReady(i64, std::collections::HashMap<u32, String>),
+    /// Background download progress update (anime_id, episode, percentage, speed_str)
+    DownloadProgress(i64, u32, f32, String),
+    /// Background episode download finished (anime_id, episode, file_path)
+    DownloadComplete(i64, u32, String),
+    /// Background episode download failed (anime_id, episode, error)
+    DownloadFailed(i64, u32, String),
+    /// MyAnimeList ID resolved for an anime (anime_id, mal_id)
+    AnimeMalIdReady(i64, i64),
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -400,6 +420,56 @@ async fn main() -> anyhow::Result<()> {
                         state.current_card_img = Some(card_banner);
                         state.episode_fallback_thumbnails.clear();
                     }
+                }
+                AppMessage::PlaybackProgressUpdated(anime_id, ep, pos, dur) => {
+                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
+                        state.anime_progress.insert(ep, (pos, dur));
+                    }
+                }
+                AppMessage::EpisodeAutoScrobbled(anime_id, ep) => {
+                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
+                        state.watched_episodes.insert(ep);
+                    }
+                    state.show_toast(format!("󰄬 Episode {} completed — auto-scrobbled", ep), unix_now());
+                    let pool_clone = pool.clone();
+                    let tx_cw = tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(cw) = services::sync::load_continue_watching(&pool_clone).await {
+                            let _ = tx_cw.send(AppMessage::ContinueWatchingUpdated(cw)).await;
+                        }
+                    });
+                }
+                AppMessage::AnimeFillersReady(anime_id, fillers) => {
+                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
+                        state.anime_fillers = fillers;
+                    }
+                }
+                AppMessage::AnimeProgressReady(anime_id, progress) => {
+                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
+                        state.anime_progress = progress;
+                    }
+                }
+                AppMessage::AnimeOfflineReady(anime_id, offline) => {
+                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
+                        state.offline_episodes = offline;
+                    }
+                }
+                AppMessage::DownloadProgress(anime_id, ep, pct, spd) => {
+                    state.active_download = Some((anime_id, ep, pct, spd));
+                }
+                AppMessage::DownloadComplete(anime_id, ep, path) => {
+                    state.active_download = None;
+                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
+                        state.offline_episodes.insert(ep, path);
+                    }
+                    state.show_toast(format!("󰄬 Episode {} downloaded offline!", ep), unix_now());
+                }
+                AppMessage::DownloadFailed(_anime_id, ep, err) => {
+                    state.active_download = None;
+                    state.show_toast(format!("Download failed for Ep {}: {}", ep, err), unix_now());
+                }
+                AppMessage::AnimeMalIdReady(anime_id, mal_id) => {
+                    state.anime_mal_ids.insert(anime_id, mal_id);
                 }
             }
         }
@@ -808,10 +878,58 @@ async fn open_detail_from_anime(
         }
     }
     state.set_watched_episodes(watched.into_iter().map(|e| e as u32).collect());
+    let progress = db::user::get_all_progress_for_anime(pool, anime_id).await.unwrap_or_default();
+    state.anime_progress = progress;
+    let offline = db::user::get_offline_episodes(pool, anime_id).await.unwrap_or_default();
+    state.offline_episodes = offline;
+    let fillers = db::user::get_anime_fillers(pool, anime_id).await.unwrap_or_default();
+    state.anime_fillers = fillers;
+
+    if state.anime_fillers.is_empty() {
+        trigger_filler_fetch(anime_id, title_english.clone(), title_romaji.clone(), pool.clone(), tx.clone());
+    }
+    if !state.anime_mal_ids.contains_key(&anime_id) {
+        trigger_mal_id_fetch(anime_id, tx.clone());
+    }
+
     if should_check_airing {
         trigger_airing_check(anime_id, pool.clone(), tx.clone());
     }
     trigger_episode_metadata_fetch(anime_id, title_romaji, title_english, tx.clone());
+}
+
+/// Query AnimeFillerList in the background to scrape filler classifications.
+fn trigger_filler_fetch(
+    anime_id: i64,
+    title_english: Option<String>,
+    title_romaji: String,
+    pool: sqlx::SqlitePool,
+    tx: tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    tokio::spawn(async move {
+        let title = title_english.as_deref().unwrap_or(&title_romaji);
+        let mut map = api::filler::fetch_filler_episodes(title).await;
+        if map.is_empty() && title_english.is_some() {
+            map = api::filler::fetch_filler_episodes(&title_romaji).await;
+        }
+        if !map.is_empty() {
+            let _ = db::user::save_anime_fillers(&pool, anime_id, &map).await;
+            let _ = tx.send(AppMessage::AnimeFillersReady(anime_id, map)).await;
+        }
+    });
+}
+
+/// Resolve MyAnimeList ID in the background for AniSkip lookup.
+fn trigger_mal_id_fetch(
+    anime_id: i64,
+    tx: tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        if let Some(mal_id) = api::anilist::resolve_mal_id(&client, anime_id).await {
+            let _ = tx.send(AppMessage::AnimeMalIdReady(anime_id, mal_id)).await;
+        }
+    });
 }
 
 /// Query AniList in the background to refresh airing status and next episode number.
@@ -1024,6 +1142,11 @@ async fn handle_detail(
     cfg:   &config::Config,
     tx:    &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
+    if state.is_download_modal_open {
+        handle_download_modal(key, state, pool, cfg, tx).await;
+        return;
+    }
+
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             state.go_back();
@@ -1109,6 +1232,13 @@ async fn handle_detail(
         // Play options overlay for the highlighted episode
         KeyCode::Char('p') | KeyCode::Char('P') => {
             begin_playback_flow(state, pool, cfg, true, tx).await;
+        }
+
+        // Open offline download modal
+        KeyCode::Char('D') => {
+            state.is_download_modal_open = true;
+            state.download_modal_mode = 0;
+            state.download_range_input.clear();
         }
 
         // Toggle Watched status for the highlighted episode
@@ -1241,6 +1371,105 @@ async fn handle_detail(
 
         _ => {}
     }
+}
+
+async fn handle_download_modal(
+    key:   event::KeyEvent,
+    state: &mut AppState,
+    pool:  &sqlx::SqlitePool,
+    cfg:   &config::Config,
+    tx:    &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    match key.code {
+        KeyCode::Esc => {
+            state.is_download_modal_open = false;
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            state.download_modal_mode = (state.download_modal_mode + 1).min(2);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.download_modal_mode = state.download_modal_mode.saturating_sub(1);
+        }
+        KeyCode::Backspace => {
+            if state.download_modal_mode == 1 {
+                state.download_range_input.pop();
+            }
+        }
+        KeyCode::Char(c) if state.download_modal_mode == 1 && (c.is_ascii_digit() || c == '-') => {
+            state.download_range_input.push(c);
+        }
+        KeyCode::Enter => {
+            let Some(anime) = state.selected_anime.clone() else {
+                state.is_download_modal_open = false;
+                return;
+            };
+            let max_aired = anime.aired_episodes();
+            let episodes = match state.download_modal_mode {
+                0 => vec![state.selected_episode.unwrap_or(1)],
+                1 => services::downloader::parse_episode_range(&state.download_range_input, max_aired, &[]),
+                2 => (1..=max_aired).filter(|ep| !state.watched_episodes.contains(ep)).collect(),
+                _ => vec![],
+            };
+            state.is_download_modal_open = false;
+            if episodes.is_empty() {
+                state.show_toast("No episodes matched download selection", unix_now());
+            } else {
+                state.show_toast(format!("󰇚 Queued {} episode(s) for offline download", episodes.len()), unix_now());
+                queue_episodes_for_download(
+                    anime,
+                    episodes,
+                    cfg.default_sub_lang.clone(),
+                    pool.clone(),
+                    tx.clone(),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn queue_episodes_for_download(
+    anime: db::cache::Anime,
+    episodes: Vec<u32>,
+    preferred_sub: String,
+    pool: sqlx::SqlitePool,
+    tx: tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    tokio::spawn(async move {
+        let anime_title = anime.display_title().to_string();
+        let query = anime.playback_query();
+        let mut tasks = Vec::new();
+
+        for ep in episodes {
+            let stream_info = api::subtitles::fetch_stream_info(anime.id, &query, ep, false).await;
+            let stream_url = stream_info
+                .qualities
+                .first()
+                .map(|q| q.url.clone())
+                .or(stream_info.master_url);
+
+            if let Some(s_url) = stream_url {
+                let sub_url = stream_info
+                    .subtitles
+                    .iter()
+                    .find(|s| s.code.eq_ignore_ascii_case(&preferred_sub) || s.stream_label.contains(&preferred_sub))
+                    .or_else(|| stream_info.subtitles.first())
+                    .map(|s| s.url.clone());
+
+                tasks.push(services::downloader::DownloadTask {
+                    anime_id: anime.id,
+                    anime_title: anime_title.clone(),
+                    episode: ep,
+                    stream_url: s_url,
+                    sub_url,
+                });
+            }
+        }
+
+        if !tasks.is_empty() {
+            services::downloader::spawn_batch_downloader(tasks, pool, tx);
+        }
+    });
 }
 
 // ── Playback query overlay ─────────────────────────────────────────────────────
@@ -1436,8 +1665,10 @@ async fn handle_playback_options(
                     sub_lang,
                     sub_url,
                     stream_url,
+                    ipc_socket: None,
+                    start_pos:  None,
                 };
-                start_playback(state, opts, title, ep, tx, pool).await;
+                start_playback(state, opts, title, ep, tx, pool, cfg).await;
             }
         }
         _ => {}
@@ -1528,7 +1759,7 @@ async fn handle_settings(
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => state.go_back(),
         KeyCode::Char('j') | KeyCode::Down => {
-            state.settings_cursor = (state.settings_cursor + 1).min(3);
+            state.settings_cursor = (state.settings_cursor + 1).min(4);
         }
         KeyCode::Char('k') | KeyCode::Up => {
             state.settings_cursor = state.settings_cursor.saturating_sub(1);
@@ -1786,6 +2017,9 @@ fn apply_settings_delta(
             let current = values.iter().position(|&val| val.eq_ignore_ascii_case(&cfg.default_sub_lang)).unwrap_or(0) as i32;
             let next = (current + delta).rem_euclid(values.len() as i32) as usize;
             cfg.default_sub_lang = values[next].to_string();
+        }
+        4 => {
+            cfg.auto_skip_intro = !cfg.auto_skip_intro;
         }
         _ => {}
     }
@@ -2232,7 +2466,7 @@ async fn handle_tailored_results(
     }
 }
 
-/// Spawn ani-cli, stream logs to channel, record watch history, auto-return on exit.
+/// Spawn player wrapper with IPC socket, auto-scrobble on 85% completion, auto-skip intro/outro, and exact timestamp resume.
 async fn start_playback(
     state:   &mut AppState,
     opts:    api::player::PlayOptions,
@@ -2240,6 +2474,7 @@ async fn start_playback(
     episode: u32,
     tx:      &tokio::sync::mpsc::Sender<AppMessage>,
     pool:    &sqlx::SqlitePool,
+    cfg:     &config::Config,
 ) {
     state.stop_player();
     state.playback_logs.clear();
@@ -2261,9 +2496,37 @@ async fn start_playback(
     }
 
     let mut opts = opts;
+    let anime_id = state.selected_anime.as_ref().map(|a| a.id).unwrap_or(0);
+
+    // 1. Instant 0ms launch if episode was downloaded offline
+    if let Some(offline_path) = state.offline_episodes.get(&episode) {
+        if std::path::Path::new(offline_path).exists() {
+            opts.stream_url = Some(offline_path.clone());
+            state.show_toast(format!("❖ Instant launch from offline vault: Ep {}", episode), unix_now());
+        }
+    }
+
+    // 2. Exact timestamp resume from saved progress
+    if opts.start_pos.is_none() {
+        if let Ok(Some((pos, dur))) = db::user::get_playback_progress(pool, anime_id, episode).await {
+            if pos > 10.0 && (dur <= 0.0 || pos / dur < 0.85) {
+                opts.start_pos = Some(pos);
+                state.show_toast(
+                    format!("❖ Resuming Ep {} at {:02}:{:02}", episode, (pos as u64) / 60, (pos as u64) % 60),
+                    unix_now(),
+                );
+            }
+        }
+    }
+
+    // 3. Connect Solus to mpv via IPC socket
+    let sock_path = format!("/tmp/solus-mpv-{}-{}.sock", anime_id, episode);
+    let _ = std::fs::remove_file(&sock_path);
+    opts.ipc_socket = Some(sock_path.clone());
+
+    // 4. Subtitle auto-sync
     if let Some(ref sub_u) = opts.sub_url {
         if sub_u.starts_with("http://") || sub_u.starts_with("https://") {
-            let anime_id = state.selected_anime.as_ref().map(|a| a.id).unwrap_or(0);
             let code = opts.sub_lang.as_deref().unwrap_or("sub");
             let client = reqwest::Client::new();
 
@@ -2307,6 +2570,20 @@ async fn start_playback(
         }
     }
 
+    // 5. Query AniSkip for intro/outro skip times
+    let mal_id_opt = state.anime_mal_ids.get(&anime_id).copied();
+    let skip_intervals = if let Some(mid) = mal_id_opt {
+        api::aniskip::fetch_skip_times(mid, episode).await
+    } else {
+        let client = reqwest::Client::new();
+        if let Some(mid) = api::anilist::resolve_mal_id(&client, anime_id).await {
+            state.anime_mal_ids.insert(anime_id, mid);
+            api::aniskip::fetch_skip_times(mid, episode).await
+        } else {
+            Vec::new()
+        }
+    };
+
     let mut child = match api::player::spawn_async(&opts) {
         Ok(c) => c,
         Err(e) => {
@@ -2318,21 +2595,28 @@ async fn start_playback(
 
     state.show_toast(format!("Launching Episode {} in external player", episode), unix_now());
 
-    // Record watch history as soon as playback starts & sync to AniList if logged in
+    // 6. Record in continue watching (without marking as completed history yet)
     if let Some(ref anime) = state.selected_anime {
-        let pool2      = pool.clone();
-        let anime_id   = anime.id;
-        let now        = unix_now();
-        let auth_token = state.auth.token.clone();
-        state.watched_episodes.insert(episode);
+        let pool2 = pool.clone();
+        let aid   = anime.id;
+        let now   = unix_now();
         tokio::spawn(async move {
-            let _ = db::user::record_watched(&pool2, anime_id, episode as i64, now).await;
-            if let Some(token) = auth_token {
-                let client = api::anilist::AniListClient::with_token(Some(token));
-                let _ = client.save_progress(anime_id, episode).await;
-            }
+            let _ = db::user::touch_continue_watching(&pool2, aid, episode as i64, now).await;
         });
     }
+
+    // 7. Spawn mpv IPC monitor for live tracking, auto-scrobble, and auto-skip
+    let ipc_cfg = services::ipc::IpcMonitorConfig {
+        anime_id,
+        episode,
+        sock_path,
+        pool: pool.clone(),
+        tx: tx.clone(),
+        auth_token: state.auth.token.clone(),
+        skip_intervals,
+        auto_skip_intro: cfg.auto_skip_intro,
+    };
+    services::ipc::spawn_mpv_ipc_monitor(ipc_cfg);
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();

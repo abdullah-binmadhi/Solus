@@ -46,6 +46,44 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS playback_progress (
+            anime_id        INTEGER NOT NULL,
+            episode         INTEGER NOT NULL,
+            position_secs   REAL NOT NULL,
+            duration_secs   REAL NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            PRIMARY KEY (anime_id, episode)
+        );"
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS anime_fillers (
+            anime_id        INTEGER NOT NULL,
+            episode         INTEGER NOT NULL,
+            filler_type     TEXT NOT NULL,
+            PRIMARY KEY (anime_id, episode)
+        );"
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS offline_episodes (
+            anime_id        INTEGER NOT NULL,
+            episode         INTEGER NOT NULL,
+            file_path       TEXT NOT NULL,
+            file_size       INTEGER NOT NULL,
+            downloaded_at   INTEGER NOT NULL,
+            PRIMARY KEY (anime_id, episode)
+        );"
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 

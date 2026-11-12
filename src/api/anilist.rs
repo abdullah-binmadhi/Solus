@@ -745,6 +745,21 @@ pub async fn fetch_streaming_episodes_with_client(
     Ok(fetch_anime_streaming_and_banner(client, id).await?.streaming_episodes)
 }
 
+/// Resolve the MyAnimeList ID for an AniList anime ID.
+pub async fn resolve_mal_id(client: &reqwest::Client, anilist_id: i64) -> Option<i64> {
+    let query = r#"query($id: Int) { Media(id: $id, type: ANIME) { idMal } }"#;
+    let body = serde_json::json!({
+        "query": query,
+        "variables": { "id": anilist_id },
+    });
+    let resp = client.post(ANILIST_API).json(&body).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().await.ok()?;
+    data.pointer("/data/Media/idMal")?.as_i64()
+}
+
 /// Helper to extract episode number and cleaned title from streaming episode entries.
 /// E.g. "Episode 1 - Ryomen Sukuna" -> (1, "Ryomen Sukuna")
 /// E.g. "Episode 12 - EAGLE EYE" -> (12, "EAGLE EYE")

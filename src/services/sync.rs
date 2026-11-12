@@ -293,6 +293,7 @@ fn build_progress_labels(
     anime_rows: &[&[cache::Anime]],
     watched_counts: &HashMap<i64, usize>,
     resume_next: &HashMap<i64, u32>,
+    progress_seconds: &HashMap<i64, (u32, f64, f64)>,
 ) -> HashMap<i64, String> {
     let mut labels = HashMap::new();
     let mut seen = HashSet::new();
@@ -301,6 +302,14 @@ fn build_progress_labels(
         for anime in *row {
             if !seen.insert(anime.id) {
                 continue;
+            }
+
+            if let Some(&(ep, pos, dur)) = progress_seconds.get(&anime.id) {
+                if pos > 10.0 && dur > 0.0 && pos / dur < 0.85 {
+                    let bar = crate::ui::detail::format_mini_bar(pos, dur, 6);
+                    labels.insert(anime.id, format!("E{} {:02}:{:02} {}", ep, (pos as u64) / 60, (pos as u64) % 60, bar));
+                    continue;
+                }
             }
 
             if let Some(next_ep) = resume_next.get(&anime.id) {
@@ -458,6 +467,18 @@ pub async fn sync_all(
     all_ids.sort_unstable();
     all_ids.dedup();
     let watched_counts = user::get_watched_counts(pool, &all_ids).await.unwrap_or_default();
+    let progress_rows = sqlx::query_as::<_, (i64, i64, f64, f64)>(
+        "SELECT anime_id, episode, position_secs, duration_secs FROM playback_progress ORDER BY updated_at DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut progress_seconds: HashMap<i64, (u32, f64, f64)> = HashMap::new();
+    for (aid, ep, pos, dur) in progress_rows {
+        progress_seconds.entry(aid).or_insert((ep as u32, pos, dur));
+    }
+
     let progress_labels = build_progress_labels(
         &[
             &continue_watching,
@@ -470,6 +491,7 @@ pub async fn sync_all(
         ],
         &watched_counts,
         &resume_next,
+        &progress_seconds,
     );
 
     Ok(HomeData {
