@@ -223,6 +223,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut needs_redraw = true;
+    let mut last_screen = state.screen.clone();
 
     // ── Main event loop ───────────────────────────────────────────────────────
     loop {
@@ -661,6 +662,12 @@ async fn main() -> anyhow::Result<()> {
             needs_redraw = true;
         }
 
+        if state.screen != last_screen {
+            let _ = terminal.clear();
+            last_screen = state.screen.clone();
+            needs_redraw = true;
+        }
+
         if needs_redraw {
             // Draw current screen
             terminal.draw(|frame| {
@@ -714,7 +721,6 @@ async fn main() -> anyhow::Result<()> {
                         ui::tailored::render_tailored_results(frame, &mut state);
                     }
                     Screen::TasteAnalytics => {
-                        render_base_screen(frame, &mut state, &home_data, &base_screen);
                         ui::analytics::render(frame, &state);
                     }
                     Screen::RemoteModal => {
@@ -2503,10 +2509,24 @@ async fn handle_analytics(
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('a') | KeyCode::Char('A') => {
             state.go_back();
+            if state.screen == Screen::TasteAnalytics {
+                state.screen = Screen::Home;
+            }
         }
         KeyCode::Char('r') | KeyCode::Char('R') => {
             state.show_toast("Refreshing viewing telemetry...", unix_now());
             trigger_analytics_fetch(state, pool.clone(), tx.clone());
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            state.open_settings();
+        }
+        KeyCode::Char('?') => {
+            state.open_help();
+        }
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            state.theme_index = (state.theme_index + 1) % ui::theme::THEMES.len();
+            let theme_name = state.theme().name;
+            state.show_toast(format!("Theme: {}", theme_name), unix_now());
         }
         _ => {}
     }

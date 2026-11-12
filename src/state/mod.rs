@@ -588,8 +588,10 @@ impl AppState {
 
     /// Open Personal Anime Wrapped & Taste Analytics Dashboard
     pub fn open_taste_analytics(&mut self) {
-        self.overlay_base = self.screen.clone();
-        self.screen = Screen::TasteAnalytics;
+        if self.screen != Screen::TasteAnalytics {
+            self.overlay_base = self.current_base_screen();
+            self.screen = Screen::TasteAnalytics;
+        }
     }
 
     /// Show a toast notification (auto-dismissed after 4 seconds).
@@ -641,7 +643,11 @@ impl AppState {
                 }
             }
             Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal => {
-                self.overlay_base.clone()
+                if self.overlay_base == self.screen {
+                    Screen::Home
+                } else {
+                    self.overlay_base.clone()
+                }
             }
             Screen::CastDeck => Screen::Detail,
             Screen::TailoredSummary => {
@@ -1198,5 +1204,32 @@ mod tests {
         state.push_log("inappropriate ioctl for device".into());
 
         assert!(state.playback_error_message().is_none());
+    }
+
+    #[test]
+    fn test_open_taste_analytics_and_go_back() {
+        let mut state = AppState::new();
+        state.screen = Screen::Home;
+
+        state.open_taste_analytics();
+        assert_eq!(state.screen, Screen::TasteAnalytics);
+
+        // Calling open_taste_analytics again while already on the screen must not overwrite overlay_base
+        state.open_taste_analytics();
+        assert_eq!(state.screen, Screen::TasteAnalytics);
+
+        // Go back must return to Home
+        state.go_back();
+        assert_eq!(state.screen, Screen::Home);
+    }
+
+    #[test]
+    fn test_taste_analytics_corrupted_overlay_base_escapes_to_home() {
+        let mut state = AppState::new();
+        state.screen = Screen::TasteAnalytics;
+        state.overlay_base = Screen::TasteAnalytics;
+
+        state.go_back();
+        assert_eq!(state.screen, Screen::Home);
     }
 }
