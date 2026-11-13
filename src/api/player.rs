@@ -77,6 +77,10 @@ pub fn resolve_player(preferred: &str) -> String {
     match preferred {
         "mpv" => {
             if command_exists("mpv") {
+                #[cfg(windows)]
+                if let Some(path) = windows_player_path("mpv") {
+                    return path;
+                }
                 "mpv".to_string()
             } else if let Some(iina) = macos_iina_fallback() {
                 iina
@@ -85,7 +89,13 @@ pub fn resolve_player(preferred: &str) -> String {
             }
         }
         "iina" => macos_iina_fallback().unwrap_or_else(|| "iina".to_string()),
-        "vlc" => "vlc".to_string(),
+        "vlc" => {
+            #[cfg(windows)]
+            if let Some(path) = windows_player_path("vlc") {
+                return path;
+            }
+            "vlc".to_string()
+        }
         other => other.to_string(),
     }
 }
@@ -101,17 +111,86 @@ pub fn detect_dependencies() -> (bool, bool, bool, bool) {
 }
 
 fn command_exists(name: &str) -> bool {
-    let Some(path) = env::var_os("PATH") else {
-        return false;
+    if let Some(path) = env::var_os("PATH") {
+        let found = env::split_paths(&path).any(|dir| {
+            executable_exists(&dir.join(name))
+                || (cfg!(windows)
+                    && (executable_exists(&dir.join(format!("{}.exe", name)))
+                        || executable_exists(&dir.join(format!("{}.cmd", name)))
+                        || executable_exists(&dir.join(format!("{}.bat", name)))))
+        });
+        if found {
+            return true;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if windows_fallback_exists(name) {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(windows)]
+fn windows_player_path(name: &str) -> Option<String> {
+    let candidates: Vec<PathBuf> = match name {
+        "vlc" => vec![
+            PathBuf::from(r"C:\Program Files\VideoLAN\VLC\vlc.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe"),
+        ],
+        "mpv" => {
+            let mut list = Vec::new();
+            if let Ok(local_app) = env::var("LOCALAPPDATA") {
+                let local = PathBuf::from(local_app);
+                list.push(local.join(r"Microsoft\WinGet\Links\mpv.exe"));
+                list.push(local.join(r"Programs\mpv\mpv.exe"));
+            }
+            if let Ok(user_profile) = env::var("USERPROFILE") {
+                let user = PathBuf::from(user_profile);
+                list.push(user.join(r"scoop\shims\mpv.exe"));
+                list.push(user.join(r"scoop\apps\mpv\current\mpv.exe"));
+            }
+            list.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin\mpv.exe"));
+            list
+        }
+        _ => Vec::new(),
     };
 
-    env::split_paths(&path).any(|dir| {
-        executable_exists(&dir.join(name))
-            || (cfg!(windows)
-                && (executable_exists(&dir.join(format!("{}.exe", name)))
-                    || executable_exists(&dir.join(format!("{}.cmd", name)))
-                    || executable_exists(&dir.join(format!("{}.bat", name)))))
-    })
+    for path in candidates {
+        if executable_exists(&path) {
+            return Some(path.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn windows_fallback_exists(name: &str) -> bool {
+    if windows_player_path(name).is_some() {
+        return true;
+    }
+    if name == "ani-cli" {
+        if let Ok(local_app) = env::var("LOCALAPPDATA") {
+            let local = PathBuf::from(local_app);
+            if executable_exists(&local.join(r"Microsoft\WinGet\Links\ani-cli.exe"))
+                || executable_exists(&local.join(r"Microsoft\WinGet\Links\ani-cli.cmd"))
+            {
+                return true;
+            }
+        }
+        if let Ok(user_profile) = env::var("USERPROFILE") {
+            let user = PathBuf::from(user_profile);
+            if executable_exists(&user.join(r"scoop\shims\ani-cli.cmd"))
+                || executable_exists(&user.join(r"scoop\shims\ani-cli.exe"))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn executable_exists(path: &Path) -> bool {
@@ -318,10 +397,29 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     // frame-perfect subtitle synchronization, accurate resolution, and sub-100ms launch.
     if let Some(ref direct_url) = opts.stream_url {
         if !direct_url.is_empty() {
+            #[cfg(windows)]
+            let mut cmd = Command::new(&player);
+            #[cfg(not(windows))]
             let mut cmd = Command::new(&wrapper_path);
             cmd.arg("--referrer=https://zokoanime.video/");
             cmd.arg("--input-terminal=no");
             cmd.arg(format!("--force-media-title={} Episode {}", opts.title, opts.episode));
+
+            #[cfg(windows)]
+            {
+                if let Some(ref url) = opts.sub_url {
+                    if !url.is_empty() {
+                        cmd.arg(format!("--sub-file={}", url));
+                        cmd.arg("--sub-visibility=yes");
+                        cmd.arg("--sub-auto=fuzzy");
+                    }
+                }
+                if opts.dub {
+                    cmd.arg("--alang=en,eng,English");
+                } else {
+                    cmd.arg("--alang=ja,jpn,Japanese");
+                }
+            }
 
             let mut current_paths = match env::var_os("PATH") {
                 Some(val) => env::split_paths(&val).collect::<Vec<_>>(),

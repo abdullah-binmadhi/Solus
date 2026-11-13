@@ -11,7 +11,7 @@ use ratatui::{
 use crate::{config, state::AppState};
 
 pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config) {
-    let area = centered_rect(66, 64, frame.area());
+    let area = centered_rect(76, 70, frame.area());
     frame.render_widget(Clear, area);
 
     let block = Block::default()
@@ -56,47 +56,78 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
     );
 
     let preferred = cfg.player.as_str();
-    let lines = vec![
+    let mut lines = vec![
         status_line("ani-cli", state.has_ani_cli, "Required for search + stream handoff"),
         status_line("mpv", state.has_mpv, "Default playback engine"),
-        status_line("iina", state.has_iina, "macOS-native player option"),
-        status_line("vlc", state.has_vlc, "Cross-platform fallback player"),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                " Preferred ",
-                Style::default().fg(Color::Black).bg(Color::Rgb(235, 235, 235)),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                preferred,
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(60, 0, 100))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
     ];
+    if cfg!(target_os = "macos") {
+        lines.push(status_line("iina", state.has_iina, "macOS-native player option"));
+    }
+    lines.push(status_line("vlc", state.has_vlc, "Cross-platform fallback player"));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            " Preferred ",
+            Style::default().fg(Color::Black).bg(Color::Rgb(235, 235, 235)),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            preferred,
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(60, 0, 100))
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
     frame.render_widget(
         Paragraph::new(lines),
         rows[1],
     );
 
+    #[cfg(target_os = "macos")]
     let suggestions = Paragraph::new(vec![
         Line::from(Span::styled(
-            "Recommended macOS setup",
+            "Recommended macOS setup (Homebrew)",
             Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "brew install curl grep aria2 ffmpeg git fzf yt-dlp",
+            "brew install mpv ani-cli && brew install --cask iina vlc",
             Style::default().fg(Color::Rgb(205, 205, 215)),
         )),
         Line::from(Span::styled(
-            "brew install --cask iina",
+            "Press 'r' to refresh dependency checks after installing.",
+            Style::default().fg(Color::Rgb(150, 150, 170)),
+        )),
+    ]);
+
+    #[cfg(target_os = "windows")]
+    let suggestions = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Recommended Windows setup (PowerShell winget)",
+            Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            r#""shinchiro.mpv", "VideoLAN.VLC", "pystardust.ani-cli" | ForEach-Object { winget install --id $_ -e }"#,
             Style::default().fg(Color::Rgb(205, 205, 215)),
         )),
         Line::from(Span::styled(
-            "ani-cli must also be installed and available in PATH.",
+            "Restart terminal, then press 'r' to refresh checks.",
+            Style::default().fg(Color::Rgb(150, 150, 170)),
+        )),
+    ]);
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let suggestions = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Recommended Linux setup",
+            Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "sudo apt install -y mpv vlc  (or pacman -S mpv vlc)",
+            Style::default().fg(Color::Rgb(205, 205, 215)),
+        )),
+        Line::from(Span::styled(
+            "Press 'r' to refresh dependency checks after installing.",
             Style::default().fg(Color::Rgb(150, 150, 170)),
         )),
     ]);
