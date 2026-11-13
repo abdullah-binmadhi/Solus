@@ -11,8 +11,38 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc::Sender;
+
+#[cfg(unix)]
+type IpcStream = tokio::net::UnixStream;
+
+#[cfg(windows)]
+type IpcStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+#[cfg(not(any(unix, windows)))]
+type IpcStream = tokio::io::DuplexStream;
+
+async fn connect_ipc(sock_path: &str) -> Option<IpcStream> {
+    #[cfg(unix)]
+    {
+        if Path::new(sock_path).exists() {
+            tokio::net::UnixStream::connect(sock_path).await.ok()
+        } else {
+            None
+        }
+    }
+    #[cfg(windows)]
+    {
+        tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(sock_path)
+            .ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = sock_path;
+        None
+    }
+}
 
 /// Configuration for launching an mpv IPC monitoring session.
 pub struct IpcMonitorConfig {
@@ -83,15 +113,13 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
         auto_skip_intro,
     } = config;
 
-    // Retry connecting to the socket for up to 5 seconds
+    // Retry connecting to the socket / named pipe for up to 5 seconds
     let mut stream = None;
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if Path::new(&sock_path).exists() {
-            if let Ok(s) = UnixStream::connect(&sock_path).await {
-                stream = Some(s);
-                break;
-            }
+        if let Some(s) = connect_ipc(&sock_path).await {
+            stream = Some(s);
+            break;
         }
     }
 
@@ -99,12 +127,13 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
         Some(s) => s,
         None => {
             // Clean up socket file if left behind
+            #[cfg(unix)]
             let _ = std::fs::remove_file(&sock_path);
             return;
         }
     };
 
-    let (reader_half, mut writer_half) = stream.into_split();
+    let (reader_half, mut writer_half) = tokio::io::split(stream);
 
     // Subscribe to time-pos and duration property changes
     let observe_cmds = [
@@ -253,6 +282,7 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
     }
 
     // Clean up socket file
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&sock_path);
 }
 

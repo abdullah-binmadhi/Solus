@@ -9,10 +9,19 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+
+#[cfg(unix)]
+type IpcStream = tokio::net::UnixStream;
+
+#[cfg(windows)]
+type IpcStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+#[cfg(not(any(unix, windows)))]
+type IpcStream = tokio::io::DuplexStream;
 
 /// Individual subtitle track representation for the mobile companion.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,44 +156,81 @@ pub fn generate_terminal_qr(url: &str) -> Option<String> {
     Some(qr_str)
 }
 
-/// Locates the active mpv IPC Unix domain socket, checking preferred paths and active /tmp sockets.
+/// Locates the active mpv IPC Unix domain socket or Windows named pipe, checking preferred paths and active /tmp sockets.
 pub async fn resolve_active_socket(preferred: &str) -> Option<String> {
-    // 1. Direct path check
-    if std::path::Path::new(preferred).exists() {
-        return Some(preferred.to_string());
+    #[cfg(unix)]
+    {
+        // 1. Direct path check
+        if std::path::Path::new(preferred).exists() {
+            return Some(preferred.to_string());
+        }
+
+        // 2. Canonical symlink check
+        if std::path::Path::new("/tmp/solus-mpv.sock").exists() {
+            return Some("/tmp/solus-mpv.sock".to_string());
+        }
+
+        // 3. Scan /tmp for any active solus-mpv-*.sock files (newest by modified time)
+        if let Ok(entries) = std::fs::read_dir("/tmp") {
+            let mut socks: Vec<(std::time::SystemTime, String)> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.starts_with("solus-mpv") && name.ends_with(".sock")
+                })
+                .filter_map(|e| {
+                    let meta = e.metadata().ok()?;
+                    let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    Some((modified, e.path().to_string_lossy().to_string()))
+                })
+                .collect();
+
+            socks.sort_by_key(|a| std::cmp::Reverse(a.0));
+            if let Some((_, path)) = socks.first() {
+                return Some(path.clone());
+            }
+        }
+
+        None
     }
-
-    // 2. Canonical symlink check
-    if std::path::Path::new("/tmp/solus-mpv.sock").exists() {
-        return Some("/tmp/solus-mpv.sock".to_string());
-    }
-
-    // 3. Scan /tmp for any active solus-mpv-*.sock files (newest by modified time)
-    if let Ok(entries) = std::fs::read_dir("/tmp") {
-        let mut socks: Vec<(std::time::SystemTime, String)> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                name.starts_with("solus-mpv") && name.ends_with(".sock")
-            })
-            .filter_map(|e| {
-                let meta = e.metadata().ok()?;
-                let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                Some((modified, e.path().to_string_lossy().to_string()))
-            })
-            .collect();
-
-        socks.sort_by_key(|a| std::cmp::Reverse(a.0));
-        if let Some((_, path)) = socks.first() {
-            return Some(path.clone());
+    #[cfg(windows)]
+    {
+        if !preferred.is_empty() {
+            Some(preferred.to_string())
+        } else {
+            Some(r"\\.\pipe\solus-mpv".to_string())
         }
     }
-
-    None
+    #[cfg(not(any(unix, windows)))]
+    {
+        if !preferred.is_empty() {
+            Some(preferred.to_string())
+        } else {
+            None
+        }
+    }
 }
 
-/// Persistent connection cache for mpv Unix socket IPC.
-static CACHED_IPC: Mutex<Option<(String, UnixStream)>> = Mutex::const_new(None);
+async fn connect_remote_ipc(target_sock: &str) -> Option<IpcStream> {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(target_sock).await.ok()
+    }
+    #[cfg(windows)]
+    {
+        tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(target_sock)
+            .ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = target_sock;
+        None
+    }
+}
+
+/// Persistent connection cache for mpv socket / named pipe IPC.
+static CACHED_IPC: Mutex<Option<(String, IpcStream)>> = Mutex::const_new(None);
 
 /// Global broadcast channel for streaming state changes to all connected WebSockets.
 static BROADCAST_CHANNEL: std::sync::OnceLock<broadcast::Sender<String>> = std::sync::OnceLock::new();
@@ -205,7 +251,7 @@ pub async fn broadcast_state(state: &Arc<RwLock<RemotePlaybackState>>) {
     }
 }
 
-/// Dispatches an mpv JSON-RPC command over the persistent Unix domain socket connection.
+/// Dispatches an mpv JSON-RPC command over the persistent Unix domain socket or Windows named pipe connection.
 pub async fn send_mpv_json_command(preferred_sock: &str, cmd_value: serde_json::Value) -> bool {
     let target_sock = match resolve_active_socket(preferred_sock).await {
         Some(s) => s,
@@ -226,7 +272,7 @@ pub async fn send_mpv_json_command(preferred_sock: &str, cmd_value: serde_json::
     }
 
     // Connect fresh stream
-    if let Ok(mut stream) = UnixStream::connect(&target_sock).await {
+    if let Some(mut stream) = connect_remote_ipc(&target_sock).await {
         let ok = stream.write_all(payload.as_bytes()).await.is_ok() && stream.flush().await.is_ok();
         *guard = Some((target_sock, stream));
         return ok;

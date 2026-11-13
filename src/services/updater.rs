@@ -74,10 +74,13 @@ pub fn target_asset_name() -> &'static str {
     { "solus-macos-x86_64" }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     { "solus-linux-x86_64" }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    { "solus-windows-x86_64.exe" }
     #[cfg(not(any(
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "windows", target_arch = "x86_64"),
     )))]
     { "solus" }
 }

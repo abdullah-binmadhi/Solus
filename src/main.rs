@@ -137,10 +137,17 @@ async fn main() -> anyhow::Result<()> {
     // ── Local LAN Mobile Remote Companion ─────────────────────────────────────
     let remote_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if cfg.remote.enabled {
+        #[cfg(unix)]
+        let default_sock = "/tmp/solus-mpv.sock".to_string();
+        #[cfg(windows)]
+        let default_sock = r"\\.\pipe\solus-mpv".to_string();
+        #[cfg(not(any(unix, windows)))]
+        let default_sock = "solus-mpv.sock".to_string();
+
         services::remote::spawn_remote_server(
             cfg.remote.port,
             state.remote_state.clone(),
-            "/tmp/solus-mpv.sock".to_string(),
+            default_sock,
             remote_shutdown.clone(),
             Some(tx.clone()),
         );
@@ -148,8 +155,11 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Image picker (after alternate screen, before event loop) ──────────────
     // guess_protocol() probes the terminal — must happen after EnterAlternateScreen.
+    #[cfg(unix)]
     let mut picker = ratatui_image::picker::Picker::from_termios()
         .unwrap_or_else(|_| ratatui_image::picker::Picker::new((9, 18)));
+    #[cfg(not(unix))]
+    let mut picker = ratatui_image::picker::Picker::new((9, 18));
     picker.guess_protocol();
     if std::env::var("KITTY_WINDOW_ID").is_ok()
         || std::env::var("TERM").map(|t| t.contains("kitty")).unwrap_or(false)
@@ -251,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         services::remote::broadcast_state(&remote_state_done).await;
                     });
+                    #[cfg(unix)]
                     let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
                     if state.screen == Screen::Playback {
                         state.screen = Screen::Detail;
@@ -2179,6 +2190,8 @@ async fn execute_hub_action(
             let _ = std::process::Command::new("open").arg(&url).spawn();
             #[cfg(target_os = "linux")]
             let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            #[cfg(target_os = "windows")]
+            let _ = std::process::Command::new("cmd").args(["/C", "start", &url]).spawn();
             state.show_toast(format!("Opened {}", url), unix_now());
         }
         RemoteToggleServer => {
@@ -2546,10 +2559,17 @@ async fn handle_remote_modal(
             let _ = std::process::Command::new("open").arg(&url).spawn();
             #[cfg(target_os = "linux")]
             let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            #[cfg(target_os = "windows")]
+            let _ = std::process::Command::new("cmd").args(["/C", "start", &url]).spawn();
             state.show_toast(format!("Opened {}", url), unix_now());
         }
         KeyCode::Char(' ') => {
+            #[cfg(unix)]
             services::remote::send_mpv_command("/tmp/solus-mpv.sock", &["cycle", "pause"]).await;
+            #[cfg(windows)]
+            services::remote::send_mpv_command(r"\\.\pipe\solus-mpv", &["cycle", "pause"]).await;
+            #[cfg(not(any(unix, windows)))]
+            services::remote::send_mpv_command("solus-mpv.sock", &["cycle", "pause"]).await;
         }
         _ => {}
     }
@@ -3143,13 +3163,21 @@ async fn start_playback(
         }
     }
 
-    // 3. Connect Solus to mpv via IPC socket
-    let sock_path = format!("/tmp/solus-mpv-{}-{}.sock", anime_id, episode);
-    let _ = std::fs::remove_file(&sock_path);
-    opts.ipc_socket = Some(sock_path.clone());
-    let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
+    // 3. Connect Solus to mpv via IPC socket / named pipe
     #[cfg(unix)]
-    let _ = std::os::unix::fs::symlink(&sock_path, "/tmp/solus-mpv.sock");
+    let sock_path = format!("/tmp/solus-mpv-{}-{}.sock", anime_id, episode);
+    #[cfg(windows)]
+    let sock_path = format!(r"\\.\pipe\solus-mpv-{}-{}", anime_id, episode);
+    #[cfg(not(any(unix, windows)))]
+    let sock_path = format!("solus-mpv-{}-{}.sock", anime_id, episode);
+
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
+        let _ = std::os::unix::fs::symlink(&sock_path, "/tmp/solus-mpv.sock");
+    }
+    opts.ipc_socket = Some(sock_path.clone());
 
     // Initialize remote companion state immediately
     let remote_state_init = state.remote_state.clone();
