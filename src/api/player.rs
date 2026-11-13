@@ -428,6 +428,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| env::temp_dir().join("solus-bin"));
+    #[cfg(not(windows))]
     let wrapper_name = wrapper_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
