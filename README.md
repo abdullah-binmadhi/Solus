@@ -68,6 +68,8 @@ Open your regular Mac Terminal app and paste:
 ```bash
 brew install --cask kitty && brew install mpv ani-cli
 ```
+*(To install all supported players—`mpv`, `IINA`, and `VLC`: `brew install mpv && brew install --cask iina vlc`)*
+
 *(If you do not have Homebrew installed yet, copy-paste this first: `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`)*
 
 #### Step 2: Install Solus
@@ -92,18 +94,24 @@ Open your terminal and paste the command for your distribution:
 
 **Ubuntu / Debian / Mint**:
 ```bash
-sudo apt update && sudo apt install -y kitty mpv ffmpeg curl git fzf yt-dlp
+sudo apt update && sudo apt install -y kitty mpv vlc ffmpeg curl git fzf yt-dlp
 git clone https://github.com/pystardust/ani-cli.git && sudo cp ani-cli/ani-cli /usr/local/bin/
 ```
 
 **Arch Linux / Manjaro**:
 ```bash
-sudo pacman -S kitty mpv ani-cli ffmpeg yt-dlp
+sudo pacman -S --needed kitty mpv vlc ani-cli ffmpeg yt-dlp
 ```
 
 **Fedora**:
 ```bash
-sudo dnf install kitty mpv ffmpeg curl git fzf yt-dlp
+sudo dnf install -y kitty mpv vlc ffmpeg curl git fzf yt-dlp
+git clone https://github.com/pystardust/ani-cli.git && sudo cp ani-cli/ani-cli /usr/local/bin/
+```
+
+**openSUSE**:
+```bash
+sudo zypper install -y kitty mpv vlc ffmpeg curl git fzf yt-dlp
 git clone https://github.com/pystardust/ani-cli.git && sudo cp ani-cli/ani-cli /usr/local/bin/
 ```
 
@@ -125,13 +133,21 @@ solus
 
 On Windows, **WezTerm** brings full picture support so anime covers and episode preview stills look clean and sharp right out of the box.
 
-#### Step 1: Install WezTerm, Video Player & Tools
-Open **PowerShell** (search "PowerShell" in your Windows Start Menu) and paste this single setup command:
+#### Step 1: Install WezTerm, Video Players & Tools
+Open **PowerShell** (search "PowerShell" in your Start Menu) and choose either option:
+
+**Option A (Recommended — using `winget` built into Windows 10 & 11)**:
+```powershell
+winget install --id wez.wezterm -e --accept-package-agreements
+"shinchiro.mpv", "VideoLAN.VLC", "pystardust.ani-cli" | ForEach-Object { winget install --id $_ -e --accept-package-agreements --accept-source-agreements }
+```
+
+**Option B (Using Scoop)**:
 ```powershell
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 iwr -useb get.scoop.sh | iex
 scoop bucket add extras
-scoop install wezterm mpv ani-cli git yt-dlp
+scoop install wezterm mpv vlc ani-cli git yt-dlp
 ```
 
 #### Step 2: Install Solus
@@ -146,6 +162,81 @@ Open **WezTerm** from your Start Menu and type:
 ```bash
 solus
 ```
+
+---
+
+## ❖ Media Player Installation Guide (All Platforms)
+
+Solus is engine-agnostic and supports multiple media player backends. You can switch your preferred player at any time in `~/.config/solus/config.toml` (`player = "mpv"` | `"iina"` | `"vlc"`):
+
+| Player | Platform | Support Level | Features |
+| :--- | :--- | :--- | :--- |
+| **`mpv`** | macOS, Linux, Windows | **Recommended Default** | Full JSON-RPC IPC, Anime4K GLSL shader pipeline, multi-audio switching, custom typography presets, mobile touch remote sync. |
+| **`iina`** | macOS only | Full Support | Native AppKit GUI with mpv IPC backend, Picture-in-Picture, trackpad gestures. |
+| **`vlc`** | macOS, Linux, Windows | Supported | Universal codec playback fallback, hardware acceleration, classic cross-platform stability. |
+
+### Single-Command Installation by Operating System
+
+#### macOS (Homebrew)
+- **Install All Players (`mpv` + `IINA` + `VLC`)**:
+  ```bash
+  brew install mpv && brew install --cask iina vlc
+  ```
+- **Install Individual Players**:
+  ```bash
+  brew install mpv            # mpv (default)
+  brew install --cask iina     # IINA (macOS native)
+  brew install --cask vlc      # VLC
+  ```
+
+#### Windows (PowerShell)
+- **Install All Players (`mpv` + `VLC` + `ani-cli`) via `winget` (Built into Windows 10/11)**:
+  ```powershell
+  "shinchiro.mpv", "VideoLAN.VLC", "pystardust.ani-cli" | ForEach-Object { winget install --id $_ -e --accept-package-agreements --accept-source-agreements }
+  ```
+- **Install All Players only (`mpv` + `VLC`) via `winget`**:
+  ```powershell
+  winget install --id shinchiro.mpv -e --accept-package-agreements; winget install --id VideoLAN.VLC -e --accept-package-agreements
+  ```
+- **Install All Players via Scoop**:
+  ```powershell
+  scoop install mpv vlc ani-cli
+  ```
+- **Install All Players via Chocolatey** *(Run PowerShell as Admin)*:
+  ```powershell
+  choco install mpv vlc -y
+  ```
+- **Install Individual Players (`winget`)**:
+  ```powershell
+  winget install shinchiro.mpv    # mpv (default)
+  winget install VideoLAN.VLC     # VLC
+  ```
+
+#### Linux Distributions
+- **Ubuntu / Debian / Linux Mint (`apt`)**:
+  - Install all players:
+    ```bash
+    sudo apt update && sudo apt install -y mpv vlc
+    ```
+  - Individual: `sudo apt install -y mpv` or `sudo apt install -y vlc`
+- **Arch Linux / Manjaro (`pacman`)**:
+  - Install all players:
+    ```bash
+    sudo pacman -S --needed mpv vlc
+    ```
+  - Individual: `sudo pacman -S mpv` or `sudo pacman -S vlc`
+- **Fedora (`dnf`)**:
+  - Install all players:
+    ```bash
+    sudo dnf install -y mpv vlc
+    ```
+  - Individual: `sudo dnf install -y mpv` or `sudo dnf install -y vlc`
+- **openSUSE (`zypper`)**:
+  - Install all players:
+    ```bash
+    sudo zypper install -y mpv vlc
+    ```
+  - Individual: `sudo zypper install -y mpv` or `sudo zypper install -y vlc`
 
 ---
 
