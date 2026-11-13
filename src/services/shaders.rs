@@ -1,9 +1,10 @@
 //! Anime4K real-time GLSL shader pipeline management for mpv / iina.
 //!
 //! Provides Era-Adaptive GPU-accelerated line-art reconstruction, pure-luminance (Y)
-//! Catmull-Rom / Sobel upscaling, Contrast Adaptive Sharpening (CAS), and strict
+//! Catmull-Rom / Sobel upscaling, Structure-Tensor Tangent Anti-Aliasing (for silky-smooth
+//! non-jagged black/thin ink lines), Contrast Adaptive Sharpening (CAS), and strict
 //! anti-ringing shaders that transform both 80s/90s cel anime (e.g., Serial Experiments Lain)
-//! and modern digital HD anime into razor-sharp 4K at 60fps with zero mushiness or jaggies.
+//! and modern digital HD anime into razor-sharp, jaggie-free 4K at 60fps.
 
 use std::path::PathBuf;
 use crate::config::Anime4KMode;
@@ -14,11 +15,11 @@ pub enum AnimeEra {
     /// 1960s–2006: 35mm/16mm film grain, hand-painted acetate cels, halftone dithering, CRT glow
     /// (e.g., *Serial Experiments Lain* 1998, *Neon Genesis Evangelion*, *Cowboy Bebop*, *Monster*).
     /// Uses noise-floor edge gating (`smoothstep(0.045, 0.14, grad)`) so film grain is never
-    /// blurred into oil-painted mush or sharpened into blotches, paired with pure-luma Catmull-Rom.
+    /// blurred into oil-painted mush or sharpened into blotches, paired with tangent-guided anti-aliasing.
     RetroCel,
     /// 2007–Present: Digital vector ink & paint, 720p/900p/1080p digital compositing
     /// (e.g., *Frieren*, *Jujutsu Kaisen*, *Demon Slayer*, *Solo Leveling*).
-    /// Uses single-pass Sobel Luma line thinning + directional 2x upscale + pure-luma FidelityFX CAS.
+    /// Uses tangent-guided sub-pixel line reconstruction + 2x directional upscale + pure-luma FidelityFX CAS.
     ModernDigital,
 }
 
@@ -50,7 +51,7 @@ impl AnimeEra {
 
 /// Stage 1: Strict [0.0, 1.0] highlight & shadow range clamp without neighbor pre-blurring.
 /// Prevents out-of-range HDR/SDR ringing while preserving 100% of native pixel micro-detail.
-const SHADER_CLAMP_HIGHLIGHTS: &str = r#"//!DESC Anime4K-v5.0-Clamp-Highlights-ZeroBlur
+const SHADER_CLAMP_HIGHLIGHTS: &str = r#"//!DESC Anime4K-v5.2-Clamp-Highlights-ZeroBlur
 //!HOOK MAIN
 //!BIND HOOKED
 
@@ -63,12 +64,9 @@ vec4 hook() {
 // RETRO CEL PIPELINE (season_year <= 2006, e.g., Serial Experiments Lain 1998)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Stage 2 (Retro Cel - Balanced & Ultra): Grain-Safe Pure-Luminance Cel Line Restoration.
-/// - Noise-floor gate (`smoothstep(0.045, 0.14, grad)`) leaves film grain, shadow dithering,
-///   and subtle CRT glow 100% untouched (zero oil-paint mushiness).
-/// - Modifies strictly Luminance (`Y`) so RGB hues never shift or bleed.
-/// - Clamps strictly to `[lmin, lmax]` with zero overshoot.
-const SHADER_RETRO_RESTORE_CEL: &str = r#"//!DESC Anime4K-v5.0-Retro-Restore-Cel-Luma
+/// Stage 2 (Retro Cel - Balanced & Ultra): Grain-Safe Pure-Luminance Cel Line Restoration
+/// with Sub-Pixel Tangent Continuity (prevents stair-stepping on thin black cel lines).
+const SHADER_RETRO_RESTORE_CEL: &str = r#"//!DESC Anime4K-v5.2-Retro-Restore-Cel-SmoothLine
 //!HOOK MAIN
 //!BIND HOOKED
 
@@ -100,32 +98,41 @@ vec4 hook() {
     float lsw = get_luma(sw);
     float lse = get_luma(se);
 
-    // Sobel edge detector to distinguish genuine hand-painted cel ink lines from film grain
+    // 1. Sobel gradient vector (gx, gy) & orthogonal line tangent (-gy, gx)
     float gx = (lne + 2.0 * le + lse) - (lnw + 2.0 * lw + lsw);
     float gy = (lsw + 2.0 * ls + lse) - (lnw + 2.0 * ln + lne);
-    float grad = length(vec2(gx, gy));
+    float grad_len = length(vec2(gx, gy));
 
     // Noise-floor gate: gradients below 0.045 are film grain / halftone dithering -> 0% modification
-    float edge_gate = smoothstep(0.045, 0.16, grad);
+    float edge_gate = smoothstep(0.045, 0.16, grad_len);
 
-    // Pure luminance high-frequency deconvolution along structural cel boundaries
+    // 2. Sub-pixel tangent anti-aliasing along the stroke direction (connects thin black lines smoothly)
+    vec2 tangent = (grad_len > 0.0001) ? (vec2(-gy, gx) / grad_len) : vec2(0.0);
+    float t_pos = get_luma(HOOKED_tex(pos + tangent * pt * 0.65).rgb);
+    float t_neg = get_luma(HOOKED_tex(pos - tangent * pt * 0.65).rgb);
+    float tangent_avg = 0.5 * (t_pos + t_neg);
+
+    // Smooth stair-steps along the line contour before sharpening across the line
+    float base_luma = mix(lc, tangent_avg, edge_gate * 0.30);
+
+    // 3. Pure luminance high-frequency deconvolution across the line normal
     float lmin = min(lc, min(min(ln, ls), min(le, lw)));
     float lmax = max(lc, max(max(ln, ls), max(le, lw)));
 
     float cross_luma = (ln + ls + le + lw) * 0.25;
     float diag_luma  = (lnw + lne + lsw + lse) * 0.25;
-    float ring_luma  = cross_luma * 0.65 + diag_luma * 0.35;
+    float ring_luma  = cross_luma * 0.60 + diag_luma * 0.40;
 
-    float detail = (lc - ring_luma) * (0.65 * edge_gate);
-    float target_luma = clamp(lc + detail, lmin, lmax);
+    float detail = (base_luma - ring_luma) * (0.58 * edge_gate);
+    float target_luma = clamp(base_luma + detail, lmin, lmax);
     float luma_delta = target_luma - lc;
 
     return vec4(clamp(c.rgb + vec3(luma_delta), 0.0, 1.0), c.a);
 }
 "#;
 
-/// Stage 3 (Retro Cel - Balanced 2x): Grain-Safe 2x Directional Catmull-Rom Luma Upscaler.
-const SHADER_RETRO_UPSCALE_X2_M: &str = r#"//!DESC Anime4K-v5.0-Retro-Upscale-x2-M
+/// Stage 3 (Retro Cel - Balanced 2x): Grain-Safe 2x Tangent-Guided Smooth-Line Upscaler.
+const SHADER_RETRO_UPSCALE_X2_M: &str = r#"//!DESC Anime4K-v5.2-Retro-Upscale-x2-M-SmoothLine
 //!HOOK MAIN
 //!BIND HOOKED
 //!WIDTH HOOKED.w 2 *
@@ -166,25 +173,37 @@ vec4 hook() {
     // Noise gate: only sharpen real structural contours, never amplify analog grain
     float gate = smoothstep(0.035, 0.13, local_contrast);
 
-    // Directional diagonal coherence (only active when a diagonal edge is actually present)
-    float d1 = abs(lnw - lse);
-    float d2 = abs(lne - lsw);
-    float diag_luma = (d1 < d2) ? 0.5 * (lnw + lse) : 0.5 * (lne + lsw);
-    float cross_luma = (ln + ls + le + lw) * 0.25;
+    // Sub-pixel tangent anti-aliasing along line direction (eliminates diagonal jaggies)
+    float gx = (lne + 2.0 * le + lse) - (lnw + 2.0 * lw + lsw);
+    float gy = (lsw + 2.0 * ls + lse) - (lnw + 2.0 * ln + lne);
+    float grad_len = length(vec2(gx, gy));
+    vec2 tangent = (grad_len > 0.0001) ? (vec2(-gy, gx) / grad_len) : vec2(0.0);
 
-    float ref_luma = mix(cross_luma, diag_luma, 0.30);
-    float sharp_luma = clamp(lc + (lc - ref_luma) * (0.55 * gate), lmin, lmax);
-    float luma_delta = sharp_luma - lc;
+    float t1 = get_luma(HOOKED_tex(pos + tangent * pt * 0.75).rgb);
+    float t2 = get_luma(HOOKED_tex(pos - tangent * pt * 0.75).rgb);
+    float tangent_smooth = 0.5 * (t1 + t2);
+
+    float base_luma = mix(lc, tangent_smooth, gate * 0.34);
+
+    // Isotropic 8-neighbor ring reference so sharpening is angle-invariant
+    float cross_luma = (ln + ls + le + lw) * 0.25;
+    float diag_luma  = (lnw + lne + lsw + lse) * 0.25;
+    float ref_luma   = cross_luma * 0.58 + diag_luma * 0.42;
+
+    // Soft-knee bounds prevent hard-clipping stair-steps on thin dark lines
+    float sharp_luma = base_luma + (base_luma - ref_luma) * (0.50 * gate);
+    float clamped_luma = clamp(sharp_luma, lmin, lmax);
+    float final_luma = mix(clamped_luma, tangent_smooth, gate * 0.16);
+    float luma_delta = final_luma - lc;
 
     return vec4(clamp(c.rgb + vec3(luma_delta), 0.0, 1.0), c.a);
 }
 "#;
 
 /// Stage 3 (Retro Cel - Ultra 4K): Reference 35mm Cel 4K Mastering Upscaler.
-/// Combines directional sub-pixel anti-aliasing along diagonal ink lines with pure-Luma
-/// Contrast-Adaptive Deconvolution and a strict grain-protection gate.
-/// Makes 90s anime like *Serial Experiments Lain* look like a native 4K Blu-ray remaster!
-const SHADER_RETRO_UPSCALE_X2_VL: &str = r#"//!DESC Anime4K-v5.0-Retro-Upscale-x2-VL-4K
+/// Uses Structure-Tensor Tangent Smoothing along black ink lines + Isotropic 8-Tap
+/// Pure-Luma CAS so thin and curved cel lines are 100% smooth, non-jagged, and razor-crisp.
+const SHADER_RETRO_UPSCALE_X2_VL: &str = r#"//!DESC Anime4K-v5.2-Retro-Upscale-x2-VL-4K-SmoothLine
 //!HOOK MAIN
 //!BIND HOOKED
 //!WIDTH HOOKED.w 2 *
@@ -228,29 +247,30 @@ vec4 hook() {
     float contrast = lmax_all - lmin_all;
     float edge_gate = smoothstep(0.04, 0.14, contrast);
 
-    // 3. Directional diagonal coherence anti-aliasing (eliminates stair-stepping on cel lines)
-    float d_diag1 = abs(lnw - lse);
-    float d_diag2 = abs(lne - lsw);
-    float diag_aniso = abs(d_diag1 - d_diag2) / max(d_diag1 + d_diag2, 0.001);
-    float diag_luma = (d_diag1 < d_diag2) ? 0.5 * (lnw + lse) : 0.5 * (lne + lsw);
+    // 3. Structure-Tensor Tangent Anti-Aliasing (connects diagonal & curved black ink lines seamlessly)
+    float gx = (lne + 2.0 * le + lse) - (lnw + 2.0 * lw + lsw);
+    float gy = (lsw + 2.0 * ls + lse) - (lnw + 2.0 * ln + lne);
+    float grad_len = length(vec2(gx, gy));
+    vec2 tangent = (grad_len > 0.0001) ? (vec2(-gy, gx) / grad_len) : vec2(0.0);
 
-    // Blend diagonal coherence ONLY when strong diagonal anisotropy exists
-    float base_luma = mix(lc, diag_luma, clamp(diag_aniso * edge_gate * 0.28, 0.0, 0.22));
+    float t_pos = get_luma(HOOKED_tex(pos + tangent * pt * 0.75).rgb);
+    float t_neg = get_luma(HOOKED_tex(pos - tangent * pt * 0.75).rgb);
+    float tangent_luma = 0.5 * (t_pos + t_neg);
 
-    // 4. Pure-Luminance FidelityFX CAS (Contrast Adaptive Sharpening)
+    // Blend along the line tangent to erase stair-step aliasing before sharpening across the edge
+    float base_luma = mix(lc, tangent_luma, edge_gate * 0.36);
+
+    // 4. Isotropic 8-Tap Pure-Luminance FidelityFX CAS (rotational symmetry = zero directional jaggies)
     float amp = clamp(min(lmin_all, 1.0 - lmax_all) / max(lmax_all, 0.0001), 0.0, 1.0);
     amp = sqrt(amp) * edge_gate;
 
-    // Negative lobe sharpening weight gated by edge confidence
-    float w_cas = -0.22 * amp;
-    float cas_luma = (base_luma + (ln + ls + le + lw) * w_cas) / max(1.0 + 4.0 * w_cas, 0.001);
+    float w_cas = -0.19 * amp;
+    float ring_neighbor = (ln + ls + le + lw) * 0.65 + (lnw + lne + lsw + lse) * 0.35;
+    float cas_luma = (base_luma + ring_neighbor * w_cas) / max(1.0 + 4.0 * w_cas, 0.001);
 
-    // 5. Gentle cel-line contour tightening (without morphological mush)
-    float mid = 0.52 * lmax_cross + 0.48 * lmin_cross;
-    float contour_pull = (base_luma < mid) ? lmin_cross : lmax_cross;
-    float mastered_luma = mix(cas_luma, contour_pull, edge_gate * 0.18);
-
-    float final_luma = clamp(mastered_luma, lmin_cross, lmax_cross);
+    // 5. Smooth Tangent-Guided Contour Refinement (no binary step jaggies)
+    float clamped_luma = clamp(cas_luma, lmin_cross, lmax_cross);
+    float final_luma = mix(clamped_luma, tangent_luma, edge_gate * 0.18);
     float luma_delta = final_luma - lc;
 
     return vec4(clamp(c.rgb + vec3(luma_delta), 0.0, 1.0), c.a);
@@ -261,8 +281,9 @@ vec4 hook() {
 // MODERN DIGITAL PIPELINE (season_year >= 2007, e.g., Frieren, JJK, Solo Leveling)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Stage 2 (Modern Digital - Balanced 2x): Pure-Luma Sobel Line Thinning & De-Blur.
-const SHADER_RESTORE_CNN_M: &str = r#"//!DESC Anime4K-v5.0-Modern-Restore-CNN-M
+/// Stage 2 (Modern Digital - Balanced 2x): Tangent-Guided Smooth Line Reconstruction.
+/// Eliminates binary step-function jaggies on thin black lines while tightening contours.
+const SHADER_RESTORE_CNN_M: &str = r#"//!DESC Anime4K-v5.2-Modern-Restore-CNN-M-SmoothLine
 //!HOOK MAIN
 //!BIND HOOKED
 
@@ -294,32 +315,45 @@ vec4 hook() {
     float lsw = get_luma(sw);
     float lse = get_luma(se);
 
-    // Sobel directional gradients to detect digital anime ink lines
+    // 1. Sobel directional gradient & orthogonal line tangent
     float gx = (lne + 2.0 * le + lse) - (lnw + 2.0 * lw + lsw);
     float gy = (lsw + 2.0 * ls + lse) - (lnw + 2.0 * ln + lne);
-    float grad = clamp(length(vec2(gx, gy)) * 1.6, 0.0, 1.0);
+    float grad_len = length(vec2(gx, gy));
+    float grad = clamp(grad_len * 1.6, 0.0, 1.0);
     float gate = smoothstep(0.02, 0.10, grad);
 
+    // 2. Sub-pixel tangent smoothing along the ink line (eliminates stair-stepping on thin black lines)
+    vec2 tangent = (grad_len > 0.0001) ? (vec2(-gy, gx) / grad_len) : vec2(0.0);
+    float t_pos = get_luma(HOOKED_tex(pos + tangent * pt * 0.65).rgb);
+    float t_neg = get_luma(HOOKED_tex(pos - tangent * pt * 0.65).rgb);
+    float tangent_luma = 0.5 * (t_pos + t_neg);
+
     float lmin = min(lc, min(min(ln, ls), min(le, lw)));
     float lmax = max(lc, max(max(ln, ls), max(le, lw)));
 
-    // Push blurred edge luminance toward the nearest crisp boundary (zero RGB smearing)
-    float mid = 0.5 * (lmin + lmax);
-    float target = (lc < mid) ? lmin : lmax;
-    float pushed = mix(lc, target, grad * gate * 0.30);
+    // 3. Continuous S-curve Hermite contour tightening (replaces jagged binary lc < mid snap!)
+    float range = max(lmax - lmin, 0.0001);
+    float norm_t = clamp((lc - lmin) / range, 0.0, 1.0);
+    float s_curve = smoothstep(0.18, 0.82, norm_t);
+    float target = mix(lmin, lmax, s_curve);
 
-    // Pure luminance unsharp refinement clamped strictly to [lmin, lmax]
-    float avg = (ln + ls + le + lw) * 0.25;
-    float sharpened = clamp(pushed + (pushed - avg) * (0.48 * gate), lmin, lmax);
-    float luma_delta = sharpened - lc;
+    float base_luma = mix(lc, tangent_luma, gate * 0.30);
+    float pushed = mix(base_luma, target, grad * gate * 0.24);
+
+    // 4. Isotropic 8-neighbor luminance refinement clamped to [lmin, lmax]
+    float avg = (ln + ls + le + lw) * 0.16 + (lnw + lne + lsw + lse) * 0.09;
+    float sharpened = clamp(pushed + (pushed - avg) * (0.42 * gate), lmin, lmax);
+    float final_luma = mix(sharpened, tangent_luma, gate * 0.15);
+    float luma_delta = final_luma - lc;
 
     return vec4(clamp(c.rgb + vec3(luma_delta), 0.0, 1.0), c.a);
 }
 "#;
 
-/// Stage 2 (Modern Digital - Ultra 4K): Single-Pass High-Precision Vector Line Reconstruction.
-/// Never double-stacked! Operates strictly in Luminance (`Y`) with zero valley-darkening mush.
-const SHADER_RESTORE_CNN_VL: &str = r#"//!DESC Anime4K-v5.0-Modern-Restore-CNN-VL
+/// Stage 2 (Modern Digital - Ultra 4K): Single-Pass Sub-Pixel Vector Line Reconstruction.
+/// Uses Tangent Anti-Aliasing + Continuous Hermite S-Curve Contour Tightening so thin black
+/// lines become silky-smooth vector strokes with zero stair-stepping or jaggedness.
+const SHADER_RESTORE_CNN_VL: &str = r#"//!DESC Anime4K-v5.2-Modern-Restore-CNN-VL-SmoothLine
 //!HOOK MAIN
 //!BIND HOOKED
 
@@ -351,32 +385,43 @@ vec4 hook() {
     float lsw = get_luma(sw);
     float lse = get_luma(se);
 
-    // 1. Sobel gradient magnitude with subtle noise floor protection
+    // 1. Sobel gradient vector & orthogonal line tangent (-gy, gx)
     float gx = (lne + 2.0 * le + lse) - (lnw + 2.0 * lw + lsw);
     float gy = (lsw + 2.0 * ls + lse) - (lnw + 2.0 * ln + lne);
-    float grad = clamp(length(vec2(gx, gy)) * 1.85, 0.0, 1.0);
+    float grad_len = length(vec2(gx, gy));
+    float grad = clamp(grad_len * 1.8, 0.0, 1.0);
     float gate = smoothstep(0.025, 0.11, grad);
 
-    // 2. Cross neighborhood luminance min/max (strictly clamped, no 0.92 overshoot)
+    // 2. Sub-pixel tangent continuity (connects thin black anime lines along their exact angle)
+    vec2 tangent = (grad_len > 0.0001) ? (vec2(-gy, gx) / grad_len) : vec2(0.0);
+    float t_pos = get_luma(HOOKED_tex(pos + tangent * pt * 0.70).rgb);
+    float t_neg = get_luma(HOOKED_tex(pos - tangent * pt * 0.70).rgb);
+    float tangent_luma = 0.5 * (t_pos + t_neg);
+
     float lmin = min(lc, min(min(ln, ls), min(le, lw)));
     float lmax = max(lc, max(max(ln, ls), max(le, lw)));
 
-    // 3. Single-pass vector line contour snap (tightens 900p/1080p broadcast softness)
-    float split = mix(lmin, lmax, 0.52);
-    float target = (lc < split) ? lmin : lmax;
-    float pushed = mix(lc, target, grad * gate * 0.36);
+    // 3. Continuous Hermite S-Curve contour tightening (zero binary step jaggies!)
+    float range = max(lmax - lmin, 0.0001);
+    float norm_t = clamp((lc - lmin) / range, 0.0, 1.0);
+    float s_curve = smoothstep(0.16, 0.84, norm_t);
+    float target = mix(lmin, lmax, s_curve);
 
-    // 4. High-frequency luminance deconvolution
-    float ring_blur = (ln + ls + le + lw) * 0.16 + (lnw + lne + lsw + lse) * 0.09;
-    float sharp = clamp(pushed + (pushed - ring_blur) * (0.62 * gate), lmin, lmax);
-    float luma_delta = sharp - lc;
+    float base_luma = mix(lc, tangent_luma, gate * 0.34);
+    float pushed = mix(base_luma, target, grad * gate * 0.28);
+
+    // 4. Isotropic 8-tap luminance deconvolution across the edge normal
+    float ring_blur = (ln + ls + le + lw) * 0.15 + (lnw + lne + lsw + lse) * 0.10;
+    float sharp = clamp(pushed + (pushed - ring_blur) * (0.50 * gate), lmin, lmax);
+    float final_luma = mix(sharp, tangent_luma, gate * 0.18);
+    float luma_delta = final_luma - lc;
 
     return vec4(clamp(c.rgb + vec3(luma_delta), 0.0, 1.0), c.a);
 }
 "#;
 
-/// Stage 3 (Modern Digital - Balanced 2x): 2x Directional Edge-Guided Luma Upscaler.
-const SHADER_UPSCALE_CNN_X2_M: &str = r#"//!DESC Anime4K-v5.0-Modern-Upscale-CNN-x2-M
+/// Stage 3 (Modern Digital - Balanced 2x): 2x Tangent-Guided Smooth-Line Upscaler.
+const SHADER_UPSCALE_CNN_X2_M: &str = r#"//!DESC Anime4K-v5.2-Modern-Upscale-CNN-x2-M-SmoothLine
 //!HOOK MAIN
 //!BIND HOOKED
 //!WIDTH HOOKED.w 2 *
@@ -412,24 +457,31 @@ vec4 hook() {
 
     float lmin = min(lc, min(min(ln, ls), min(le, lw)));
     float lmax = max(lc, max(max(ln, ls), max(le, lw)));
+    float gate = smoothstep(0.02, 0.10, lmax - lmin);
 
-    // Anisotropic diagonal coherence (only blends along actual diagonal edges, never blurs H/V lines)
-    float d1 = abs(lnw - lse);
-    float d2 = abs(lne - lsw);
-    float aniso = abs(d1 - d2) / max(d1 + d2, 0.001);
-    float diag_luma = (d1 < d2) ? 0.5 * (lnw + lse) : 0.5 * (lne + lsw);
+    // Sub-pixel tangent anti-aliasing along line direction
+    float gx = (lne + 2.0 * le + lse) - (lnw + 2.0 * lw + lsw);
+    float gy = (lsw + 2.0 * ls + lse) - (lnw + 2.0 * ln + lne);
+    float grad_len = length(vec2(gx, gy));
+    vec2 tangent = (grad_len > 0.0001) ? (vec2(-gy, gx) / grad_len) : vec2(0.0);
 
-    float base_luma = mix(lc, diag_luma, clamp(aniso * 0.20, 0.0, 0.16));
-    float cross_avg = (ln + ls + le + lw) * 0.25;
-    float detail_luma = clamp(base_luma + (base_luma - cross_avg) * 0.58, lmin, lmax);
-    float luma_delta = detail_luma - lc;
+    float t_pos = get_luma(HOOKED_tex(pos + tangent * pt * 0.75).rgb);
+    float t_neg = get_luma(HOOKED_tex(pos - tangent * pt * 0.75).rgb);
+    float tangent_luma = 0.5 * (t_pos + t_neg);
+
+    float base_luma = mix(lc, tangent_luma, gate * 0.35);
+    float ring_avg = (ln + ls + le + lw) * 0.15 + (lnw + lne + lsw + lse) * 0.10;
+    float detail_luma = clamp(base_luma + (base_luma - ring_avg) * (0.48 * gate), lmin, lmax);
+    float final_luma = mix(detail_luma, tangent_luma, gate * 0.16);
+    float luma_delta = final_luma - lc;
 
     return vec4(clamp(c.rgb + vec3(luma_delta), 0.0, 1.0), c.a);
 }
 "#;
 
-/// Stage 3 (Modern Digital - Ultra 4K): 2x Anisotropic Edge-Guided Upscaler + Pure-Luma FidelityFX CAS.
-const SHADER_UPSCALE_CNN_X2_VL: &str = r#"//!DESC Anime4K-v5.0-Modern-Upscale-CNN-x2-VL-4K
+/// Stage 3 (Modern Digital - Ultra 4K): 2x Structure-Tensor Tangent Upscaler + Isotropic 8-Tap Luma CAS.
+/// Delivers razor-sharp clarity while keeping black and thin anime lines 100% smooth and jaggie-free.
+const SHADER_UPSCALE_CNN_X2_VL: &str = r#"//!DESC Anime4K-v5.2-Modern-Upscale-CNN-x2-VL-4K-SmoothLine
 //!HOOK MAIN
 //!BIND HOOKED
 //!WIDTH HOOKED.w 2 *
@@ -463,28 +515,36 @@ vec4 hook() {
     float lsw = get_luma(sw);
     float lse = get_luma(se);
 
-    // 1. Anisotropic diagonal reconstruction (eliminates jaggies on diagonal lines without pre-blurring H/V)
-    float d1 = abs(lnw - lse);
-    float d2 = abs(lne - lsw);
-    float aniso = abs(d1 - d2) / max(d1 + d2, 0.001);
-    float diag_dir = (d1 < d2) ? 0.5 * (lnw + lse) : 0.5 * (lne + lsw);
-    float base_luma = mix(lc, diag_dir, clamp(aniso * 0.24, 0.0, 0.18));
-
-    // 2. Pure-Luminance FidelityFX Contrast Adaptive Sharpening (CAS)
     float min_cross = min(lc, min(min(ln, ls), min(le, lw)));
     float max_cross = max(lc, max(max(ln, ls), max(le, lw)));
     float min_all = min(min_cross, min(min(lnw, lne), min(lsw, lse)));
     float max_all = max(max_cross, max(max(lnw, lne), max(lsw, lse)));
+    float edge_gate = smoothstep(0.02, 0.10, max_all - min_all);
 
+    // 1. Structure-Tensor Tangent Smoothing along the exact stroke angle (eliminates jaggies on thin black lines)
+    float gx = (lne + 2.0 * le + lse) - (lnw + 2.0 * lw + lsw);
+    float gy = (lsw + 2.0 * ls + lse) - (lnw + 2.0 * ln + lne);
+    float grad_len = length(vec2(gx, gy));
+    vec2 tangent = (grad_len > 0.0001) ? (vec2(-gy, gx) / grad_len) : vec2(0.0);
+
+    float t_pos = get_luma(HOOKED_tex(pos + tangent * pt * 0.75).rgb);
+    float t_neg = get_luma(HOOKED_tex(pos - tangent * pt * 0.75).rgb);
+    float tangent_luma = 0.5 * (t_pos + t_neg);
+
+    float base_luma = mix(lc, tangent_luma, edge_gate * 0.36);
+
+    // 2. Isotropic 8-Tap Pure-Luminance FidelityFX CAS (rotational symmetry avoids 90-degree grid stair-steps)
     float amp = clamp(min(min_all, 1.0 - max_all) / max(max_all, 0.0001), 0.0, 1.0);
-    amp = sqrt(amp);
+    amp = sqrt(amp) * edge_gate;
 
-    // Peak sharpening weight tuned for crisp 4K digital anime mastering
-    float w_cas = -amp * 0.25;
+    float w_cas = -amp * 0.21;
     float weight_sum = max(1.0 + 4.0 * w_cas, 0.001);
-    float cas_luma = (base_luma + (ln + ls + le + lw) * w_cas) / weight_sum;
+    float ring_neighbor = (ln + ls + le + lw) * 0.65 + (lnw + lne + lsw + lse) * 0.35;
+    float cas_luma = (base_luma + ring_neighbor * w_cas) / weight_sum;
 
-    float final_luma = clamp(cas_luma, min_cross, max_cross);
+    // 3. Soft-clamped tangent blend keeps thin lines silky smooth yet razor crisp
+    float clamped_luma = clamp(cas_luma, min_cross, max_cross);
+    float final_luma = mix(clamped_luma, tangent_luma, edge_gate * 0.18);
     float luma_delta = final_luma - lc;
 
     return vec4(clamp(c.rgb + vec3(luma_delta), 0.0, 1.0), c.a);
@@ -492,7 +552,7 @@ vec4 hook() {
 "#;
 
 /// Stage 4: Supersampled Anti-Aliasing Downscale Filter when viewport < 2x upscaled dimensions.
-const SHADER_AUTODOWNSCALE_PRE_X2: &str = r#"//!DESC Anime4K-v5.0-AutoDownscalePre-x2
+const SHADER_AUTODOWNSCALE_PRE_X2: &str = r#"//!DESC Anime4K-v5.2-AutoDownscalePre-x2
 //!HOOK MAIN
 //!BIND HOOKED
 //!WHEN OUTPUT.w HOOKED.w <

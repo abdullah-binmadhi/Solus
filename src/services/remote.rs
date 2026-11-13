@@ -290,6 +290,33 @@ pub async fn send_mpv_json_command(preferred_sock: &str, cmd_value: serde_json::
     false
 }
 
+/// Sends `quit` to the currently connected player and drops the cached IPC stream so the
+/// next command never targets a dead socket. Used for instant episode switching.
+pub async fn quit_active_player() {
+    let mut guard = CACHED_IPC.lock().await;
+    if let Some((_, ref mut stream)) = *guard {
+        let _ = stream.write_all(b"{\"command\": [\"quit\"]}\n").await;
+        let _ = stream.flush().await;
+    } else {
+        drop(guard);
+        #[cfg(unix)]
+        {
+            if let Some(sock) = resolve_active_socket("/tmp/solus-mpv.sock").await {
+                if let Some(mut st) = connect_remote_ipc(&sock).await {
+                    let _ = st.write_all(b"{\"command\": [\"quit\"]}\n").await;
+                    let _ = st.flush().await;
+                }
+            }
+        }
+        guard = CACHED_IPC.lock().await;
+    }
+    *guard = None;
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
+    }
+}
+
 /// Dispatches an mpv JSON-RPC string array command.
 pub async fn send_mpv_command(sock_path: &str, command: &[&str]) -> bool {
     let cmd_json = serde_json::json!({

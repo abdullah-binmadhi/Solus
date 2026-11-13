@@ -467,6 +467,9 @@ pub struct AppState {
     pub update_modal_phase: Option<UpdateModalPhase>,
 
     /// Last launched PlayOptions (preserved so remote episode switching reuses exact player, quality, dub/sub, provider, and subtitle language)
+    /// Monotonic playback generation; stale PlaybackDone events are ignored
+    pub playback_gen: u64,
+
     pub last_play_options: Option<crate::api::player::PlayOptions>,
 }
 
@@ -608,6 +611,7 @@ impl AppState {
             cast_playback_pos: 0.0,
             cast_playback_dur: 0.0,
             update_modal_phase: None,
+            playback_gen: 0,
             last_play_options: None,
         }
     }

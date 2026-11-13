@@ -34,7 +34,7 @@ enum AppMessage {
     /// A log line from ani-cli stdout or stderr
     PlaybackLog(String),
     /// ani-cli process exited
-    PlaybackDone,
+    PlaybackDone(u64),
     /// AniList search results
     SearchResults(Vec<db::cache::Anime>),
     /// Cover image downloaded and decoded (anime_id, image)
@@ -362,7 +362,11 @@ async fn main() -> anyhow::Result<()> {
                 AppMessage::PlaybackLog(line) => {
                     state.push_log(line);
                 }
-                AppMessage::PlaybackDone => {
+                AppMessage::PlaybackDone(gen) => {
+                    // Ignore completion events from superseded players (episode switches)
+                    if gen != state.playback_gen {
+                        continue;
+                    }
                     state.now_playing = None;
                     state.player_stop = None;
                     let remote_state_done = state.remote_state.clone();
@@ -770,6 +774,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 AppMessage::RemotePlayEpisode(ep) => {
                     if let Some(ref anime) = state.selected_anime.clone() {
+                        // Close the current episode immediately, before resolving the next stream
+                        services::remote::quit_active_player().await;
+                        state.stop_player();
                         state.selected_episode = Some(ep);
                         let title = anime.display_title().to_string();
                         let season_year = anime.season_year;
@@ -3816,7 +3823,11 @@ async fn start_playback(
     pool:    &sqlx::SqlitePool,
     cfg:     &config::Config,
 ) {
+    // Instantly shut down any previous player (incl. detached IINA) and drop its stale IPC stream
+    services::remote::quit_active_player().await;
     state.stop_player();
+    state.playback_gen = state.playback_gen.wrapping_add(1);
+    let my_gen = state.playback_gen;
     state.playback_logs.clear();
     state.now_playing = Some(format!("{} — Episode {}", title, episode));
     state.last_played = state.now_playing.clone();
@@ -4069,13 +4080,13 @@ async fn start_playback(
             status = child.wait() => {
                 let msg = format!("ani-cli exited: {:?}", status);
                 let _ = tx4.send(AppMessage::PlaybackLog(msg)).await;
-                let _ = tx4.send(AppMessage::PlaybackDone).await;
+                let _ = tx4.send(AppMessage::PlaybackDone(my_gen)).await;
             }
             _ = stop_rx       => {
                 let kill_res = child.kill().await;
                 let msg = format!("manual stop — kill result: {:?}", kill_res);
                 let _ = tx4.send(AppMessage::PlaybackLog(msg)).await;
-                let _ = tx4.send(AppMessage::PlaybackDone).await;
+                let _ = tx4.send(AppMessage::PlaybackDone(my_gen)).await;
             }
         }
     });
