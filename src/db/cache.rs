@@ -137,7 +137,11 @@ fn push_unique(values: &mut Vec<String>, candidate: String) {
 }
 
 /// Upsert a single anime into the cache.
-pub async fn upsert_anime(pool: &SqlitePool, anime: &Anime) -> Result<()> {
+/// Upsert anime record using any sqlx executor (Pool, Connection, or Transaction).
+pub async fn execute_upsert_anime<'e, E>(executor: E, anime: &Anime) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     sqlx::query(
         r#"
         INSERT INTO anime (
@@ -181,9 +185,14 @@ pub async fn upsert_anime(pool: &SqlitePool, anime: &Anime) -> Result<()> {
     .bind(anime.has_dub)
     .bind(anime.updated_at)
     .bind(anime.next_airing_episode)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
+}
+
+/// Insert or update an anime record in the cache.
+pub async fn upsert_anime(pool: &SqlitePool, anime: &Anime) -> Result<()> {
+    execute_upsert_anime(pool, anime).await
 }
 
 /// Update only airing metadata for an anime.

@@ -367,53 +367,14 @@ pub async fn load_more_like_this(
 
 // ─── Sync all + build HomeData ────────────────────────────────────────────────
 
-/// Sync every category (respecting TTLs) and return a fully populated HomeData.
-/// Called once on startup and again when the user explicitly refreshes.
-pub async fn sync_all(
-    pool:             &SqlitePool,
-    client:           &AniListClient,
-    auth:             Option<&crate::config::AuthConfig>,
-    trending_ttl:     u64,
-    stable_ttl:       u64,
-    now:              i64,
-) -> Result<HomeData> {
-    // If authenticated with AniList, sync user watching list & planning list into DB
-    if let Some(auth_cfg) = auth {
-        if auth_cfg.is_authenticated() {
-            let uid = match auth_cfg.user_id {
-                Some(id) => Some(id),
-                None => client.viewer().await.ok().map(|v| v.id),
-            };
-            if let Some(user_id) = uid {
-                let dismissed_wl = user::get_dismissed_ids(pool, "watchlist").await.unwrap_or_default();
-                let dismissed_cw = user::get_dismissed_ids(pool, "continue_watching").await.unwrap_or_default();
-                if let Ok(coll) = client.user_collection(user_id, now).await {
-                    for (anime, progress) in coll.watching {
-                        let _ = cache::upsert_anime(pool, &anime).await;
-                        if !dismissed_cw.contains(&anime.id) {
-                            let _ = user::record_watched(pool, anime.id, progress as i64, now).await;
-                        }
-                    }
-                    for anime in coll.planning {
-                        let _ = cache::upsert_anime(pool, &anime).await;
-                        if !dismissed_wl.contains(&anime.id) {
-                            let _ = user::add_to_watchlist(pool, anime.id, now).await;
-                        }
-                    }
-                    for anime in coll.completed {
-                        let _ = cache::upsert_anime(pool, &anime).await;
-                    }
-                }
-            }
-        }
-    }
-
-    // Run all syncs concurrently — each is independent
+/// Load HomeData directly from the local SQLite cache without any network requests.
+/// Runs in < 15ms to allow instant (<50ms) cold launch.
+pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
     let (trending, popular, top_rated, seasonal, continue_entries, continue_watching, watchlist) = tokio::join!(
-        sync_category(pool, client, meta::TRENDING,  trending_ttl, now),
-        sync_category(pool, client, meta::POPULAR,   stable_ttl,   now),
-        sync_category(pool, client, meta::TOP_RATED, stable_ttl,   now),
-        sync_category(pool, client, meta::SEASONAL,  trending_ttl, now),
+        cache::get_category(pool, meta::TRENDING),
+        cache::get_category(pool, meta::POPULAR),
+        cache::get_category(pool, meta::TOP_RATED),
+        cache::get_category(pool, meta::SEASONAL),
         user::get_continue_watching(pool),
         load_continue_watching(pool),
         load_watchlist(pool),
@@ -507,6 +468,44 @@ pub async fn sync_all(
         top_rated,
         seasonal,
     })
+}
+
+/// Sync every category (respecting TTLs) and return a fully populated HomeData.
+/// Called in background on startup and again when the user explicitly refreshes.
+pub async fn sync_all(
+    pool:             &SqlitePool,
+    client:           &AniListClient,
+    auth:             Option<&crate::config::AuthConfig>,
+    trending_ttl:     u64,
+    stable_ttl:       u64,
+    now:              i64,
+) -> Result<HomeData> {
+    // If authenticated with AniList, batch sync user watching list & planning list into DB atomically
+    if let Some(auth_cfg) = auth {
+        if auth_cfg.is_authenticated() {
+            let uid = match auth_cfg.user_id {
+                Some(id) => Some(id),
+                None => client.viewer().await.ok().map(|v| v.id),
+            };
+            if let Some(user_id) = uid {
+                let dismissed_wl = user::get_dismissed_ids(pool, "watchlist").await.unwrap_or_default();
+                let dismissed_cw = user::get_dismissed_ids(pool, "continue_watching").await.unwrap_or_default();
+                if let Ok(coll) = client.user_collection(user_id, now).await {
+                    let _ = user::batch_sync_user_collection(pool, &coll, &dismissed_cw, &dismissed_wl, now).await;
+                }
+            }
+        }
+    }
+
+    // Run all syncs concurrently — each category checks TTL, updates SQLite, and marks synced
+    let _ = tokio::join!(
+        sync_category(pool, client, meta::TRENDING,  trending_ttl, now),
+        sync_category(pool, client, meta::POPULAR,   stable_ttl,   now),
+        sync_category(pool, client, meta::TOP_RATED, stable_ttl,   now),
+        sync_category(pool, client, meta::SEASONAL,  trending_ttl, now),
+    );
+
+    load_cached_home_data(pool).await
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -757,5 +756,61 @@ mod tests {
         );
 
         assert!(recommended.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_cached_home_data_empty_and_populated() {
+        let pool = crate::db::init(":memory:").await.unwrap();
+
+        // Initially empty
+        let initial = load_cached_home_data(&pool).await.unwrap();
+        assert!(initial.is_empty());
+
+        // Insert mock anime and assign to trending category
+        let anime = scored_anime(42, "Cyberpunk", &["Action", "Sci-Fi"], "TV", 92);
+        crate::db::cache::upsert_anime(&pool, &anime).await.unwrap();
+        crate::db::cache::upsert_category(&pool, meta::TRENDING, &[42], 1_000_000).await.unwrap();
+
+        // Load again
+        let loaded = load_cached_home_data(&pool).await.unwrap();
+        assert!(!loaded.is_empty());
+        assert_eq!(loaded.trending.len(), 1);
+        assert_eq!(loaded.trending[0].id, 42);
+        assert_eq!(loaded.featured.map(|a| a.id), Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_batch_sync_user_collection_atomic() {
+        let pool = crate::db::init(":memory:").await.unwrap();
+
+        let anime1 = scored_anime(101, "Frieren", &["Fantasy", "Drama"], "TV", 95);
+        let anime2 = scored_anime(102, "Dungeon Meshi", &["Comedy", "Fantasy"], "TV", 88);
+        let anime3 = scored_anime(103, "Steins;Gate", &["Sci-Fi", "Thriller"], "TV", 91);
+
+        let coll = crate::api::anilist::UserCollection {
+            watching: vec![(anime1, 8)],
+            planning: vec![anime2],
+            completed: vec![anime3],
+            dropped: vec![],
+        };
+
+        let dismissed_cw = std::collections::HashSet::new();
+        let dismissed_wl = std::collections::HashSet::new();
+
+        crate::db::user::batch_sync_user_collection(&pool, &coll, &dismissed_cw, &dismissed_wl, 1_000_000)
+            .await
+            .unwrap();
+
+        let cw = load_continue_watching(&pool).await.unwrap();
+        assert_eq!(cw.len(), 1);
+        assert_eq!(cw[0].id, 101);
+
+        let wl = load_watchlist(&pool).await.unwrap();
+        assert_eq!(wl.len(), 1);
+        assert_eq!(wl[0].id, 102);
+
+        let completed = crate::db::cache::get_anime(&pool, 103).await.unwrap();
+        assert!(completed.is_some());
+        assert_eq!(completed.unwrap().id, 103);
     }
 }

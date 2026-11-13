@@ -23,14 +23,22 @@ jobs:
             target: aarch64-apple-darwin
             label: macos-aarch64
             artifact_name: solus-macos-aarch64
+            binary_name: solus
           - os: macos-latest
             target: x86_64-apple-darwin
             label: macos-x86_64
             artifact_name: solus-macos-x86_64
+            binary_name: solus
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             label: linux-x86_64
             artifact_name: solus-linux-x86_64
+            binary_name: solus
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x86_64
+            artifact_name: solus-windows-x86_64.exe
+            binary_name: solus.exe
 
     steps:
       - name: checkout
@@ -48,13 +56,18 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: prepare artifact
+        shell: bash
         run: |
-          cp target/${{ matrix.target }}/release/solus ${{ matrix.artifact_name }}
-          chmod +x ${{ matrix.artifact_name }}
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} ${{ matrix.artifact_name }}
+          if [ "${{ matrix.os }}" != "windows-latest" ]; then
+            chmod +x ${{ matrix.artifact_name }}
+          fi
           # Also generate legacy ani-tui-* alias for backward compatibility:
           legacy_name=$(echo "${{ matrix.artifact_name }}" | sed 's/^solus-/ani-tui-/')
-          cp target/${{ matrix.target }}/release/solus "$legacy_name"
-          chmod +x "$legacy_name"
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} "$legacy_name"
+          if [ "${{ matrix.os }}" != "windows-latest" ]; then
+            chmod +x "$legacy_name"
+          fi
 
       - name: upload workflow artifact
         uses: actions/upload-artifact@v4

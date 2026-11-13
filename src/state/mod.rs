@@ -41,6 +41,30 @@ pub enum Screen {
     CastModal,
     /// Active TV streaming command deck
     CastDeck,
+    /// In-app self-updater modal dialog
+    UpdateModal,
+}
+
+/// Phases of the in-app self-updater modal dialog.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateModalPhase {
+    /// Update available: shows version diff, release highlights, and prompts Enter to install.
+    Available {
+        info: crate::services::updater::UpdateInfo,
+    },
+    /// Downloading and installing update with live progress bar.
+    Downloading {
+        progress_pct: f32,
+        speed: String,
+    },
+    /// Update successfully installed: prompts user to exit Solus and relaunch.
+    RestartRequired {
+        new_version: String,
+    },
+    /// Update failed with an error message.
+    Failed {
+        error: String,
+    },
 }
 
 /// Which category row the cursor is on (Home screen).
@@ -438,6 +462,9 @@ pub struct AppState {
     pub is_scanning_cast: bool,
     pub cast_playback_pos: f64,
     pub cast_playback_dur: f64,
+
+    /// Active phase of the in-app update modal
+    pub update_modal_phase: Option<UpdateModalPhase>,
 }
 
 impl AppState {
@@ -577,6 +604,7 @@ impl AppState {
             is_scanning_cast: false,
             cast_playback_pos: 0.0,
             cast_playback_dur: 0.0,
+            update_modal_phase: None,
         }
     }
 
@@ -654,7 +682,7 @@ impl AppState {
                     Screen::Home
                 }
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal => {
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal => {
                 if self.overlay_base == self.screen {
                     Screen::Home
                 } else {
@@ -743,6 +771,24 @@ impl AppState {
     pub fn open_setup(&mut self) {
         self.overlay_base = self.current_base_screen();
         self.screen = Screen::Setup;
+    }
+
+    /// Open the in-app update modal dialog.
+    pub fn open_update_modal(&mut self, info: crate::services::updater::UpdateInfo) {
+        if self.screen != Screen::UpdateModal {
+            self.overlay_base = self.current_base_screen();
+        }
+        self.available_update = Some(info.clone());
+        self.update_modal_phase = Some(UpdateModalPhase::Available { info });
+        self.screen = Screen::UpdateModal;
+    }
+
+    /// Close the in-app update modal dialog.
+    pub fn close_update_modal(&mut self) {
+        if self.screen == Screen::UpdateModal {
+            self.screen = self.overlay_base.clone();
+            self.update_modal_phase = None;
+        }
     }
 
     /// Open the AniList login and library sync overlay.
@@ -980,7 +1026,7 @@ impl AppState {
             Screen::Detail | Screen::Playback | Screen::PlaybackQuery | Screen::PlaybackOptions => {
                 Screen::Detail
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal => self.overlay_base.clone(),
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal => self.overlay_base.clone(),
             Screen::CastDeck => Screen::Detail,
             Screen::Home => Screen::Home,
         }
@@ -1290,5 +1336,33 @@ mod tests {
 
         state.go_back();
         assert_eq!(state.screen, Screen::Home);
+    }
+
+    #[test]
+    fn test_update_modal_flow_and_go_back() {
+        let mut state = AppState::new();
+        state.screen = Screen::Home;
+
+        let info = crate::services::updater::UpdateInfo {
+            current_version: "1.0.6".to_string(),
+            latest_version: "1.0.7".to_string(),
+            download_url: "https://github.com/example/solus".to_string(),
+            asset_name: "solus-windows-x86_64.exe".to_string(),
+            release_notes: Some("Big launch speed upgrade".to_string()),
+            is_homebrew: false,
+        };
+
+        state.open_update_modal(info.clone());
+        assert_eq!(state.screen, Screen::UpdateModal);
+        assert_eq!(state.overlay_base, Screen::Home);
+        assert_eq!(state.available_update, Some(info.clone()));
+        assert_eq!(
+            state.update_modal_phase,
+            Some(UpdateModalPhase::Available { info })
+        );
+
+        state.close_update_modal();
+        assert_eq!(state.screen, Screen::Home);
+        assert_eq!(state.update_modal_phase, None);
     }
 }

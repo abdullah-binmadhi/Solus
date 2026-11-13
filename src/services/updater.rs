@@ -196,33 +196,89 @@ pub async fn download_and_install_update(
     tokio::io::AsyncWriteExt::flush(&mut file).await?;
     drop(file);
 
-    // Ensure permissions are set to executable (0o755)
+    // Ensure permissions and replace running executable
+    #[cfg(windows)]
+    {
+        // On Windows, the running executable is locked by the OS against modification or deletion.
+        // However, NTFS allows renaming an open executable within the same filesystem!
+        // 1. Generate old backup name: solus.exe.old
+        let old_exe = current_exe.with_extension("exe.old");
+        let _ = std::fs::remove_file(&old_exe); // Remove any old backup if present and unlocked
+
+        // 2. Rename the currently running executable to solus.exe.old
+        if let Err(e) = std::fs::rename(&current_exe, &old_exe) {
+            let _ = std::fs::remove_file(&temp_download_path);
+            return Err(AppError::Player(format!(
+                "Failed to rename running executable {} to {}: {}",
+                current_exe.display(),
+                old_exe.display(),
+                e
+            )));
+        }
+
+        // 3. Move the downloaded new binary into place
+        if let Err(e) = std::fs::rename(&temp_download_path, &current_exe) {
+            // Roll back if moving the new binary failed
+            let _ = std::fs::rename(&old_exe, &current_exe);
+            let _ = std::fs::remove_file(&temp_download_path);
+            return Err(AppError::Player(format!(
+                "Failed to install new binary at {}: {}",
+                current_exe.display(),
+                e
+            )));
+        }
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = std::fs::metadata(&temp_download_path)?.permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&temp_download_path, perms)?;
-    }
 
-    // Atomically replace running binary with the newly downloaded binary
-    if let Err(e) = std::fs::rename(&temp_download_path, &current_exe) {
-        // Fallback for cross-device or permission limits: attempt removal then copy
-        let _ = std::fs::remove_file(&current_exe);
-        if let Err(e2) = std::fs::copy(&temp_download_path, &current_exe) {
+        // Atomically replace running binary with the newly downloaded binary
+        if let Err(e) = std::fs::rename(&temp_download_path, &current_exe) {
+            // Fallback for cross-device or permission limits: attempt removal then copy
+            let _ = std::fs::remove_file(&current_exe);
+            if let Err(e2) = std::fs::copy(&temp_download_path, &current_exe) {
+                let _ = std::fs::remove_file(&temp_download_path);
+                return Err(AppError::Player(format!(
+                    "Failed to replace binary at {}: {} (fallback copy error: {})",
+                    current_exe.display(),
+                    e,
+                    e2
+                )));
+            }
             let _ = std::fs::remove_file(&temp_download_path);
-            return Err(AppError::Player(format!(
-                "Failed to replace binary at {}: {} (fallback copy error: {})",
-                current_exe.display(),
-                e,
-                e2
-            )));
         }
-        let _ = std::fs::remove_file(&temp_download_path);
     }
 
     let _ = tx.send(AppMessage::UpdateSuccess(target_version.to_string())).await;
     Ok(current_exe)
+}
+
+/// Clean up any leftover update artifacts (e.g., `*.exe.old` or temporary download files)
+/// from previous updates. Called on startup.
+pub fn cleanup_legacy_update_files() {
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            #[cfg(windows)]
+            {
+                let old_exe = current_exe.with_extension("exe.old");
+                let _ = std::fs::remove_file(old_exe);
+            }
+            // Clean up any abandoned .solus-update-*.tmp files
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name();
+                    let name_str = file_name.to_string_lossy();
+                    if name_str.starts_with(".solus-update-") && name_str.ends_with(".tmp") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

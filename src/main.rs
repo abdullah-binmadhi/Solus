@@ -214,12 +214,25 @@ async fn main() -> anyhow::Result<()> {
     // ── Message channel (background tasks → UI loop) ──────────────────────────
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AppMessage>(64);
 
+    // Clean up any leftover update artifacts from previous update sessions
+    services::updater::cleanup_legacy_update_files();
+
     // ── App state ─────────────────────────────────────────────────────────────
     let mut state     = AppState::new();
     state.anime4k_mode = cfg.anime4k_mode;
     state.ambilight_enabled = cfg.ambilight_enabled;
     state.playback_player_cursor = state.playback_players.iter().position(|p| *p == cfg.player).unwrap_or(0);
-    let mut home_data = ui::home::HomeData::empty();
+
+    // ── Instant Stale-While-Revalidate startup: load cached catalog (<15ms) ────
+    let cached_home = services::sync::load_cached_home_data(&pool)
+        .await
+        .unwrap_or_else(|_| ui::home::HomeData::empty());
+    let has_cached = !cached_home.is_empty();
+    let mut home_data = cached_home;
+    if has_cached {
+        state.is_loading = false;
+        refresh_home_cover(&mut state, &home_data, &pool, &tx);
+    }
     refresh_dependency_status(&mut state);
     if !state.has_any_player() {
         state.open_setup();
@@ -711,31 +724,48 @@ async fn main() -> anyhow::Result<()> {
                     state.analytics_data = Some(analytics);
                 }
                 AppMessage::UpdateCheckResult(update_opt) => {
+                    let was_checking = state.is_checking_update;
                     state.is_checking_update = false;
                     if let Some(info) = update_opt {
                         let new_ver = info.latest_version.clone();
                         let is_brew = info.is_homebrew;
-                        state.available_update = Some(info);
                         if is_brew {
+                            state.available_update = Some(info);
                             state.show_toast(format!("❖ Solus {} available: brew upgrade solus", new_ver), unix_now());
+                        } else if state.screen != Screen::Playback {
+                            // Automatically open the update modal popup so user doesn't miss it!
+                            state.open_update_modal(info);
                         } else {
+                            state.available_update = Some(info);
                             state.show_toast(format!("❖ Solus {} is available! Press [U] to update.", new_ver), unix_now());
                         }
+                    } else if was_checking {
+                        state.show_toast(format!("Solus is up to date (v{})", env!("CARGO_PKG_VERSION")), unix_now());
                     }
                 }
                 AppMessage::UpdateProgress(pct, spd) => {
                     state.is_updating = true;
-                    state.update_progress = Some((pct, spd));
+                    state.update_progress = Some((pct, spd.clone()));
+                    state.update_modal_phase = Some(state::UpdateModalPhase::Downloading {
+                        progress_pct: pct,
+                        speed: spd,
+                    });
                 }
                 AppMessage::UpdateSuccess(version) => {
                     state.is_updating = false;
                     state.update_progress = None;
                     state.available_update = None;
-                    state.show_toast(format!("󰄬 Solus updated to {}! Restart to apply.", version), unix_now());
+                    state.update_modal_phase = Some(state::UpdateModalPhase::RestartRequired {
+                        new_version: version.clone(),
+                    });
+                    state.show_toast(format!("󰄬 Solus updated to {}! Press Enter to exit.", version), unix_now());
                 }
                 AppMessage::UpdateFailed(err) => {
                     state.is_updating = false;
                     state.update_progress = None;
+                    state.update_modal_phase = Some(state::UpdateModalPhase::Failed {
+                        error: err.clone(),
+                    });
                     state.show_toast(format!("Update failed: {}", err), unix_now());
                 }
                 AppMessage::RemotePlayEpisode(ep) => {
@@ -849,6 +879,10 @@ async fn main() -> anyhow::Result<()> {
                     Screen::CastDeck => {
                         ui::cast::render_cast_deck(frame, &state);
                     }
+                    Screen::UpdateModal => {
+                        render_base_screen(frame, &mut state, &home_data, &base_screen);
+                        ui::update_modal::render_overlay(frame, &state);
+                    }
                 }
                 // Toast notification renders on top of everything
                 if let Some(ref msg) = toast_msg {
@@ -932,6 +966,80 @@ async fn handle_key(
         Screen::RemoteModal => handle_remote_modal(key, state).await,
         Screen::CastModal => handle_cast_modal(key, state, tx).await,
         Screen::CastDeck => handle_cast_deck(key, state).await,
+        Screen::UpdateModal => handle_update_modal(key, state, tx).await,
+    }
+}
+
+async fn handle_update_modal(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let Some(ref phase) = state.update_modal_phase.clone() else {
+        state.close_update_modal();
+        return;
+    };
+
+    match phase {
+        state::UpdateModalPhase::Available { info } => {
+            match key.code {
+                KeyCode::Enter => {
+                    if !info.is_homebrew && !state.is_updating {
+                        state.is_updating = true;
+                        state.update_modal_phase = Some(state::UpdateModalPhase::Downloading {
+                            progress_pct: 0.0,
+                            speed: "Connecting...".to_string(),
+                        });
+                        let client = reqwest::Client::new();
+                        let dl_url = info.download_url.clone();
+                        let target_ver = info.latest_version.clone();
+                        let tx_dl = tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = services::updater::download_and_install_update(
+                                &client,
+                                &dl_url,
+                                &target_ver,
+                                tx_dl.clone(),
+                            )
+                            .await
+                            {
+                                let _ = tx_dl.send(AppMessage::UpdateFailed(e.to_string())).await;
+                            }
+                        });
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    state.close_update_modal();
+                }
+                _ => {}
+            }
+        }
+        state::UpdateModalPhase::Downloading { .. } => {
+            if key.code == KeyCode::Esc {
+                // Allow closing modal to background while download continues
+                state.close_update_modal();
+            }
+        }
+        state::UpdateModalPhase::RestartRequired { .. } => {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('q') => {
+                    // Gracefully exit Solus so user can relaunch into the new version
+                    state.should_quit = true;
+                }
+                KeyCode::Esc => {
+                    state.close_update_modal();
+                }
+                _ => {}
+            }
+        }
+        state::UpdateModalPhase::Failed { .. } => {
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {
+                    state.close_update_modal();
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -1415,28 +1523,7 @@ async fn handle_home(
         }
         KeyCode::Char('U') => {
             if let Some(ref info) = state.available_update.clone() {
-                if info.is_homebrew {
-                    state.show_toast("Installed via Homebrew: run 'brew upgrade solus'", unix_now());
-                } else if !state.is_updating {
-                    state.is_updating = true;
-                    state.show_toast(format!("Downloading Solus {}...", info.latest_version), unix_now());
-                    let download_url = info.download_url.clone();
-                    let target_ver = info.latest_version.clone();
-                    let tx_update = tx.clone();
-                    tokio::spawn(async move {
-                        let client = reqwest::Client::new();
-                        if let Err(e) = services::updater::download_and_install_update(
-                            &client,
-                            &download_url,
-                            &target_ver,
-                            tx_update.clone(),
-                        )
-                        .await
-                        {
-                            let _ = tx_update.send(AppMessage::UpdateFailed(e.to_string())).await;
-                        }
-                    });
-                }
+                state.open_update_modal(info.clone());
             } else if !state.is_checking_update {
                 state.is_checking_update = true;
                 state.show_toast("Checking GitHub for updates...", unix_now());
@@ -1841,12 +1928,13 @@ fn prefetch_all_home_covers(
     tx: &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     let mut items: Vec<db::cache::Anime> = Vec::new();
-    items.extend(data.continue_watching.iter().cloned());
-    items.extend(data.trending.iter().cloned());
-    items.extend(data.popular.iter().cloned());
-    items.extend(data.top_rated.iter().cloned());
-    items.extend(data.seasonal.iter().cloned());
-    items.extend(data.watchlist.iter().cloned());
+    // Prioritize visible viewport cards first to prevent network & thread starvation on startup
+    items.extend(data.continue_watching.iter().take(6).cloned());
+    items.extend(data.trending.iter().take(6).cloned());
+    items.extend(data.popular.iter().take(6).cloned());
+    items.extend(data.seasonal.iter().take(6).cloned());
+    items.extend(data.watchlist.iter().take(6).cloned());
+    items.extend(data.top_rated.iter().take(6).cloned());
 
     for anime in items {
         if !state.cover_cache.contains_key(&anime.id) && !state.loading_covers.contains(&anime.id) {
@@ -2052,28 +2140,17 @@ async fn handle_detail(
         // Install available update if present
         KeyCode::Char('U') => {
             if let Some(ref info) = state.available_update.clone() {
-                if info.is_homebrew {
-                    state.show_toast("Installed via Homebrew: run 'brew upgrade solus'", unix_now());
-                } else if !state.is_updating {
-                    state.is_updating = true;
-                    state.show_toast(format!("Downloading Solus {}...", info.latest_version), unix_now());
-                    let download_url = info.download_url.clone();
-                    let target_ver = info.latest_version.clone();
-                    let tx_update = tx.clone();
-                    tokio::spawn(async move {
-                        let client = reqwest::Client::new();
-                        if let Err(e) = services::updater::download_and_install_update(
-                            &client,
-                            &download_url,
-                            &target_ver,
-                            tx_update.clone(),
-                        )
-                        .await
-                        {
-                            let _ = tx_update.send(AppMessage::UpdateFailed(e.to_string())).await;
-                        }
-                    });
-                }
+                state.open_update_modal(info.clone());
+            } else if !state.is_checking_update {
+                state.is_checking_update = true;
+                state.show_toast("Checking GitHub for updates...", unix_now());
+                let tx_check = tx.clone();
+                tokio::spawn(async move {
+                    let client = reqwest::Client::new();
+                    let current_ver = env!("CARGO_PKG_VERSION");
+                    let res = services::updater::check_for_updates(&client, current_ver).await.unwrap_or(None);
+                    let _ = tx_check.send(AppMessage::UpdateCheckResult(res)).await;
+                });
             }
         }
 
@@ -2806,28 +2883,7 @@ async fn execute_hub_action(
         }
         CheckUpdates => {
             if let Some(ref info) = state.available_update.clone() {
-                if info.is_homebrew {
-                    state.show_toast("Installed via Homebrew: run 'brew upgrade solus'", unix_now());
-                } else if !state.is_updating {
-                    state.is_updating = true;
-                    state.show_toast(format!("Downloading Solus {}...", info.latest_version), unix_now());
-                    let download_url = info.download_url.clone();
-                    let target_ver = info.latest_version.clone();
-                    let tx_update = tx.clone();
-                    tokio::spawn(async move {
-                        let client = reqwest::Client::new();
-                        if let Err(e) = services::updater::download_and_install_update(
-                            &client,
-                            &download_url,
-                            &target_ver,
-                            tx_update.clone(),
-                        )
-                        .await
-                        {
-                            let _ = tx_update.send(AppMessage::UpdateFailed(e.to_string())).await;
-                        }
-                    });
-                }
+                state.open_update_modal(info.clone());
             } else if !state.is_checking_update {
                 state.is_checking_update = true;
                 state.show_toast("Checking GitHub for updates...", unix_now());

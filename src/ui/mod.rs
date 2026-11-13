@@ -15,3 +15,4 @@ pub mod settings;
 pub mod setup;
 pub mod tailored;
 pub mod theme;
+pub mod update_modal;

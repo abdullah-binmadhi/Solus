@@ -712,4 +712,13 @@ impl HomeData {
             seasonal:          Vec::new(),
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.continue_watching.is_empty()
+            && self.watchlist.is_empty()
+            && self.trending.is_empty()
+            && self.popular.is_empty()
+            && self.top_rated.is_empty()
+            && self.seasonal.is_empty()
+    }
 }
