@@ -413,9 +413,7 @@ else
 fi
 
 if [ -n "$SOLUS_IPC_SOCKET" ]; then
-    if [ "$is_iina" -eq 1 ]; then
-        args+=("--mpv-input-ipc-server=$SOLUS_IPC_SOCKET")
-    elif [ "$is_vlc" -eq 0 ]; then
+    if [ "$is_iina" -eq 0 ] && [ "$is_vlc" -eq 0 ]; then
         args+=("--input-ipc-server=$SOLUS_IPC_SOCKET")
     fi
 fi
@@ -438,41 +436,74 @@ if [ -n "$SOLUS_SHADERS" ]; then
     fi
 fi
 
-if [ -n "$video_link" ]; then
-    args+=("$video_link")
-fi
-
 if [ "$is_vlc" -eq 1 ]; then
-    vlc_args=()
+    vlc_args=("--play-and-exit" "--no-video-title-show")
+    item_opts=()
     for a in "${args[@]}"; do
         case "$a" in
-            --input-terminal=*|--force-media-title=*|--sub-files-clr|--sub-auto=*)
+            --input-terminal=*|--force-media-title=*|--sub-files-clr|--sub-auto=*|--keep-running|--no-stdin)
                 ;;
             --referrer=*)
-                vlc_args+=(":http-referrer=${a#--referrer=}")
+                vlc_args+=("--http-referrer=${a#--referrer=}")
+                ;;
+            :http-referrer=*)
+                vlc_args+=("--http-referrer=${a#:http-referrer=}")
                 ;;
             --sub-file=*)
-                vlc_args+=(":sub-file=${a#--sub-file=}")
+                item_opts+=(":sub-file=${a#--sub-file=}")
+                ;;
+            :sub-file=*)
+                item_opts+=("$a")
+                ;;
+            --start=*)
+                item_opts+=(":start-time=${a#--start=}")
+                ;;
+            :start-time=*)
+                item_opts+=("$a")
+                ;;
+            --audio-language=*|--meta-title=*)
+                vlc_args+=("$a")
                 ;;
             *)
                 vlc_args+=("$a")
                 ;;
         esac
     done
-    exec "$REAL_PLAYER" "${vlc_args[@]}"
+    if [ -n "$video_link" ]; then
+        exec "$REAL_PLAYER" "${vlc_args[@]}" "$video_link" "${item_opts[@]}"
+    else
+        exec "$REAL_PLAYER" "${vlc_args[@]}" "${item_opts[@]}"
+    fi
 elif [ "$is_iina" -eq 1 ]; then
-    iina_args=("--keep-running")
+    iina_args=("--keep-running" "--no-stdin")
+    if [ -n "$refr" ]; then
+        iina_args+=("--mpv-referrer=$refr")
+    else
+        iina_args+=("--mpv-referrer=https://zokoanime.video/")
+    fi
+    iina_args+=("--mpv-user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     for a in "${args[@]}"; do
         case "$a" in
-            --input-terminal=*)
+            --input-terminal=*|--keep-running|--no-stdin|--mpv-input-ipc-server=*|--input-ipc-server=*)
                 ;;
             --referrer=*)
-                iina_args+=("--mpv-referrer=${a#--referrer=}")
                 ;;
             --force-media-title=*)
                 iina_args+=("--mpv-force-media-title=${a#--force-media-title=}")
                 ;;
-            --mpv-*|--keep-running)
+            --sub-file=*)
+                iina_args+=("--mpv-sub-file=${a#--sub-file=}" "--mpv-sub-visibility=yes")
+                ;;
+            --sub-files=*)
+                iina_args+=("--mpv-sub-file=${a#--sub-files=}" "--mpv-sub-visibility=yes")
+                ;;
+            --mpv-sub-files=*)
+                iina_args+=("--mpv-sub-file=${a#--mpv-sub-files=}" "--mpv-sub-visibility=yes")
+                ;;
+            --start=*)
+                iina_args+=("--mpv-start=${a#--start=}")
+                ;;
+            --mpv-*)
                 iina_args+=("$a")
                 ;;
             --*)
@@ -483,9 +514,17 @@ elif [ "$is_iina" -eq 1 ]; then
                 ;;
         esac
     done
-    exec "$REAL_PLAYER" "${iina_args[@]}"
+    if [ -n "$video_link" ]; then
+        exec "$REAL_PLAYER" "${iina_args[@]}" "$video_link"
+    else
+        exec "$REAL_PLAYER" "${iina_args[@]}"
+    fi
 else
-    exec "$REAL_PLAYER" "${args[@]}"
+    if [ -n "$video_link" ]; then
+        exec "$REAL_PLAYER" "${args[@]}" "$video_link"
+    else
+        exec "$REAL_PLAYER" "${args[@]}"
+    fi
 fi
 "#;
 
@@ -546,34 +585,38 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
             };
 
             if is_vlc {
-                // VLC-native arguments
-                cmd.arg(direct_url);
-                cmd.arg("--meta-title");
-                cmd.arg(format!("{} Episode {}", opts.title, opts.episode));
-                cmd.arg(":http-referrer=https://zokoanime.video/");
-                if let Some(ref url) = opts.sub_url {
-                    if !url.is_empty() {
-                        cmd.arg(format!(":sub-file={}", url));
-                    }
-                }
+                // VLC-native arguments:
+                // --play-and-exit ensures VLC immediately quits when playback finishes or the window is closed
+                cmd.arg("--play-and-exit");
+                cmd.arg("--no-video-title-show");
+                cmd.arg(format!("--meta-title={} Episode {}", opts.title, opts.episode));
+                cmd.arg("--http-referrer=https://zokoanime.video/");
+                cmd.arg("--http-user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
                 if opts.dub {
                     cmd.arg("--audio-language=en,eng");
                 } else {
                     cmd.arg("--audio-language=ja,jpn");
+                }
+                cmd.arg(direct_url);
+                if let Some(ref url) = opts.sub_url {
+                    if !url.is_empty() {
+                        cmd.arg(format!(":sub-file={}", url));
+                    }
                 }
                 if let Some(pos) = opts.start_pos {
                     cmd.arg(format!(":start-time={}", pos));
                 }
             } else if is_iina {
                 // IINA-native arguments (--keep-running prevents iina-cli from exiting prematurely)
+                // All options must precede the media URL to satisfy iina-cli syntax and header requirements.
                 cmd.arg("--keep-running");
-                cmd.arg(direct_url);
-                cmd.arg(format!("--mpv-force-media-title={} Episode {}", opts.title, opts.episode));
+                cmd.arg("--no-stdin");
                 cmd.arg("--mpv-referrer=https://zokoanime.video/");
+                cmd.arg("--mpv-user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+                cmd.arg(format!("--mpv-force-media-title={} Episode {}", opts.title, opts.episode));
                 if let Some(ref url) = opts.sub_url {
                     if !url.is_empty() {
-                        let escaped = url.replace(':', "\\:");
-                        cmd.arg(format!("--mpv-sub-files={}", escaped));
+                        cmd.arg(format!("--mpv-sub-file={}", url));
                         cmd.arg("--mpv-sub-visibility=yes");
                     }
                 }
@@ -581,9 +624,6 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                     cmd.arg("--mpv-alang=en,eng,English");
                 } else {
                     cmd.arg("--mpv-alang=ja,jpn,Japanese");
-                }
-                if let Some(ref sock) = opts.ipc_socket {
-                    cmd.arg(format!("--mpv-input-ipc-server={}", sock));
                 }
                 if let Some(pos) = opts.start_pos {
                     cmd.arg(format!("--mpv-start={}", pos));
@@ -596,6 +636,8 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                         cmd.arg(format!("--mpv-{}", flag.trim_start_matches("--")));
                     }
                 }
+                // Media URL is placed strictly trailing
+                cmd.arg(direct_url);
             } else {
                 // Standard MPV engine arguments
                 cmd.arg("--referrer=https://zokoanime.video/");
@@ -776,15 +818,17 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     let mut player_flags = Vec::new();
     if player.contains("iina") {
         player_flags.push("--keep-running".to_string());
-    } else if !player.contains("vlc") {
+        player_flags.push("--no-stdin".to_string());
+    } else if player.contains("vlc") {
+        player_flags.push("--play-and-exit".to_string());
+        player_flags.push("--no-video-title-show".to_string());
+    } else {
         player_flags.push("--input-terminal=no".to_string());
     }
 
     if let Some(ref sock) = opts.ipc_socket {
         cmd.env("SOLUS_IPC_SOCKET", sock);
-        if player.contains("iina") {
-            player_flags.push(format!("--mpv-input-ipc-server={}", sock));
-        } else if !player.contains("vlc") {
+        if !player.contains("iina") && !player.contains("vlc") {
             player_flags.push(format!("--input-ipc-server={}", sock));
         }
     }
@@ -812,12 +856,10 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     if let Some(ref url) = opts.sub_url {
         if !url.is_empty() {
             if player.contains("iina") {
-                // iina-cli expects mpv options prefixed with --mpv-
-                let escaped_url = url.replace(':', "\\:");
-                player_flags.push(format!("--mpv-sub-files={}", escaped_url));
+                player_flags.push(format!("--mpv-sub-file={}", url));
                 player_flags.push("--mpv-sub-visibility=yes".to_string());
             } else if player.contains("vlc") {
-                player_flags.push(format!(":input-slave={}", url));
+                player_flags.push(format!(":sub-file={}", url));
             } else {
                 // Default: mpv. Pass without literal quotes so sh parameter expansion
                 // passes a clean argument. --sub-files-clr guarantees any preceding
@@ -997,5 +1039,13 @@ mod tests {
 
         let vlc_wrapper = ensure_player_wrapper("vlc").expect("Failed to create vlc wrapper");
         assert!(vlc_wrapper.file_name().unwrap().to_str().unwrap().contains("vlc"));
+        let vlc_content = std::fs::read_to_string(&vlc_wrapper).expect("Failed to read vlc wrapper");
+        assert!(vlc_content.contains("--play-and-exit"));
+        assert!(vlc_content.contains("--no-video-title-show"));
+
+        let iina_content = std::fs::read_to_string(&iina_wrapper).expect("Failed to read iina wrapper");
+        assert!(iina_content.contains("--keep-running"));
+        assert!(iina_content.contains("--no-stdin"));
+        assert!(iina_content.contains("--mpv-user-agent"));
     }
 }
