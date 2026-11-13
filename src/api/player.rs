@@ -168,27 +168,69 @@ fn windows_player_path(name: &str) -> Option<String> {
 }
 
 #[cfg(windows)]
+fn find_windows_ani_cli() -> Option<PathBuf> {
+    // 1. Search PATH entries
+    if let Some(path) = env::var_os("PATH") {
+        for dir in env::split_paths(&path) {
+            for ext in &["cmd", "bat", "exe", ""] {
+                let candidate = if ext.is_empty() {
+                    dir.join("ani-cli")
+                } else {
+                    dir.join(format!("ani-cli.{}", ext))
+                };
+                if executable_exists(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    // 2. WinGet links directory (%LOCALAPPDATA%\Microsoft\WinGet\Links)
+    if let Ok(local_app) = env::var("LOCALAPPDATA") {
+        let local = PathBuf::from(local_app);
+        for sub in &[
+            r"Microsoft\WinGet\Links\ani-cli.cmd",
+            r"Microsoft\WinGet\Links\ani-cli.bat",
+            r"Microsoft\WinGet\Links\ani-cli.exe",
+        ] {
+            let p = local.join(sub);
+            if executable_exists(&p) {
+                return Some(p);
+            }
+        }
+    }
+
+    // 3. Scoop shims directory (%USERPROFILE%\scoop\shims)
+    if let Ok(user_profile) = env::var("USERPROFILE") {
+        let user = PathBuf::from(user_profile);
+        for sub in &[
+            r"scoop\shims\ani-cli.cmd",
+            r"scoop\shims\ani-cli.bat",
+            r"scoop\shims\ani-cli.exe",
+        ] {
+            let p = user.join(sub);
+            if executable_exists(&p) {
+                return Some(p);
+            }
+        }
+    }
+
+    // 4. Chocolatey directory
+    let choco_p = PathBuf::from(r"C:\ProgramData\chocolatey\bin\ani-cli.bat");
+    if executable_exists(&choco_p) {
+        return Some(choco_p);
+    }
+
+    None
+}
+
+#[cfg(windows)]
 fn windows_fallback_exists(name: &str) -> bool {
     if windows_player_path(name).is_some() {
         return true;
     }
     if name == "ani-cli" {
-        if let Ok(local_app) = env::var("LOCALAPPDATA") {
-            let local = PathBuf::from(local_app);
-            if executable_exists(&local.join(r"Microsoft\WinGet\Links\ani-cli.exe"))
-                || executable_exists(&local.join(r"Microsoft\WinGet\Links\ani-cli.cmd"))
-            {
-                return true;
-            }
-        }
-        if let Ok(user_profile) = env::var("USERPROFILE") {
-            let user = PathBuf::from(user_profile);
-            if executable_exists(&user.join(r"scoop\shims\ani-cli.cmd"))
-                || executable_exists(&user.join(r"scoop\shims\ani-cli.exe"))
-            {
-                return true;
-            }
-        }
+        return find_windows_ani_cli().is_some();
     }
     false
 }
@@ -426,6 +468,20 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 None => Vec::new(),
             };
             current_paths.insert(0, bin_dir.clone());
+            #[cfg(windows)]
+            {
+                if let Ok(local_app) = env::var("LOCALAPPDATA") {
+                    let local = PathBuf::from(local_app);
+                    current_paths.push(local.join(r"Microsoft\WinGet\Links"));
+                    current_paths.push(local.join(r"Programs\mpv"));
+                }
+                if let Ok(user_profile) = env::var("USERPROFILE") {
+                    let user = PathBuf::from(user_profile);
+                    current_paths.push(user.join(r"scoop\shims"));
+                }
+                current_paths.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin"));
+                current_paths.push(PathBuf::from(r"C:\Program Files\VideoLAN\VLC"));
+            }
             if let Ok(new_path) = env::join_paths(current_paths) {
                 cmd.env("PATH", new_path);
             }
@@ -479,24 +535,59 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     }
 
     // 2. Fallback playback via ani-cli
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.arg("/C");
+        if let Some(target) = find_windows_ani_cli() {
+            c.arg(target);
+        } else {
+            c.arg("ani-cli");
+        }
+        c
+    };
+    #[cfg(not(windows))]
     let mut cmd = Command::new("ani-cli");
 
-    // Prepend wrapper directory to PATH so ani-cli executes the bare binary name
-    // (e.g. "solus-mpv") directly without space splitting in $player_function.
+    // Prepend wrapper directory and well-known tool directories to PATH
     let mut current_paths = match env::var_os("PATH") {
         Some(val) => env::split_paths(&val).collect::<Vec<_>>(),
         None => Vec::new(),
     };
     current_paths.insert(0, bin_dir);
+    #[cfg(windows)]
+    {
+        if let Ok(local_app) = env::var("LOCALAPPDATA") {
+            let local = PathBuf::from(local_app);
+            current_paths.push(local.join(r"Microsoft\WinGet\Links"));
+            current_paths.push(local.join(r"Programs\mpv"));
+        }
+        if let Ok(user_profile) = env::var("USERPROFILE") {
+            let user = PathBuf::from(user_profile);
+            current_paths.push(user.join(r"scoop\shims"));
+        }
+        current_paths.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin"));
+        current_paths.push(PathBuf::from(r"C:\Program Files\VideoLAN\VLC"));
+        current_paths.push(PathBuf::from(r"C:\Program Files\Git\bin"));
+        current_paths.push(PathBuf::from(r"C:\Program Files\Git\usr\bin"));
+    }
     if let Ok(new_path) = env::join_paths(current_paths) {
         cmd.env("PATH", new_path);
     }
 
     cmd.args(&args)
-        .env("ANI_CLI_PLAYER", &wrapper_name)
-        .env("SOLUS_REAL_PLAYER", &player)
         .env("ANI_CLI_EXIT_AFTER_PLAY", "1")
         .env("ANI_CLI_NO_DETACH", "1");
+
+    #[cfg(windows)]
+    {
+        cmd.env("ANI_CLI_PLAYER", &player);
+    }
+    #[cfg(not(windows))]
+    {
+        cmd.env("ANI_CLI_PLAYER", &wrapper_name);
+        cmd.env("SOLUS_REAL_PLAYER", &player);
+    }
 
     if opts.dub {
         cmd.env("SOLUS_AUDIO_DUB", "1");
