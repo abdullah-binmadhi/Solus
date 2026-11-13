@@ -105,7 +105,13 @@ fn command_exists(name: &str) -> bool {
         return false;
     };
 
-    env::split_paths(&path).any(|dir| executable_exists(&dir.join(name)))
+    env::split_paths(&path).any(|dir| {
+        executable_exists(&dir.join(name))
+            || (cfg!(windows)
+                && (executable_exists(&dir.join(format!("{}.exe", name)))
+                    || executable_exists(&dir.join(format!("{}.cmd", name)))
+                    || executable_exists(&dir.join(format!("{}.bat", name)))))
+    })
 }
 
 fn executable_exists(path: &Path) -> bool {
