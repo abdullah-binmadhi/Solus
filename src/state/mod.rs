@@ -473,7 +473,11 @@ impl AppState {
             playback_quality_cursor: 0,
             playback_sub_languages: vec![crate::api::subtitles::SubtitleOption::default_english()],
             playback_sub_cursor: 0,
-            playback_players: vec![crate::config::Player::Mpv, crate::config::Player::Iina, crate::config::Player::Vlc],
+            playback_players: if cfg!(target_os = "macos") {
+                vec![crate::config::Player::Mpv, crate::config::Player::Iina, crate::config::Player::Vlc]
+            } else {
+                vec![crate::config::Player::Mpv, crate::config::Player::Vlc]
+            },
             playback_player_cursor: 0,
             playback_providers: crate::api::subtitles::default_providers(),
             dub_available: None,
@@ -820,7 +824,11 @@ impl AppState {
         self.playback_quality_cursor = quality_idx;
         self.pending_dub = dub;
         self.playback_sub_cursor = 0;
-        self.playback_players = vec![crate::config::Player::Mpv, crate::config::Player::Iina, crate::config::Player::Vlc];
+        self.playback_players = if cfg!(target_os = "macos") {
+            vec![crate::config::Player::Mpv, crate::config::Player::Iina, crate::config::Player::Vlc]
+        } else {
+            vec![crate::config::Player::Mpv, crate::config::Player::Vlc]
+        };
         self.playback_player_cursor = self.playback_players.iter().position(|p| *p == player).unwrap_or(0);
         self.playback_providers = crate::api::subtitles::default_providers();
         self.dub_available = None;
@@ -836,6 +844,15 @@ impl AppState {
     /// Return the currently selected media player.
     pub fn selected_player(&self) -> crate::config::Player {
         self.playback_players.get(self.playback_player_cursor).copied().unwrap_or_default()
+    }
+
+    /// Cycle through available media players (e.g. mpv -> iina -> vlc -> mpv).
+    pub fn cycle_playback_player(&mut self) {
+        if self.playback_players.is_empty() {
+            return;
+        }
+        let total = self.playback_players.len();
+        self.playback_player_cursor = (self.playback_player_cursor + 1) % total;
     }
 
     /// Dynamically synchronize active quality and subtitle options with the highlighted provider.
@@ -1242,10 +1259,27 @@ mod tests {
     fn test_playback_player_selection() {
         let mut state = AppState::new();
         assert_eq!(state.selected_player(), crate::config::Player::Mpv);
-        state.playback_player_cursor = 1;
-        assert_eq!(state.selected_player(), crate::config::Player::Iina);
-        state.playback_player_cursor = 2;
-        assert_eq!(state.selected_player(), crate::config::Player::Vlc);
+        if cfg!(target_os = "macos") {
+            state.playback_player_cursor = 1;
+            assert_eq!(state.selected_player(), crate::config::Player::Iina);
+            state.playback_player_cursor = 2;
+            assert_eq!(state.selected_player(), crate::config::Player::Vlc);
+        } else {
+            state.playback_player_cursor = 1;
+            assert_eq!(state.selected_player(), crate::config::Player::Vlc);
+        }
+    }
+
+    #[test]
+    fn test_cycle_playback_player() {
+        let mut state = AppState::new();
+        let initial = state.selected_player();
+        state.cycle_playback_player();
+        assert_ne!(state.selected_player(), initial);
+        for _ in 1..state.playback_players.len() {
+            state.cycle_playback_player();
+        }
+        assert_eq!(state.selected_player(), initial);
     }
 
     #[test]

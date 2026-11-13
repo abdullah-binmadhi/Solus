@@ -1914,6 +1914,10 @@ async fn handle_playback_options(
                 }
             }
         }
+        KeyCode::Char('p') | KeyCode::Char('P') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            state.cycle_playback_player();
+            state.show_toast(format!("Player: {}", state.selected_player().as_str()), unix_now());
+        }
         KeyCode::Char('a') | KeyCode::Char('A') => {
             if !state.pending_dub && state.dub_available == Some(false) {
                 state.show_toast("English Dub is not available for this anime (Sub only)", unix_now());

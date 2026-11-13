@@ -60,7 +60,18 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             Span::styled(dub_badge_text, dub_badge_style),
         ]),
         Line::from(vec![
-            Span::styled(" Audio Mode: ", Style::default().fg(Color::Rgb(160, 160, 175))),
+            Span::styled(" Player: ", Style::default().fg(Color::Rgb(160, 160, 175))),
+            Span::styled(
+                format!(" {} ", state.selected_player().as_str()),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(140, 30, 200))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled("([p] toggle)", Style::default().fg(Color::Rgb(120, 120, 135))),
+            Span::raw("   "),
+            Span::styled("Audio: ", Style::default().fg(Color::Rgb(160, 160, 175))),
             Span::styled(
                 format!(" {} ", audio_label),
                 Style::default()
@@ -68,17 +79,17 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                     .bg(if state.pending_dub { Color::Rgb(120, 40, 180) } else { Color::Rgb(40, 40, 60) })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
+            Span::raw(" "),
             Span::styled(
                 if state.dub_available == Some(false) {
-                    "([a] toggle — Dub not available)"
+                    "([a] Sub only)"
                 } else {
                     "([a] toggle)"
                 },
                 Style::default().fg(if state.dub_available == Some(false) { Color::Rgb(220, 120, 80) } else { Color::Rgb(120, 120, 135) }),
             ),
             Span::raw("   "),
-            Span::styled(" Anime4K: ", Style::default().fg(Color::Rgb(160, 160, 175))),
+            Span::styled("Anime4K: ", Style::default().fg(Color::Rgb(160, 160, 175))),
             Span::styled(
                 format!(" {} ", state.anime4k_mode.as_str()),
                 Style::default()
@@ -394,10 +405,12 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         Span::raw(" Launch  "),
         Span::styled(" Tab/h/l ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
         Span::raw(" Column  "),
-        Span::styled(" 1/2/3/4 ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        Span::styled(" 1-4 ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
         Span::raw(" Jump  "),
         Span::styled(" j/k ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
         Span::raw(" Select  "),
+        Span::styled(" p ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
+        Span::raw(" Player  "),
         Span::styled(" a ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
         Span::raw(" Audio  "),
         Span::styled(" u ", Style::default().fg(Color::Black).bg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD)),
