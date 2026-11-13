@@ -43,7 +43,7 @@ pub enum AudioMode {
 }
 
 /// Video player to use
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Player {
     #[default]

@@ -128,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
     let mut state     = AppState::new();
     state.anime4k_mode = cfg.anime4k_mode;
     state.ambilight_enabled = cfg.ambilight_enabled;
+    state.playback_player_cursor = state.playback_players.iter().position(|p| *p == cfg.player).unwrap_or(0);
     let mut home_data = ui::home::HomeData::empty();
     refresh_dependency_status(&mut state);
     if !state.has_ani_cli || !state.has_any_player() {
@@ -1243,11 +1244,13 @@ async fn begin_playback_flow(
     let use_dub = anime.has_dub() && default_audio == config::AudioMode::Dub;
     let ep = state.selected_episode.unwrap_or(1);
 
+    let default_player = state.selected_player();
     if let Some(saved_query) = db::user::get_playback_query(pool, anime.id).await.unwrap_or(None) {
         state.open_playback_options(
             saved_query,
             quality_index(&cfg.quality),
             use_dub,
+            default_player,
         );
         trigger_stream_detection(&anime, ep, use_dub, tx);
     } else if anime.playback_queries().len() > 1 {
@@ -1257,6 +1260,7 @@ async fn begin_playback_flow(
             anime.playback_query(),
             quality_index(&cfg.quality),
             use_dub,
+            default_player,
         );
         trigger_stream_detection(&anime, ep, use_dub, tx);
     }
@@ -1810,10 +1814,12 @@ async fn handle_playback_query(
                     .unwrap_or(None)
                     .unwrap_or_else(|| cfg.audio_mode.clone());
                 let is_dub = anime.has_dub() && preferred_audio == config::AudioMode::Dub;
+                let default_player = state.selected_player();
                 state.open_playback_options(
                     query,
                     quality_index(&cfg.quality),
                     is_dub,
+                    default_player,
                 );
                 let ep = state.selected_episode.unwrap_or(1);
                 trigger_stream_detection(&anime, ep, is_dub, tx);
@@ -1833,21 +1839,21 @@ async fn handle_playback_options(
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => state.go_back(),
         KeyCode::Tab => {
-            state.playback_focus_column = (state.playback_focus_column + 1) % 3;
-            state.playback_sub_focused = state.playback_focus_column == 2;
+            state.playback_focus_column = (state.playback_focus_column + 1) % 4;
+            state.playback_sub_focused = state.playback_focus_column == 3;
         }
         KeyCode::BackTab => {
-            state.playback_focus_column = if state.playback_focus_column == 0 { 2 } else { state.playback_focus_column - 1 };
-            state.playback_sub_focused = state.playback_focus_column == 2;
+            state.playback_focus_column = if state.playback_focus_column == 0 { 3 } else { state.playback_focus_column - 1 };
+            state.playback_sub_focused = state.playback_focus_column == 3;
         }
         KeyCode::Left | KeyCode::Char('h') => {
             state.playback_focus_column = state.playback_focus_column.saturating_sub(1);
-            state.playback_sub_focused = state.playback_focus_column == 2;
+            state.playback_sub_focused = state.playback_focus_column == 3;
         }
         KeyCode::Right | KeyCode::Char('l') => {
-            if state.playback_focus_column < 2 {
+            if state.playback_focus_column < 3 {
                 state.playback_focus_column += 1;
-                state.playback_sub_focused = state.playback_focus_column == 2;
+                state.playback_sub_focused = state.playback_focus_column == 3;
             }
         }
         KeyCode::Char('1') => {
@@ -1860,17 +1866,26 @@ async fn handle_playback_options(
         }
         KeyCode::Char('3') => {
             state.playback_focus_column = 2;
+            state.playback_sub_focused = false;
+        }
+        KeyCode::Char('4') => {
+            state.playback_focus_column = 3;
             state.playback_sub_focused = true;
         }
         KeyCode::Down | KeyCode::Char('j') => {
             match state.playback_focus_column {
                 0 => {
+                    if state.playback_player_cursor + 1 < state.playback_players.len() {
+                        state.playback_player_cursor += 1;
+                    }
+                }
+                1 => {
                     if state.playback_provider_cursor + 1 < state.playback_providers.len() {
                         state.playback_provider_cursor += 1;
                         state.sync_active_provider();
                     }
                 }
-                1 => {
+                2 => {
                     if state.playback_quality_cursor + 1 < state.playback_qualities.len() {
                         state.playback_quality_cursor += 1;
                     }
@@ -1885,10 +1900,13 @@ async fn handle_playback_options(
         KeyCode::Up | KeyCode::Char('k') => {
             match state.playback_focus_column {
                 0 => {
+                    state.playback_player_cursor = state.playback_player_cursor.saturating_sub(1);
+                }
+                1 => {
                     state.playback_provider_cursor = state.playback_provider_cursor.saturating_sub(1);
                     state.sync_active_provider();
                 }
-                1 => {
+                2 => {
                     state.playback_quality_cursor = state.playback_quality_cursor.saturating_sub(1);
                 }
                 _ => {
@@ -1966,13 +1984,31 @@ async fn handle_playback_options(
                     }
                 }
 
+                let chosen_player = state.selected_player();
+                if chosen_player == config::Player::Iina && !cfg!(target_os = "macos") {
+                    state.show_toast("IINA is only supported on macOS. Please select mpv or vlc.", unix_now());
+                    return;
+                }
+                if chosen_player == config::Player::Iina && !state.has_iina {
+                    state.show_toast("IINA is not installed. Run 'brew install --cask iina' or select mpv.", unix_now());
+                    return;
+                }
+                if chosen_player == config::Player::Mpv && !state.has_mpv {
+                    state.show_toast("mpv is not installed. Press ! to check setup.", unix_now());
+                    return;
+                }
+                if chosen_player == config::Player::Vlc && !state.has_vlc {
+                    state.show_toast("VLC is not installed. Press ! to check setup.", unix_now());
+                    return;
+                }
+
                 let glsl_shaders = services::shaders::build_shader_arg(state.anime4k_mode);
                 let opts = api::player::PlayOptions {
                     title:   query,
                     episode: ep,
                     quality: quality_label,
                     dub:     audio == config::AudioMode::Dub,
-                    player:  cfg.player.as_str().to_string(),
+                    player:  chosen_player.as_str().to_string(),
                     sub_lang,
                     sub_url,
                     stream_url,

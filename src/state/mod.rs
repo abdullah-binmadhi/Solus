@@ -188,7 +188,13 @@ pub struct AppState {
     /// Playback options: selected streaming provider index
     pub playback_provider_cursor: usize,
 
-    /// Playback options: focused column index (0 = Provider, 1 = Quality, 2 = Subtitles)
+    /// Playback options: available media playback engines (mpv, iina, vlc)
+    pub playback_players: Vec<crate::config::Player>,
+
+    /// Playback options: selected playback engine index
+    pub playback_player_cursor: usize,
+
+    /// Playback options: focused column index (0 = Player, 1 = Provider, 2 = Quality, 3 = Subtitles)
     pub playback_focus_column: usize,
 
     /// Playback options: which section is focused (false = Quality, true = Subtitles)
@@ -467,6 +473,8 @@ impl AppState {
             playback_quality_cursor: 0,
             playback_sub_languages: vec![crate::api::subtitles::SubtitleOption::default_english()],
             playback_sub_cursor: 0,
+            playback_players: vec![crate::config::Player::Mpv, crate::config::Player::Iina, crate::config::Player::Vlc],
+            playback_player_cursor: 0,
             playback_providers: crate::api::subtitles::default_providers(),
             dub_available: None,
             playback_provider_cursor: 0,
@@ -806,12 +814,14 @@ impl AppState {
     }
 
     /// Open the playback options overlay after a query has been chosen.
-    pub fn open_playback_options(&mut self, query: String, quality_idx: usize, dub: bool) {
+    pub fn open_playback_options(&mut self, query: String, quality_idx: usize, dub: bool, player: crate::config::Player) {
         self.pending_playback_query = Some(query);
         self.playback_qualities.clear();
         self.playback_quality_cursor = quality_idx;
         self.pending_dub = dub;
         self.playback_sub_cursor = 0;
+        self.playback_players = vec![crate::config::Player::Mpv, crate::config::Player::Iina, crate::config::Player::Vlc];
+        self.playback_player_cursor = self.playback_players.iter().position(|p| *p == player).unwrap_or(0);
         self.playback_providers = crate::api::subtitles::default_providers();
         self.dub_available = None;
         self.playback_provider_cursor = 0;
@@ -821,6 +831,11 @@ impl AppState {
         self.pending_master_url = None;
         self.playback_sub_languages = vec![crate::api::subtitles::SubtitleOption::default_english()];
         self.screen = Screen::PlaybackOptions;
+    }
+
+    /// Return the currently selected media player.
+    pub fn selected_player(&self) -> crate::config::Player {
+        self.playback_players.get(self.playback_player_cursor).copied().unwrap_or_default()
     }
 
     /// Dynamically synchronize active quality and subtitle options with the highlighted provider.
@@ -1221,6 +1236,16 @@ mod tests {
         // Go back must return to Home
         state.go_back();
         assert_eq!(state.screen, Screen::Home);
+    }
+
+    #[test]
+    fn test_playback_player_selection() {
+        let mut state = AppState::new();
+        assert_eq!(state.selected_player(), crate::config::Player::Mpv);
+        state.playback_player_cursor = 1;
+        assert_eq!(state.selected_player(), crate::config::Player::Iina);
+        state.playback_player_cursor = 2;
+        assert_eq!(state.selected_player(), crate::config::Player::Vlc);
     }
 
     #[test]
