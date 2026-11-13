@@ -384,8 +384,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 AppMessage::CoverReady(anime_id, img) => {
                     state.loading_covers.remove(&anime_id);
-                    let card_img = prepare_card_cover(img.clone());
-                    let portrait_img = prepare_portrait_cover(img);
+                    let font_size = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
+                    let card_img = prepare_card_cover_with_font(img.clone(), font_size);
+                    let portrait_img = prepare_portrait_cover_with_font(img.clone(), font_size);
+                    let thumb_img = prepare_16_9_thumbnail_cover(img, font_size);
                     if let Some(ref mut picker) = state.picker {
                         let proto1 = picker.new_resize_protocol(card_img.clone());
                         let proto2 = picker.new_resize_protocol(card_img.clone());
@@ -398,7 +400,7 @@ async fn main() -> anyhow::Result<()> {
                         let base_theme = ui::theme::get_theme(state.theme_index);
                         state.ambilight_theme = Some(ui::theme::extract_ambilight_palette(&card_img, base_theme));
                         if state.current_card_img.is_none() {
-                            state.current_card_img = Some(card_img);
+                            state.current_card_img = Some(thumb_img);
                             state.episode_fallback_thumbnails.clear();
                         }
                     }
@@ -618,7 +620,8 @@ async fn main() -> anyhow::Result<()> {
                 AppMessage::EpisodeThumbnailReady(anime_id, ep, img) => {
                     if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
                         state.loading_episode_thumbnails.remove(&ep);
-                        let card_thumb = prepare_card_cover(img);
+                        let font_size = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
+                        let card_thumb = prepare_16_9_thumbnail_cover(img, font_size);
                         if let Some(ref mut picker) = state.picker {
                             let proto = picker.new_resize_protocol(card_thumb);
                             state.episode_thumbnails.insert(ep, proto);
@@ -627,13 +630,15 @@ async fn main() -> anyhow::Result<()> {
                 }
                 AppMessage::AnimeBannerReady(anime_id, img) => {
                     state.loading_banners.remove(&anime_id);
-                    let card_banner = prepare_card_cover(img);
+                    let font_size = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
+                    let card_banner = prepare_card_cover_with_font(img.clone(), font_size);
                     if let Some(ref mut picker) = state.picker {
                         let proto = picker.new_resize_protocol(card_banner.clone());
                         state.anime_banners.insert(anime_id, proto);
                     }
                     if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
-                        state.current_card_img = Some(card_banner);
+                        let thumb_banner = prepare_16_9_thumbnail_cover(img, font_size);
+                        state.current_card_img = Some(thumb_banner);
                         state.episode_fallback_thumbnails.clear();
                     }
                 }
@@ -1102,9 +1107,9 @@ async fn handle_mouse(
                     // Rows & Cards
                     if my >= 11 && my < term_h.saturating_sub(2) {
                         let rel_y = my - 11;
-                        let row_h = 9;
+                        let row_h = 12;
                         let clicked_row_idx = (rel_y / row_h) as usize;
-                        let card_pitch = 23;
+                        let card_pitch = 24;
                         let clicked_card_col = (mx / card_pitch) as usize;
 
                         let rows: Vec<(&str, state::CategoryRow, &[db::cache::Anime])> = vec![
@@ -1117,14 +1122,35 @@ async fn handle_mouse(
                             ("seasonal",          state::CategoryRow::Seasonal,         &home_data.seasonal),
                         ];
                         let visible: Vec<_> = rows.into_iter().filter(|(_, _, items)| !items.is_empty()).collect();
-                        if let Some((key, cat_row, items)) = visible.get(clicked_row_idx) {
-                            state.active_row = cat_row.clone();
-                            let offset = state.row_offset(key);
-                            let target_idx = offset + clicked_card_col;
-                            if let Some(anime) = items.get(target_idx) {
-                                state.row_offsets.insert(key.to_string(), target_idx);
-                                open_detail_from_anime(state, anime.clone(), pool, tx).await;
-                                return true;
+                        let row_count = visible.len();
+                        if row_count > 0 {
+                            let max_rows_that_fit = ((term_h.saturating_sub(11 + 2)) / row_h).max(1) as usize;
+                            let visible_rows = row_count.min(max_rows_that_fit);
+
+                            let active_key = match state.active_row {
+                                state::CategoryRow::ContinueWatching => "continue_watching",
+                                state::CategoryRow::Watchlist        => "watchlist",
+                                state::CategoryRow::Recommended      => "recommended",
+                                state::CategoryRow::Trending         => "trending",
+                                state::CategoryRow::Popular          => "popular",
+                                state::CategoryRow::TopRated         => "top_rated",
+                                state::CategoryRow::Seasonal         => "seasonal",
+                            };
+                            let active_idx = visible.iter().position(|(key, _, _)| *key == active_key).unwrap_or(0);
+                            let start_idx = active_idx.saturating_sub(visible_rows.saturating_sub(1));
+
+                            if clicked_row_idx < visible_rows {
+                                let actual_row_idx = start_idx + clicked_row_idx;
+                                if let Some((key, cat_row, items)) = visible.get(actual_row_idx) {
+                                    state.active_row = cat_row.clone();
+                                    let offset = state.row_offset(key);
+                                    let target_idx = offset + clicked_card_col;
+                                    if let Some(anime) = items.get(target_idx) {
+                                        state.row_offsets.insert(key.to_string(), target_idx);
+                                        open_detail_from_anime(state, anime.clone(), pool, tx).await;
+                                        return true;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1158,17 +1184,51 @@ async fn handle_mouse(
                         }
                     }
                     // Episodes
-                    if my >= 15 {
-                        let rel_ep_row = (my - 15) as usize;
-                        let target_ep = (state.episode_offset + rel_ep_row + 1) as u32;
-                        let max_ep = state.selected_anime.as_ref().and_then(|a| a.episodes).map(|e| e as u32).unwrap_or(1);
-                        if target_ep <= max_ep {
-                            if state.selected_episode == Some(target_ep) {
-                                begin_playback_flow(state, pool, cfg, false, tx).await;
-                            } else {
-                                state.selected_episode = Some(target_ep);
+                    match state.episode_view_mode {
+                        state::EpisodeViewMode::List => {
+                            if my >= 16 {
+                                let inner_h = term_h.saturating_sub(17);
+                                let card_h = if inner_h >= 21 { 7 } else if inner_h >= 14 { 6 } else { 5 };
+                                let visible_cards = (inner_h / card_h).max(1) as usize;
+                                let card_idx = ((my - 16) / card_h) as usize;
+                                if card_idx < visible_cards {
+                                    let ep_idx = state.episode_offset + card_idx;
+                                    if ep_idx < state.episode_list.len() {
+                                        let target_ep = state.episode_list[ep_idx];
+                                        if state.selected_episode == Some(target_ep) {
+                                            begin_playback_flow(state, pool, cfg, false, tx).await;
+                                        } else {
+                                            state.selected_episode = Some(target_ep);
+                                        }
+                                        return true;
+                                    }
+                                }
                             }
-                            return true;
+                        }
+                        state::EpisodeViewMode::Split => {
+                            if mx < 44 {
+                                // Left Queue
+                                if my >= 17 {
+                                    let rel_line = (my - 17) as usize;
+                                    let visible_rows = term_h.saturating_sub(19) as usize;
+                                    if rel_line < visible_rows {
+                                        let ep_idx = state.episode_offset + rel_line;
+                                        if ep_idx < state.episode_list.len() {
+                                            let target_ep = state.episode_list[ep_idx];
+                                            if state.selected_episode == Some(target_ep) {
+                                                begin_playback_flow(state, pool, cfg, false, tx).await;
+                                            } else {
+                                                state.selected_episode = Some(target_ep);
+                                            }
+                                            return true;
+                                        }
+                                    }
+                                }
+                            } else if my >= 16 {
+                                // Right Inspector Theater
+                                begin_playback_flow(state, pool, cfg, false, tx).await;
+                                return true;
+                            }
                         }
                     }
                     false
@@ -1595,15 +1655,17 @@ async fn open_detail_from_anime(
     state.open_detail(anime);
     if let Some(blob) = state.selected_anime.as_ref().and_then(|a| a.cover_blob.as_ref()) {
         if let Ok(dyn_img) = image::load_from_memory(blob) {
-            let card_img = prepare_card_cover(dyn_img.clone());
-            let portrait_img = prepare_portrait_cover(dyn_img);
+            let font_size = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
+            let card_img = prepare_card_cover_with_font(dyn_img.clone(), font_size);
+            let portrait_img = prepare_portrait_cover_with_font(dyn_img.clone(), font_size);
+            let thumb_img = prepare_16_9_thumbnail_cover(dyn_img, font_size);
             if let Some(ref mut picker) = state.picker {
                 let proto_portrait = picker.new_resize_protocol(portrait_img);
                 state.detail_cache.insert(anime_id, proto_portrait);
             }
             let base_theme = ui::theme::get_theme(state.theme_index);
             state.ambilight_theme = Some(ui::theme::extract_ambilight_palette(&card_img, base_theme));
-            state.current_card_img = Some(card_img);
+            state.current_card_img = Some(thumb_img);
         }
     }
     state.set_watched_episodes(watched.into_iter().map(|e| e as u32).collect());
@@ -3879,40 +3941,48 @@ async fn start_playback(
 
 // ─── Cover image download ─────────────────────────────────────────────────────
 
-/// Prepare an anime cover image for card and banner rendering:
-/// Anime posters from AniList are portrait (e.g. 230x345). Home cards allocate a 20-col x 6-row
-/// inner cover chunk. In standard terminal cell geometry (1:2 cell aspect ratio),
-/// 20 columns by 6 rows corresponds to an aspect ratio of 20 / (6 * 2) = 1.6667 (5:3).
-///
-/// To eliminate all horizontal deadspace and ensure the image fills 100% of the
-/// card frame from border to border without distortion:
-/// 1. Scales the image so its width reaches at least 1280px (ensuring `desired.width` in
-///    ratatui-image exceeds card width and prevents premature truncation on high-DPI displays).
-/// 2. Scales and crops to target 1280x768 (1.6667 aspect ratio) with an upper-center
-///    bias (22% offset from top of excess height) to keep character faces, eyes, and action in focus.
-pub fn prepare_card_cover(img: image::DynamicImage) -> image::DynamicImage {
+/// Dynamically scales and center/upper-biased crops an image so its physical pixel aspect ratio
+/// exactly matches the character cell area (target_cols x target_rows) for the detected font size.
+/// By ensuring the pixel dimensions are an exact integer multiple of (target_cols * font_w, target_rows * font_h),
+/// ratatui-image's internal ratio calculation (wratio == hratio) matches identically down to the lowest bit,
+/// guaranteeing 100% frame fill with 0% deadspace across all platforms, fonts, and terminal emulators.
+pub fn scale_to_frame_cover(
+    img: image::DynamicImage,
+    target_cols: u16,
+    target_rows: u16,
+    font_size: (u16, u16),
+    upper_bias: f32,
+) -> image::DynamicImage {
     let (w, h) = (img.width(), img.height());
-    if w == 0 || h == 0 {
+    if w == 0 || h == 0 || target_cols == 0 || target_rows == 0 {
         return img;
     }
 
-    let target_w = 1280u32;
-    let target_h = 768u32;
-    let target_aspect = target_w as f32 / target_h as f32; // 1.6667
+    let font_w = (font_size.0 as u32).max(1);
+    let font_h = (font_size.1 as u32).max(1);
+
+    let base_pw = target_cols as u32 * font_w;
+    let base_ph = target_rows as u32 * font_h;
+
+    // Scale to high-res crisp multiplier (target_w >= 1000px) so ratatui-image has full fidelity
+    let multiplier = (1280 / base_pw).clamp(2, 16);
+    let target_w = base_pw * multiplier;
+    let target_h = base_ph * multiplier;
+    let target_aspect = target_w as f32 / target_h as f32;
 
     let current_aspect = w as f32 / h as f32;
 
     if current_aspect < target_aspect {
-        // Taller/narrower than target (standard portrait anime poster)
+        // Source is taller/narrower than frame -> scale width to target_w, crop excess height with upper bias
         let scale = target_w as f32 / w as f32;
         let scaled_h = ((h as f32 * scale).round() as u32).max(target_h);
         let scaled = img.resize(target_w, scaled_h, image::imageops::FilterType::Triangle);
 
         let excess_h = scaled.height().saturating_sub(target_h);
-        let top = ((excess_h as f32) * 0.22).round() as u32;
+        let top = ((excess_h as f32) * upper_bias).round() as u32;
         scaled.crop_imm(0, top.min(excess_h), target_w, target_h)
     } else {
-        // Wider than target
+        // Source is wider than frame -> scale height to target_h, center-crop excess width
         let scale = target_h as f32 / h as f32;
         let scaled_w = ((w as f32 * scale).round() as u32).max(target_w);
         let scaled = img.resize(scaled_w, target_h, image::imageops::FilterType::Triangle);
@@ -3923,47 +3993,40 @@ pub fn prepare_card_cover(img: image::DynamicImage) -> image::DynamicImage {
     }
 }
 
-/// Prepare an anime cover image for portrait poster preview rendering:
-/// Tailored results allocate a 20-col x 16-row box (inner: 18 cols x 14 rows).
-/// In standard terminal cell geometry (1:2 cell aspect ratio),
-/// 18 columns by 14 rows corresponds to an aspect ratio of 18 / (14 * 2) = 0.6428.
-///
-/// To eliminate all horizontal and vertical deadspace and ensure the image fills 100% of the
-/// poster frame from border to border without distortion:
-/// 1. Target dimensions: 720x1120 (0.6428 aspect ratio).
-/// 2. Scales and crops with a slight upper-center bias (15% offset from top of excess height)
-///    to keep character faces, eyes, and action in focus.
+pub fn prepare_card_cover(img: image::DynamicImage) -> image::DynamicImage {
+    scale_to_frame_cover(img, 20, 6, (12, 24), 0.22)
+}
+
+pub fn prepare_card_cover_with_font(img: image::DynamicImage, font_size: (u16, u16)) -> image::DynamicImage {
+    scale_to_frame_cover(img, 20, 6, font_size, 0.22)
+}
+
 pub fn prepare_portrait_cover(img: image::DynamicImage) -> image::DynamicImage {
-    let (w, h) = (img.width(), img.height());
-    if w == 0 || h == 0 {
-        return img;
-    }
+    scale_to_frame_cover(img, 16, 12, (12, 24), 0.15)
+}
 
-    let target_w = 1200u32;
-    let target_h = 1800u32;
-    let target_aspect = target_w as f32 / target_h as f32; // ~0.6667 (2:3 standard anime poster)
+pub fn prepare_portrait_cover_with_font(img: image::DynamicImage, font_size: (u16, u16)) -> image::DynamicImage {
+    scale_to_frame_cover(img, 16, 12, font_size, 0.15)
+}
 
-    let current_aspect = w as f32 / h as f32;
+pub fn prepare_thumbnail_cover_with_font(
+    img: image::DynamicImage,
+    target_cols: u16,
+    target_rows: u16,
+    font_size: (u16, u16),
+) -> image::DynamicImage {
+    scale_to_frame_cover(img, target_cols, target_rows, font_size, 0.20)
+}
 
-    if current_aspect < target_aspect {
-        // Taller than target aspect -> scale to target_w, crop excess height with upper bias
-        let scale = target_w as f32 / w as f32;
-        let scaled_h = ((h as f32 * scale).round() as u32).max(target_h);
-        let scaled = img.resize(target_w, scaled_h, image::imageops::FilterType::Triangle);
-
-        let excess_h = scaled.height().saturating_sub(target_h);
-        let top = ((excess_h as f32) * 0.15).round() as u32;
-        scaled.crop_imm(0, top.min(excess_h), target_w, target_h)
-    } else {
-        // Wider than target aspect -> scale to target_h, crop excess width centered
-        let scale = target_h as f32 / h as f32;
-        let scaled_w = ((w as f32 * scale).round() as u32).max(target_w);
-        let scaled = img.resize(scaled_w, target_h, image::imageops::FilterType::Triangle);
-
-        let excess_w = scaled.width().saturating_sub(target_w);
-        let left = excess_w / 2;
-        scaled.crop_imm(left, 0, target_w, target_h)
-    }
+pub fn prepare_16_9_thumbnail_cover(
+    img: image::DynamicImage,
+    font_size: (u16, u16),
+) -> image::DynamicImage {
+    let font_w = (font_size.0 as f32).max(1.0);
+    let font_h = (font_size.1 as f32).max(1.0);
+    let target_rows: u16 = 9;
+    let target_cols: u16 = ((16.0 * font_h) / font_w).round() as u16;
+    scale_to_frame_cover(img, target_cols, target_rows, font_size, 0.20)
 }
 
 /// Preload episode thumbnails for the first 16 episodes plus a window around the currently selected episode.
@@ -4281,8 +4344,8 @@ mod tests {
         // Typical AniList portrait cover dimensions (230x345)
         let img = image::DynamicImage::new_rgb8(230, 345);
         let prepared = prepare_card_cover(img);
-        assert_eq!(prepared.width(), 1280);
-        assert_eq!(prepared.height(), 768);
+        assert_eq!(prepared.width(), 1200);
+        assert_eq!(prepared.height(), 720);
     }
 
     #[test]
@@ -4290,8 +4353,8 @@ mod tests {
         // Landscape image
         let img = image::DynamicImage::new_rgb8(800, 400);
         let prepared = prepare_card_cover(img);
-        assert_eq!(prepared.width(), 1280);
-        assert_eq!(prepared.height(), 768);
+        assert_eq!(prepared.width(), 1200);
+        assert_eq!(prepared.height(), 720);
     }
 
     #[test]
@@ -4306,7 +4369,17 @@ mod tests {
     fn test_prepare_portrait_cover_dimensions() {
         let img = image::DynamicImage::new_rgb8(230, 345);
         let prepared = prepare_portrait_cover(img);
-        assert_eq!(prepared.width(), 1200);
-        assert_eq!(prepared.height(), 1800);
+        assert_eq!(prepared.width(), 1152);
+        assert_eq!(prepared.height(), 1728);
+    }
+
+    #[test]
+    fn test_prepare_16_9_thumbnail_cover_aspect_ratio() {
+        let img = image::DynamicImage::new_rgb8(800, 600);
+        let prepared = prepare_16_9_thumbnail_cover(img, (12, 24));
+        // Ratio must be exactly 16:9
+        let aspect = prepared.width() as f64 / prepared.height() as f64;
+        let expected = 16.0 / 9.0;
+        assert!((aspect - expected).abs() < 0.001);
     }
 }

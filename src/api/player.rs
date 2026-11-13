@@ -84,12 +84,17 @@ pub fn resolve_player(preferred: &str) -> String {
                 "mpv".to_string()
             } else if let Some(iina) = macos_iina_fallback() {
                 iina
+            } else if let Some(vlc) = macos_vlc_fallback() {
+                vlc
             } else {
                 "mpv".to_string()
             }
         }
         "iina" => macos_iina_fallback().unwrap_or_else(|| "iina".to_string()),
         "vlc" => {
+            if let Some(vlc) = macos_vlc_fallback() {
+                return vlc;
+            }
             #[cfg(windows)]
             if let Some(path) = windows_player_path("vlc") {
                 return path;
@@ -102,11 +107,25 @@ pub fn resolve_player(preferred: &str) -> String {
 
 /// Detect whether the relevant runtime dependencies are available on this machine.
 pub fn detect_dependencies() -> (bool, bool, bool, bool) {
+    let has_vlc = {
+        #[cfg(target_os = "macos")]
+        {
+            command_exists("vlc") || macos_vlc_fallback().is_some()
+        }
+        #[cfg(windows)]
+        {
+            command_exists("vlc") || windows_player_path("vlc").is_some()
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            command_exists("vlc")
+        }
+    };
     (
         command_exists("ani-cli"),
         command_exists("mpv"),
         macos_iina_fallback().is_some(),
-        command_exists("vlc"),
+        has_vlc,
     )
 }
 
@@ -261,6 +280,23 @@ fn macos_iina_fallback() -> Option<String> {
     None
 }
 
+fn macos_vlc_fallback() -> Option<String> {
+    if env::consts::OS != "macos" {
+        return None;
+    }
+
+    let app_path = PathBuf::from("/Applications/VLC.app/Contents/MacOS/VLC");
+    if executable_exists(&app_path) {
+        return Some(app_path.to_string_lossy().into_owned());
+    }
+
+    if command_exists("vlc") {
+        return Some("vlc".to_string());
+    }
+
+    None
+}
+
 /// Ensure the Solus player wrapper script exists, is executable, and return its path.
 /// The wrapper intercepts ani-cli's invocation to:
 /// 1. Inject `--audio-file` with the master playlist when HLS multi-audio split streams are detected (e.g. Cyberpunk Edgerunners).
@@ -324,9 +360,9 @@ done
 
 is_iina=0
 is_vlc=0
-if [[ "$REAL_PLAYER" =~ iina ]]; then
+if [[ "$REAL_PLAYER" =~ iina ]] || [[ "$REAL_PLAYER" =~ IINA ]]; then
     is_iina=1
-elif [[ "$REAL_PLAYER" =~ vlc ]]; then
+elif [[ "$REAL_PLAYER" =~ vlc ]] || [[ "$REAL_PLAYER" =~ VLC ]]; then
     is_vlc=1
 fi
 
@@ -335,7 +371,7 @@ if [ -n "$SOLUS_SUB_URL" ]; then
         escaped_sub="${SOLUS_SUB_URL//:/\\:}"
         args+=("--mpv-sub-files=$escaped_sub" "--mpv-sub-visibility=yes")
     elif [ "$is_vlc" -eq 1 ]; then
-        args+=(":input-slave=$SOLUS_SUB_URL")
+        args+=(":sub-file=$SOLUS_SUB_URL")
     else
         args+=("--sub-file=$SOLUS_SUB_URL" "--sub-visibility=yes" "--sub-auto=fuzzy")
     fi
@@ -361,13 +397,17 @@ fi
 if [ "$SOLUS_AUDIO_DUB" = "1" ]; then
     if [ "$is_iina" -eq 1 ]; then
         args+=("--mpv-alang=en,eng,English")
-    elif [ "$is_vlc" -eq 0 ]; then
+    elif [ "$is_vlc" -eq 1 ]; then
+        args+=("--audio-language=en,eng")
+    else
         args+=("--alang=en,eng,English")
     fi
 else
     if [ "$is_iina" -eq 1 ]; then
         args+=("--mpv-alang=ja,jpn,Japanese")
-    elif [ "$is_vlc" -eq 0 ]; then
+    elif [ "$is_vlc" -eq 1 ]; then
+        args+=("--audio-language=ja,jpn")
+    else
         args+=("--alang=ja,jpn,Japanese")
     fi
 fi
@@ -402,7 +442,51 @@ if [ -n "$video_link" ]; then
     args+=("$video_link")
 fi
 
-exec "$REAL_PLAYER" "${args[@]}"
+if [ "$is_vlc" -eq 1 ]; then
+    vlc_args=()
+    for a in "${args[@]}"; do
+        case "$a" in
+            --input-terminal=*|--force-media-title=*|--sub-files-clr|--sub-auto=*)
+                ;;
+            --referrer=*)
+                vlc_args+=(":http-referrer=${a#--referrer=}")
+                ;;
+            --sub-file=*)
+                vlc_args+=(":sub-file=${a#--sub-file=}")
+                ;;
+            *)
+                vlc_args+=("$a")
+                ;;
+        esac
+    done
+    exec "$REAL_PLAYER" "${vlc_args[@]}"
+elif [ "$is_iina" -eq 1 ]; then
+    iina_args=("--keep-running")
+    for a in "${args[@]}"; do
+        case "$a" in
+            --input-terminal=*)
+                ;;
+            --referrer=*)
+                iina_args+=("--mpv-referrer=${a#--referrer=}")
+                ;;
+            --force-media-title=*)
+                iina_args+=("--mpv-force-media-title=${a#--force-media-title=}")
+                ;;
+            --mpv-*|--keep-running)
+                iina_args+=("$a")
+                ;;
+            --*)
+                iina_args+=("--mpv-${a#--}")
+                ;;
+            *)
+                iina_args+=("$a")
+                ;;
+        esac
+    done
+    exec "$REAL_PLAYER" "${iina_args[@]}"
+else
+    exec "$REAL_PLAYER" "${args[@]}"
+fi
 "#;
 
     std::fs::write(&wrapper_path, script_content)
@@ -445,28 +529,116 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     // frame-perfect subtitle synchronization, accurate resolution, and sub-100ms launch.
     if let Some(ref direct_url) = opts.stream_url {
         if !direct_url.is_empty() {
-            #[cfg(windows)]
-            let mut cmd = Command::new(&player);
-            #[cfg(not(windows))]
-            let mut cmd = Command::new(&wrapper_path);
-            cmd.arg("--referrer=https://zokoanime.video/");
-            cmd.arg("--input-terminal=no");
-            cmd.arg(format!("--force-media-title={} Episode {}", opts.title, opts.episode));
+            let is_vlc = player.to_lowercase().contains("vlc");
+            let is_iina = player.to_lowercase().contains("iina");
 
-            #[cfg(windows)]
-            {
+            let mut cmd = if is_vlc || is_iina {
+                Command::new(&player)
+            } else {
+                #[cfg(windows)]
+                {
+                    Command::new(&player)
+                }
+                #[cfg(not(windows))]
+                {
+                    Command::new(&wrapper_path)
+                }
+            };
+
+            if is_vlc {
+                // VLC-native arguments
+                cmd.arg(direct_url);
+                cmd.arg("--meta-title");
+                cmd.arg(format!("{} Episode {}", opts.title, opts.episode));
+                cmd.arg(":http-referrer=https://zokoanime.video/");
                 if let Some(ref url) = opts.sub_url {
                     if !url.is_empty() {
-                        cmd.arg(format!("--sub-file={}", url));
-                        cmd.arg("--sub-visibility=yes");
-                        cmd.arg("--sub-auto=fuzzy");
+                        cmd.arg(format!(":sub-file={}", url));
                     }
                 }
                 if opts.dub {
-                    cmd.arg("--alang=en,eng,English");
+                    cmd.arg("--audio-language=en,eng");
                 } else {
-                    cmd.arg("--alang=ja,jpn,Japanese");
+                    cmd.arg("--audio-language=ja,jpn");
                 }
+                if let Some(pos) = opts.start_pos {
+                    cmd.arg(format!(":start-time={}", pos));
+                }
+            } else if is_iina {
+                // IINA-native arguments (--keep-running prevents iina-cli from exiting prematurely)
+                cmd.arg("--keep-running");
+                cmd.arg(direct_url);
+                cmd.arg(format!("--mpv-force-media-title={} Episode {}", opts.title, opts.episode));
+                cmd.arg("--mpv-referrer=https://zokoanime.video/");
+                if let Some(ref url) = opts.sub_url {
+                    if !url.is_empty() {
+                        let escaped = url.replace(':', "\\:");
+                        cmd.arg(format!("--mpv-sub-files={}", escaped));
+                        cmd.arg("--mpv-sub-visibility=yes");
+                    }
+                }
+                if opts.dub {
+                    cmd.arg("--mpv-alang=en,eng,English");
+                } else {
+                    cmd.arg("--mpv-alang=ja,jpn,Japanese");
+                }
+                if let Some(ref sock) = opts.ipc_socket {
+                    cmd.arg(format!("--mpv-input-ipc-server={}", sock));
+                }
+                if let Some(pos) = opts.start_pos {
+                    cmd.arg(format!("--mpv-start={}", pos));
+                }
+                if let Some(ref shaders) = opts.glsl_shaders {
+                    cmd.arg(format!("--mpv-glsl-shaders={}", shaders));
+                }
+                if let Some(ref style) = opts.sub_style {
+                    for flag in style.to_mpv_flags() {
+                        cmd.arg(format!("--mpv-{}", flag.trim_start_matches("--")));
+                    }
+                }
+            } else {
+                // Standard MPV engine arguments
+                cmd.arg("--referrer=https://zokoanime.video/");
+                cmd.arg("--input-terminal=no");
+                cmd.arg(format!("--force-media-title={} Episode {}", opts.title, opts.episode));
+
+                #[cfg(windows)]
+                {
+                    if let Some(ref url) = opts.sub_url {
+                        if !url.is_empty() {
+                            cmd.arg(format!("--sub-file={}", url));
+                            cmd.arg("--sub-visibility=yes");
+                            cmd.arg("--sub-auto=fuzzy");
+                        }
+                    }
+                    if opts.dub {
+                        cmd.arg("--alang=en,eng,English");
+                    } else {
+                        cmd.arg("--alang=ja,jpn,Japanese");
+                    }
+                }
+
+                if let Some(ref sock) = opts.ipc_socket {
+                    cmd.env("SOLUS_IPC_SOCKET", sock);
+                    cmd.arg(format!("--input-ipc-server={}", sock));
+                }
+                if let Some(pos) = opts.start_pos {
+                    cmd.env("SOLUS_START_POS", pos.to_string());
+                    cmd.arg(format!("--start={}", pos));
+                }
+
+                if let Some(ref shaders) = opts.glsl_shaders {
+                    cmd.env("SOLUS_SHADERS", shaders);
+                    cmd.arg(format!("--glsl-shaders={}", shaders));
+                }
+
+                if let Some(ref style) = opts.sub_style {
+                    for flag in style.to_mpv_flags() {
+                        cmd.arg(&flag);
+                    }
+                }
+
+                cmd.arg(direct_url);
             }
 
             let mut current_paths = match env::var_os("PATH") {
@@ -474,6 +646,13 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 None => Vec::new(),
             };
             current_paths.insert(0, bin_dir.clone());
+            #[cfg(target_os = "macos")]
+            {
+                current_paths.push(PathBuf::from("/Applications/IINA.app/Contents/MacOS"));
+                current_paths.push(PathBuf::from("/Applications/VLC.app/Contents/MacOS"));
+                current_paths.push(PathBuf::from("/opt/homebrew/bin"));
+                current_paths.push(PathBuf::from("/usr/local/bin"));
+            }
             #[cfg(windows)]
             {
                 if let Ok(local_app) = env::var("LOCALAPPDATA") {
@@ -487,6 +666,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 }
                 current_paths.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin"));
                 current_paths.push(PathBuf::from(r"C:\Program Files\VideoLAN\VLC"));
+                current_paths.push(PathBuf::from(r"C:\Program Files (x86)\VideoLAN\VLC"));
             }
             if let Ok(new_path) = env::join_paths(current_paths) {
                 cmd.env("PATH", new_path);
@@ -504,32 +684,6 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                     cmd.env("SOLUS_SUB_URL", url);
                 }
             }
-
-            if let Some(ref sock) = opts.ipc_socket {
-                cmd.env("SOLUS_IPC_SOCKET", sock);
-                cmd.arg(format!("--input-ipc-server={}", sock));
-            }
-            if let Some(pos) = opts.start_pos {
-                cmd.env("SOLUS_START_POS", pos.to_string());
-                cmd.arg(format!("--start={}", pos));
-            }
-
-            if let Some(ref shaders) = opts.glsl_shaders {
-                cmd.env("SOLUS_SHADERS", shaders);
-                if player.contains("iina") {
-                    cmd.arg(format!("--mpv-glsl-shaders={}", shaders));
-                } else if !player.contains("vlc") {
-                    cmd.arg(format!("--glsl-shaders={}", shaders));
-                }
-            }
-
-            if let Some(ref style) = opts.sub_style {
-                for flag in style.to_mpv_flags() {
-                    cmd.arg(&flag);
-                }
-            }
-
-            cmd.arg(direct_url);
 
             return cmd
                 .stdin(Stdio::null())
@@ -619,7 +773,12 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
         }
     }
 
-    let mut player_flags = vec!["--input-terminal=no".to_string()];
+    let mut player_flags = Vec::new();
+    if player.contains("iina") {
+        player_flags.push("--keep-running".to_string());
+    } else if !player.contains("vlc") {
+        player_flags.push("--input-terminal=no".to_string());
+    }
 
     if let Some(ref sock) = opts.ipc_socket {
         cmd.env("SOLUS_IPC_SOCKET", sock);
@@ -818,7 +977,8 @@ mod tests {
 
     #[test]
     fn test_resolve_player_keeps_vlc() {
-        assert_eq!(resolve_player("vlc"), "vlc");
+        let resolved = resolve_player("vlc");
+        assert!(resolved.to_lowercase().contains("vlc"));
     }
 
     #[test]

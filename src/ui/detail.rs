@@ -407,10 +407,12 @@ fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anim
         let card_inner = card_block.inner(card_rect);
         frame.render_widget(card_block, card_rect);
 
-        // Split card horizontally: [ 16:9 Thumbnail (aspect ratio ~3.33 cells wide/high) | Episode info ]
-        let thumb_width = ((card_inner.height as f32 * 3.333).round() as u16)
-            .max(10)
-            .min(card_inner.width.saturating_sub(20));
+        // Split card horizontally: [ 16:9 Thumbnail (fits frame with zero deadspace) | Episode info ]
+        let (font_w, font_h) = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
+        let font_w = (font_w as f32).max(1.0);
+        let font_h = (font_h as f32).max(1.0);
+        let thumb_width = ((card_inner.height as f32 * font_h * 16.0) / (font_w * 9.0)).round() as u16;
+        let thumb_width = thumb_width.max(10).min(card_inner.width.saturating_sub(20));
         let card_cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -727,8 +729,12 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
         ])
         .split(insp_inner);
 
-    // Calculate exact 16:9 width (~3.33 columns per row) so thumbnail fits frame with zero deadspace
-    let thumb_w = ((max_thumb_h as f32 * 3.333).round() as u16).min(insp_rows[0].width);
+    // Calculate exact 16:9 width so thumbnail fits frame with zero deadspace
+    let (font_w, font_h) = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
+    let font_w = (font_w as f32).max(1.0);
+    let font_h = (font_h as f32).max(1.0);
+    let thumb_w = ((max_thumb_h as f32 * font_h * 16.0) / (font_w * 9.0)).round() as u16;
+    let thumb_w = thumb_w.min(insp_rows[0].width);
     let top_split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
