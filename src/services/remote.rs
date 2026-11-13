@@ -253,25 +253,27 @@ pub async fn broadcast_state(state: &Arc<RwLock<RemotePlaybackState>>) {
 
 /// Dispatches an mpv JSON-RPC command over the persistent Unix domain socket or Windows named pipe connection.
 pub async fn send_mpv_json_command(preferred_sock: &str, cmd_value: serde_json::Value) -> bool {
-    let target_sock = match resolve_active_socket(preferred_sock).await {
-        Some(s) => s,
-        None => return false,
-    };
-
     let payload = format!("{}\n", cmd_value);
     let mut guard = CACHED_IPC.lock().await;
 
-    // Try reusing existing open stream
-    if let Some((ref cached_path, ref mut stream)) = *guard {
-        if cached_path == &target_sock
-            && stream.write_all(payload.as_bytes()).await.is_ok()
+    // 1. Zero-I/O Fast Path: try reusing existing open stream without scanning /tmp
+    if let Some((_, ref mut stream)) = *guard {
+        if stream.write_all(payload.as_bytes()).await.is_ok()
             && stream.flush().await.is_ok()
         {
             return true;
         }
     }
 
-    // Connect fresh stream
+    // 2. Fallback: resolve active socket on disk and connect fresh stream
+    let target_sock = match resolve_active_socket(preferred_sock).await {
+        Some(s) => s,
+        None => {
+            *guard = None;
+            return false;
+        }
+    };
+
     if let Some(mut stream) = connect_remote_ipc(&target_sock).await {
         let ok = stream.write_all(payload.as_bytes()).await.is_ok() && stream.flush().await.is_ok();
         *guard = Some((target_sock, stream));
@@ -316,6 +318,9 @@ pub fn spawn_remote_server(
                     continue;
                 }
             };
+
+            // Disable Nagle's algorithm so 30-byte WebSocket touch commands flush in <1ms
+            let _ = socket.set_nodelay(true);
 
             let state_clone = Arc::clone(&state);
             let sock_path_clone = sock_path.clone();
@@ -646,6 +651,27 @@ async fn handle_remote_action(
                 let shader_arg = crate::services::shaders::build_shader_arg(mode).unwrap_or_default();
                 let cmd = serde_json::json!({ "command": ["set_property", "glsl-shaders", shader_arg] });
                 let _ = send_mpv_json_command(sock_path, cmd).await;
+
+                // Toggle hardware debanding & high-precision scaling alongside shaders
+                let deband_val = if mode == crate::config::Anime4KMode::Off { "no" } else { "yes" };
+                let _ = send_mpv_json_command(
+                    sock_path,
+                    serde_json::json!({ "command": ["set_property", "deband", deband_val] }),
+                )
+                .await;
+
+                // Show instant visual confirmation banner on the video screen
+                let osd_label = match mode {
+                    crate::config::Anime4KMode::Off => "✦ Anime4K: OFF (Native Stream)",
+                    crate::config::Anime4KMode::Balanced => "✦ Anime4K: BALANCED 2x (Line Reconstruction + 2x Upscale + Deband)",
+                    crate::config::Anime4KMode::Ultra => "✦ Anime4K: ULTRA 4K (Sobel Line Thinning + 2x CAS + Deband)",
+                };
+                let _ = send_mpv_json_command(
+                    sock_path,
+                    serde_json::json!({ "command": ["show-text", osd_label, 3000] }),
+                )
+                .await;
+
                 if let Some(tx) = tx_app {
                     let _ = tx.send(crate::AppMessage::RemoteAnime4K(mode)).await;
                 }
@@ -718,7 +744,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       --radius-md: 16px;
       --radius-lg: 22px;
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
     body {
       background: var(--bg);
       color: var(--text);
@@ -1215,6 +1241,11 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     let localTimePos = 0;
     let localDuration = 0;
     let currentState = null;
+    let lastPosterUrl = '';
+    let lastSubtitlesKey = '';
+    let lastEpisodesKey = '';
+    let lastSeekSent = 0;
+    let lastVolSent = 0;
 
     const scrubber = document.getElementById('scrubber');
     const playBtn = document.getElementById('play-btn');
@@ -1226,21 +1257,32 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       const pos = parseFloat(scrubber.value);
       document.getElementById('time-pos').innerText = formatTime(pos);
       document.getElementById('time-dur').innerText = `-${formatTime(Math.max(0, localDuration - pos))}`;
+      const now = Date.now();
+      if (now - lastSeekSent > 60) {
+        lastSeekSent = now;
+        sendAction('set_pos', { pos: pos }, true);
+      }
     });
 
     scrubber.addEventListener('change', () => {
       const pos = parseFloat(scrubber.value);
       localTimePos = pos;
       sendAction('set_pos', { pos: pos });
-      setTimeout(() => { isDragging = false; }, 250);
+      setTimeout(() => { isDragging = false; }, 150);
     });
 
     scrubber.addEventListener('touchend', () => {
-      setTimeout(() => { isDragging = false; }, 300);
+      setTimeout(() => { isDragging = false; }, 180);
     });
 
     volSlider.addEventListener('input', () => {
-      volVal.innerText = volSlider.value + '%';
+      const val = parseInt(volSlider.value);
+      volVal.innerText = val + '%';
+      const now = Date.now();
+      if (now - lastVolSent > 45) {
+        lastVolSent = now;
+        sendAction('set_volume', { value: val }, true);
+      }
     });
 
     volSlider.addEventListener('change', () => {
@@ -1277,7 +1319,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       document.getElementById('backdrop').classList.add('active');
       const drawer = document.getElementById(`drawer-${id}`);
       if (drawer) drawer.classList.add('active');
-      if (navigator.vibrate) navigator.vibrate(20);
+      if (navigator.vibrate) navigator.vibrate(15);
     }
 
     function closeAllDrawers() {
@@ -1285,7 +1327,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       document.querySelectorAll('.drawer').forEach(d => d.classList.remove('active'));
     }
 
-    /* State Renderer */
+    /* State Renderer with Dirty-Checked DOM Diffing */
     function renderState(data) {
       if (!data) return;
       currentState = data;
@@ -1301,12 +1343,16 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       document.getElementById('audio-badge').innerText = (data.audio_mode || 'sub').toUpperCase();
       document.getElementById('sub-badge').innerText = data.sub_lang || 'Subtitles';
 
-      // Poster thumbnail
-      const pBox = document.getElementById('poster-box');
-      if (data.poster_url && data.poster_url.startsWith('http')) {
-        pBox.innerHTML = `<img src="${data.poster_url}" alt="Poster" />`;
-      } else {
-        pBox.innerHTML = '❖';
+      // Only update poster DOM if URL actually changed
+      const posterUrl = (data.poster_url && data.poster_url.startsWith('http')) ? data.poster_url : '';
+      if (posterUrl !== lastPosterUrl) {
+        lastPosterUrl = posterUrl;
+        const pBox = document.getElementById('poster-box');
+        if (posterUrl) {
+          pBox.innerHTML = `<img src="${posterUrl}" alt="Poster" />`;
+        } else {
+          pBox.innerHTML = '❖';
+        }
       }
 
       playBtn.innerText = data.is_playing ? '❚❚' : '▶';
@@ -1327,11 +1373,19 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       const delay = data.sub_delay || 0.0;
       document.getElementById('sub-delay-val').innerText = `${delay >= 0 ? '+' : ''}${delay.toFixed(2)}s`;
 
-      // Subtitles List
-      renderSubtitlesList(data.subtitles);
+      // Only rebuild Subtitles List if track data or active selection changed
+      const subKey = JSON.stringify(data.subtitles || []);
+      if (subKey !== lastSubtitlesKey) {
+        lastSubtitlesKey = subKey;
+        renderSubtitlesList(data.subtitles);
+      }
 
-      // Episodes List
-      renderEpisodesList(data.episodes, data.episode);
+      // Only rebuild Episodes List if episode catalog or current episode changed
+      const epKey = `${data.episode}:${(data.episodes || []).length}`;
+      if (epKey !== lastEpisodesKey) {
+        lastEpisodesKey = epKey;
+        renderEpisodesList(data.episodes, data.episode);
+      }
 
       // Speed & Audio Pills
       updateSpeedPills(data.speed || 1.0);
@@ -1480,9 +1534,9 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       }
     }
 
-    async function sendAction(action, payload = {}) {
-      if (navigator.vibrate) {
-        try { navigator.vibrate(25); } catch (e) {}
+    async function sendAction(action, payload = {}, silent = false) {
+      if (!silent && navigator.vibrate) {
+        try { navigator.vibrate(18); } catch (e) {}
       }
 
       const body = { action, ...payload };

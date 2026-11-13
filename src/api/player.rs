@@ -430,9 +430,9 @@ fi
 
 if [ -n "$SOLUS_SHADERS" ]; then
     if [ "$is_iina" -eq 1 ]; then
-        args+=("--mpv-glsl-shaders=$SOLUS_SHADERS")
+        args+=("--mpv-glsl-shaders=$SOLUS_SHADERS" "--mpv-scale=ewa_lanczossharp" "--mpv-cscale=ewa_lanczossharp" "--mpv-dscale=mitchell" "--mpv-correct-downscaling=yes" "--mpv-linear-downscaling=yes" "--mpv-sigmoid-upscaling=yes" "--mpv-deband=yes" "--mpv-deband-iterations=2" "--mpv-deband-threshold=35" "--mpv-deband-range=16")
     elif [ "$is_vlc" -eq 0 ]; then
-        args+=("--glsl-shaders=$SOLUS_SHADERS")
+        args+=("--glsl-shaders=$SOLUS_SHADERS" "--scale=ewa_lanczossharp" "--cscale=ewa_lanczossharp" "--dscale=mitchell" "--correct-downscaling=yes" "--linear-downscaling=yes" "--sigmoid-upscaling=yes" "--deband=yes" "--deband-iterations=2" "--deband-threshold=35" "--deband-range=16")
     fi
 fi
 
@@ -630,6 +630,16 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 }
                 if let Some(ref shaders) = opts.glsl_shaders {
                     cmd.arg(format!("--mpv-glsl-shaders={}", shaders));
+                    cmd.arg("--mpv-scale=ewa_lanczossharp");
+                    cmd.arg("--mpv-cscale=ewa_lanczossharp");
+                    cmd.arg("--mpv-dscale=mitchell");
+                    cmd.arg("--mpv-correct-downscaling=yes");
+                    cmd.arg("--mpv-linear-downscaling=yes");
+                    cmd.arg("--mpv-sigmoid-upscaling=yes");
+                    cmd.arg("--mpv-deband=yes");
+                    cmd.arg("--mpv-deband-iterations=2");
+                    cmd.arg("--mpv-deband-threshold=35");
+                    cmd.arg("--mpv-deband-range=16");
                 }
                 if let Some(ref style) = opts.sub_style {
                     for flag in style.to_mpv_flags() {
@@ -672,6 +682,16 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 if let Some(ref shaders) = opts.glsl_shaders {
                     cmd.env("SOLUS_SHADERS", shaders);
                     cmd.arg(format!("--glsl-shaders={}", shaders));
+                    cmd.arg("--scale=ewa_lanczossharp");
+                    cmd.arg("--cscale=ewa_lanczossharp");
+                    cmd.arg("--dscale=mitchell");
+                    cmd.arg("--correct-downscaling=yes");
+                    cmd.arg("--linear-downscaling=yes");
+                    cmd.arg("--sigmoid-upscaling=yes");
+                    cmd.arg("--deband=yes");
+                    cmd.arg("--deband-iterations=2");
+                    cmd.arg("--deband-threshold=35");
+                    cmd.arg("--deband-range=16");
                 }
 
                 if let Some(ref style) = opts.sub_style {
