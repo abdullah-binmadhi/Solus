@@ -8,7 +8,7 @@ mod ui;
 
 use anyhow::Context;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -117,9 +117,15 @@ async fn main() -> anyhow::Result<()> {
     // ── Terminal setup ────────────────────────────────────────────────────────
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend      = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    // Drain any leftover input events from shell launch (e.g. Enter pressed when typing `solus`)
+    // or terminal emulator query replies (e.g. WezTerm/ConPTY DA1 queries on Windows).
+    while event::poll(Duration::from_millis(50)).unwrap_or(false) {
+        let _ = event::read();
+    }
 
     // ── Message channel (background tasks → UI loop) ──────────────────────────
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AppMessage>(64);
@@ -755,11 +761,21 @@ async fn main() -> anyhow::Result<()> {
             needs_redraw = false;
         }
 
-        // Poll keyboard with short timeout so background messages stay responsive
+        // Poll input with short timeout so background messages stay responsive
         if event::poll(Duration::from_millis(30))? {
-            if let Event::Key(key) = event::read()? {
-                needs_redraw = true;
-                handle_key(key, &mut state, &mut home_data, &pool, &mut cfg, &tx).await;
+            match event::read()? {
+                Event::Key(key) => {
+                    // On Windows, Crossterm emits both KeyEventKind::Press and KeyEventKind::Release.
+                    // Ignoring Release prevents every keypress from triggering twice.
+                    if key.kind != event::KeyEventKind::Release {
+                        needs_redraw = true;
+                        handle_key(key, &mut state, &mut home_data, &pool, &mut cfg, &tx).await;
+                    }
+                }
+                Event::Resize(_, _) => {
+                    needs_redraw = true;
+                }
+                _ => {}
             }
         }
 
@@ -771,11 +787,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Cleanup ───────────────────────────────────────────────────────────────
     state.stop_player();
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
 }
