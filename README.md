@@ -136,18 +136,18 @@ On Windows, **WezTerm** brings full picture support so anime covers and episode 
 #### Step 1: Install WezTerm, Video Players & Tools
 Open **PowerShell** (search "PowerShell" in your Start Menu) and choose either option:
 
-**Option A (Recommended — using `winget` built into Windows 10 & 11)**:
-```powershell
-winget install --id wez.wezterm -e --accept-package-agreements
-"shinchiro.mpv", "VideoLAN.VLC", "pystardust.ani-cli" | ForEach-Object { winget install --id $_ -e --accept-package-agreements --accept-source-agreements }
-```
-
-**Option B (Using Scoop)**:
+**Option A (Recommended — using Scoop)**:
 ```powershell
 Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 iwr -useb get.scoop.sh | iex
 scoop bucket add extras
 scoop install wezterm mpv vlc ani-cli git yt-dlp
+```
+
+**Option B (Using winget for players)**:
+```powershell
+winget install --id wez.wezterm -e --accept-package-agreements
+winget install --id shinchiro.mpv -e --accept-package-agreements; winget install --id VideoLAN.VLC -e --accept-package-agreements
 ```
 
 #### Step 2: Install Solus
@@ -190,11 +190,11 @@ Solus is engine-agnostic and supports multiple media player backends. You can sw
   ```
 
 #### Windows (PowerShell)
-- **Install All Players (`mpv` + `VLC` + `ani-cli`) via `winget` (Built into Windows 10/11)**:
+- **Install Players via Scoop (`mpv` + `VLC` + `ani-cli`)**:
   ```powershell
-  "shinchiro.mpv", "VideoLAN.VLC", "pystardust.ani-cli" | ForEach-Object { winget install --id $_ -e --accept-package-agreements --accept-source-agreements }
+  scoop install mpv vlc ani-cli
   ```
-- **Install All Players only (`mpv` + `VLC`) via `winget`**:
+- **Install Players via `winget` (`mpv` + `VLC`)**:
   ```powershell
   winget install --id shinchiro.mpv -e --accept-package-agreements; winget install --id VideoLAN.VLC -e --accept-package-agreements
   ```

@@ -105,6 +105,90 @@ enum AppMessage {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
+#[cfg(windows)]
+fn detect_windows_terminal_font_size() -> (u16, u16) {
+    #[repr(C)]
+    struct RECT {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[repr(C)]
+    struct COORD {
+        x: i16,
+        y: i16,
+    }
+    #[repr(C)]
+    struct CONSOLE_FONT_INFOEX {
+        cb_size: u32,
+        n_font: u32,
+        dw_font_size: COORD,
+        font_family: u32,
+        font_weight: u32,
+        face_name: [u16; 32],
+    }
+    extern "system" {
+        fn GetConsoleWindow() -> *mut std::ffi::c_void;
+        fn GetClientRect(hwnd: *mut std::ffi::c_void, lp_rect: *mut RECT) -> i32;
+        fn GetStdHandle(n_std_handle: u32) -> *mut std::ffi::c_void;
+        fn GetCurrentConsoleFontEx(
+            h_console_output: *mut std::ffi::c_void,
+            b_maximum_window: i32,
+            lp_console_current_font_ex: *mut CONSOLE_FONT_INFOEX,
+        ) -> i32;
+    }
+
+    // 1. Calculate from Console Window Client Rect and terminal size
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        if cols > 0 && rows > 0 {
+            unsafe {
+                let hwnd = GetConsoleWindow();
+                if !hwnd.is_null() {
+                    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    if GetClientRect(hwnd, &mut rect) != 0 {
+                        let w = (rect.right - rect.left).max(0) as u32;
+                        let h = (rect.bottom - rect.top).max(0) as u32;
+                        let fw = (w / cols as u32) as u16;
+                        let fh = (h / rows as u32) as u16;
+                        if (6..=36).contains(&fw) && (12..=72).contains(&fh) {
+                            return (fw, fh);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Query console font info
+    unsafe {
+        let h_stdout = GetStdHandle(0xfffffff5); // STD_OUTPUT_HANDLE = -11
+        if !h_stdout.is_null() && h_stdout as isize != -1 {
+            let mut cfi: CONSOLE_FONT_INFOEX = std::mem::zeroed();
+            cfi.cb_size = std::mem::size_of::<CONSOLE_FONT_INFOEX>() as u32;
+            if GetCurrentConsoleFontEx(h_stdout, 0, &mut cfi) != 0 {
+                let fw = cfi.dw_font_size.x.max(0) as u16;
+                let fh = cfi.dw_font_size.y.max(0) as u16;
+                if (6..=36).contains(&fw) && (12..=72).contains(&fh) {
+                    return (fw, fh);
+                }
+            }
+        }
+    }
+
+    // 3. Fallback based on known terminal emulators on Windows
+    if std::env::var("WEZTERM_EXECUTABLE").is_ok()
+        || std::env::var("TERM_PROGRAM").map(|t| t.contains("WezTerm")).unwrap_or(false)
+    {
+        return (14, 28);
+    }
+    if std::env::var("WT_SESSION").is_ok() {
+        return (12, 24);
+    }
+
+    (11, 22)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // ── Config + DB ───────────────────────────────────────────────────────────
@@ -137,7 +221,7 @@ async fn main() -> anyhow::Result<()> {
     state.playback_player_cursor = state.playback_players.iter().position(|p| *p == cfg.player).unwrap_or(0);
     let mut home_data = ui::home::HomeData::empty();
     refresh_dependency_status(&mut state);
-    if !state.has_ani_cli || !state.has_any_player() {
+    if !state.has_any_player() {
         state.open_setup();
     }
 
@@ -164,14 +248,22 @@ async fn main() -> anyhow::Result<()> {
     // guess_protocol() probes the terminal — must happen after EnterAlternateScreen.
     #[cfg(unix)]
     let mut picker = ratatui_image::picker::Picker::from_termios()
-        .unwrap_or_else(|_| ratatui_image::picker::Picker::new((9, 18)));
-    #[cfg(not(unix))]
-    let mut picker = ratatui_image::picker::Picker::new((9, 18));
+        .unwrap_or_else(|_| ratatui_image::picker::Picker::new((10, 20)));
+    #[cfg(windows)]
+    let mut picker = ratatui_image::picker::Picker::new(detect_windows_terminal_font_size());
+    #[cfg(not(any(unix, windows)))]
+    let mut picker = ratatui_image::picker::Picker::new((10, 20));
+
     picker.guess_protocol();
     if std::env::var("KITTY_WINDOW_ID").is_ok()
         || std::env::var("TERM").map(|t| t.contains("kitty")).unwrap_or(false)
     {
         picker.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
+    }
+    if std::env::var("WEZTERM_EXECUTABLE").is_ok()
+        || std::env::var("TERM_PROGRAM").map(|t| t.contains("WezTerm")).unwrap_or(false)
+    {
+        picker.protocol_type = ratatui_image::picker::ProtocolType::Iterm2;
     }
     state.picker = Some(picker);
 
@@ -3542,12 +3634,12 @@ async fn start_playback(
 
     let (has_ani_cli, has_mpv, has_iina, has_vlc) = api::player::detect_dependencies();
     state.set_dependencies(has_ani_cli, has_mpv, has_iina, has_vlc);
-    if !has_ani_cli {
-        state.show_toast("ani-cli is not installed. Open ! for setup help.", unix_now());
+    if opts.stream_url.is_none() && !has_ani_cli {
+        state.show_toast("ani-cli is required for Pahe/Gogo streams. Open ! for setup help.", unix_now());
         return;
     }
     if !(has_mpv || has_iina || has_vlc) {
-        state.show_toast("No supported player found. Open ! for setup help.", unix_now());
+        state.show_toast("No supported player found (mpv/vlc). Open ! for setup help.", unix_now());
         return;
     }
 

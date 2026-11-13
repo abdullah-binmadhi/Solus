@@ -113,7 +113,10 @@ fn render_info(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anim
 
     // Cover: real image when terminal supports it, halfblock otherwise
     if state.has_image_support() {
-        if let Some(cover) = state.detail_cache.get_mut(&anime.id) {
+        if let Some(cover) = state.detail_cache.get_mut(&anime.id)
+            .or_else(|| state.cover_cache.get_mut(&anime.id))
+            .or_else(|| state.banner_cache.get_mut(&anime.id))
+        {
             let image_widget = ratatui_image::StatefulImage::new(None)
                 .resize(ratatui_image::Resize::Fit(None));
             frame.render_stateful_widget(image_widget, cover_inner, cover);

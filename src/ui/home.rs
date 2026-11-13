@@ -170,9 +170,9 @@ fn render_featured(frame: &mut Frame, area: Rect, state: &mut AppState, anime: O
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(20), // Cover art (portrait)
-            Constraint::Length(1),  // Vertical divider
-            Constraint::Min(0),     // Anime info & actions
+            Constraint::Length(CARD_WIDTH), // Cover art (matches card width = 22, inner = 20x6)
+            Constraint::Length(1),          // Vertical divider
+            Constraint::Min(0),             // Anime info & actions
         ])
         .split(inner);
 
@@ -242,7 +242,11 @@ fn render_featured(frame: &mut Frame, area: Rect, state: &mut AppState, anime: O
     frame.render_widget(cover_block, cols[0]);
 
     if state.has_image_support() {
-        if let Some(cover) = state.banner_cache.get_mut(&anime.id).or_else(|| state.cover_cache.get_mut(&anime.id)) {
+        if let Some(cover) = state.anime_banners.get_mut(&anime.id)
+            .or_else(|| state.banner_cache.get_mut(&anime.id))
+            .or_else(|| state.cover_cache.get_mut(&anime.id))
+            .or_else(|| state.detail_cache.get_mut(&anime.id))
+        {
             let image_widget = ratatui_image::StatefulImage::new(None)
                 .resize(ratatui_image::Resize::Fit(None));
             frame.render_stateful_widget(image_widget, cover_inner, cover);

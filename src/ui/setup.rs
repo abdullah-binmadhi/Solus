@@ -103,11 +103,11 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState, cfg: &config::Config)
     #[cfg(target_os = "windows")]
     let suggestions = Paragraph::new(vec![
         Line::from(Span::styled(
-            "Recommended Windows setup (PowerShell winget)",
+            "Recommended Windows setup (PowerShell & Scoop)",
             Style::default().fg(Color::Rgb(180, 0, 255)).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            r#""shinchiro.mpv", "VideoLAN.VLC", "pystardust.ani-cli" | ForEach-Object { winget install --id $_ -e }"#,
+            r#"scoop install mpv vlc ani-cli  (or winget: winget install --id shinchiro.mpv -e)"#,
             Style::default().fg(Color::Rgb(205, 205, 215)),
         )),
         Line::from(Span::styled(

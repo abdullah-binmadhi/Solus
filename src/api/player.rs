@@ -113,11 +113,20 @@ pub fn detect_dependencies() -> (bool, bool, bool, bool) {
 fn command_exists(name: &str) -> bool {
     if let Some(path) = env::var_os("PATH") {
         let found = env::split_paths(&path).any(|dir| {
-            executable_exists(&dir.join(name))
-                || (cfg!(windows)
-                    && (executable_exists(&dir.join(format!("{}.exe", name)))
-                        || executable_exists(&dir.join(format!("{}.cmd", name)))
-                        || executable_exists(&dir.join(format!("{}.bat", name)))))
+            #[cfg(unix)]
+            {
+                executable_exists(&dir.join(name))
+            }
+            #[cfg(windows)]
+            {
+                executable_exists(&dir.join(format!("{}.exe", name)))
+                    || executable_exists(&dir.join(format!("{}.cmd", name)))
+                    || executable_exists(&dir.join(format!("{}.bat", name)))
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                executable_exists(&dir.join(name))
+            }
         });
         if found {
             return true;
@@ -169,15 +178,11 @@ fn windows_player_path(name: &str) -> Option<String> {
 
 #[cfg(windows)]
 fn find_windows_ani_cli() -> Option<PathBuf> {
-    // 1. Search PATH entries
+    // 1. Search PATH entries for .cmd, .bat, or .exe
     if let Some(path) = env::var_os("PATH") {
         for dir in env::split_paths(&path) {
-            for ext in &["cmd", "bat", "exe", ""] {
-                let candidate = if ext.is_empty() {
-                    dir.join("ani-cli")
-                } else {
-                    dir.join(format!("ani-cli.{}", ext))
-                };
+            for ext in &["cmd", "bat", "exe"] {
+                let candidate = dir.join(format!("ani-cli.{}", ext));
                 if executable_exists(&candidate) {
                     return Some(candidate);
                 }
@@ -538,14 +543,20 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     // 2. Fallback playback via ani-cli
     #[cfg(windows)]
     let mut cmd = {
-        let mut c = Command::new("cmd");
-        c.arg("/C");
         if let Some(target) = find_windows_ani_cli() {
-            c.arg(target);
+            let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat") {
+                let mut c = Command::new("cmd");
+                c.arg("/C").arg(target);
+                c
+            } else {
+                Command::new(target)
+            }
         } else {
-            c.arg("ani-cli");
+            return Err(AppError::Player(
+                "ani-cli was not found. Install it via 'scoop install ani-cli' or select AllAnime provider for direct streaming.".to_string(),
+            ));
         }
-        c
     };
     #[cfg(not(windows))]
     let mut cmd = Command::new("ani-cli");
