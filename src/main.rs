@@ -8,7 +8,7 @@ mod ui;
 
 use anyhow::Context;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -117,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Terminal setup ────────────────────────────────────────────────────────
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend      = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -766,10 +766,15 @@ async fn main() -> anyhow::Result<()> {
             match event::read()? {
                 Event::Key(key) => {
                     // On Windows, Crossterm emits both KeyEventKind::Press and KeyEventKind::Release.
-                    // Ignoring Release prevents every keypress from triggering twice.
-                    if key.kind != event::KeyEventKind::Release {
+                    // Only process Press events so keys never double-type.
+                    if key.kind == event::KeyEventKind::Press {
                         needs_redraw = true;
                         handle_key(key, &mut state, &mut home_data, &pool, &mut cfg, &tx).await;
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    if handle_mouse(mouse, &mut state, &mut home_data, &pool, &mut cfg, &tx).await {
+                        needs_redraw = true;
                     }
                 }
                 Event::Resize(_, _) => {
@@ -787,7 +792,11 @@ async fn main() -> anyhow::Result<()> {
     // ── Cleanup ───────────────────────────────────────────────────────────────
     state.stop_player();
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -826,6 +835,357 @@ async fn handle_key(
         Screen::RemoteModal => handle_remote_modal(key, state).await,
         Screen::CastModal => handle_cast_modal(key, state, tx).await,
         Screen::CastDeck => handle_cast_deck(key, state).await,
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let popup_layout = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Percentage((100 - percent_y) / 2),
+            ratatui::layout::Constraint::Percentage(percent_y),
+            ratatui::layout::Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Horizontal)
+        .constraints([
+            ratatui::layout::Constraint::Percentage((100 - percent_x) / 2),
+            ratatui::layout::Constraint::Percentage(percent_x),
+            ratatui::layout::Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+async fn handle_mouse(
+    mouse:     event::MouseEvent,
+    state:     &mut AppState,
+    home_data: &mut ui::home::HomeData,
+    pool:      &sqlx::SqlitePool,
+    cfg:       &mut config::Config,
+    tx:        &tokio::sync::mpsc::Sender<AppMessage>,
+) -> bool {
+    let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 24));
+    let term_area = ratatui::layout::Rect::new(0, 0, term_w, term_h);
+
+    // Right-click always acts as Back / Esc
+    if matches!(mouse.kind, event::MouseEventKind::Down(event::MouseButton::Right)) {
+        state.go_back();
+        return true;
+    }
+
+    match mouse.kind {
+        event::MouseEventKind::ScrollDown => {
+            match state.screen {
+                Screen::Home => {
+                    state.active_row = next_non_empty_row(&state.active_row, home_data, 1);
+                    refresh_home_cover(state, home_data, pool, tx);
+                    true
+                }
+                Screen::Detail => {
+                    let ep = state.selected_episode.unwrap_or(1);
+                    let max_ep = state.selected_anime.as_ref().and_then(|a| a.episodes).map(|e| e as u32).unwrap_or(1);
+                    if ep < max_ep {
+                        state.selected_episode = Some(ep + 1);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Screen::PlaybackOptions => {
+                    match state.playback_focus_column {
+                        0 => {
+                            if state.playback_player_cursor + 1 < state.playback_players.len() {
+                                state.playback_player_cursor += 1;
+                                true
+                            } else { false }
+                        }
+                        1 => {
+                            if state.playback_provider_cursor + 1 < state.playback_providers.len() {
+                                state.playback_provider_cursor += 1;
+                                state.sync_active_provider();
+                                true
+                            } else { false }
+                        }
+                        2 => {
+                            if state.playback_quality_cursor + 1 < state.playback_qualities.len() {
+                                state.playback_quality_cursor += 1;
+                                true
+                            } else { false }
+                        }
+                        _ => {
+                            if state.playback_sub_cursor + 1 < state.playback_sub_languages.len() {
+                                state.playback_sub_cursor += 1;
+                                true
+                            } else { false }
+                        }
+                    }
+                }
+                Screen::Search if !state.search_results.is_empty() && state.search_cursor + 1 < state.search_results.len() => {
+                    state.search_cursor += 1;
+                    if let Some(a) = state.search_results.get(state.search_cursor) {
+                        state.cover_anime_id = Some(a.id);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+        event::MouseEventKind::ScrollUp => {
+            match state.screen {
+                Screen::Home => {
+                    state.active_row = next_non_empty_row(&state.active_row, home_data, -1);
+                    refresh_home_cover(state, home_data, pool, tx);
+                    true
+                }
+                Screen::Detail => {
+                    let ep = state.selected_episode.unwrap_or(1);
+                    if ep > 1 {
+                        state.selected_episode = Some(ep - 1);
+                        true
+                    } else { false }
+                }
+                Screen::PlaybackOptions => {
+                    match state.playback_focus_column {
+                        0 => {
+                            state.playback_player_cursor = state.playback_player_cursor.saturating_sub(1);
+                            true
+                        }
+                        1 => {
+                            state.playback_provider_cursor = state.playback_provider_cursor.saturating_sub(1);
+                            state.sync_active_provider();
+                            true
+                        }
+                        2 => {
+                            state.playback_quality_cursor = state.playback_quality_cursor.saturating_sub(1);
+                            true
+                        }
+                        _ => {
+                            state.playback_sub_cursor = state.playback_sub_cursor.saturating_sub(1);
+                            true
+                        }
+                    }
+                }
+                Screen::Search if state.search_cursor > 0 => {
+                    state.search_cursor -= 1;
+                    if let Some(a) = state.search_results.get(state.search_cursor) {
+                        state.cover_anime_id = Some(a.id);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+        event::MouseEventKind::Down(event::MouseButton::Left) => {
+            let (mx, my) = (mouse.column, mouse.row);
+            match state.screen {
+                Screen::Home => {
+                    // Featured Banner (top 10 rows)
+                    if my < 10 {
+                        let banner_anime = active_anime(state, home_data).or_else(|| home_data.featured.clone());
+                        if let Some(anime) = banner_anime {
+                            open_detail_from_anime(state, anime, pool, tx).await;
+                            return true;
+                        }
+                    }
+                    // Bottom Navigation Bar (footer)
+                    if my >= term_h.saturating_sub(2) {
+                        if mx < 18 {
+                            state.open_search();
+                            return true;
+                        } else if mx < 35 {
+                            state.open_tailored_wizard();
+                            return true;
+                        } else if mx < 55 {
+                            state.theme_index = (state.theme_index + 1) % ui::theme::THEMES.len();
+                            let theme_name = state.theme().name;
+                            state.show_toast(format!("Theme: {}", theme_name), unix_now());
+                            return true;
+                        } else if mx < 80 {
+                            state.open_login();
+                            return true;
+                        }
+                    }
+                    // Rows & Cards
+                    if my >= 11 && my < term_h.saturating_sub(2) {
+                        let rel_y = my - 11;
+                        let row_h = 9;
+                        let clicked_row_idx = (rel_y / row_h) as usize;
+                        let card_pitch = 23;
+                        let clicked_card_col = (mx / card_pitch) as usize;
+
+                        let rows: Vec<(&str, state::CategoryRow, &[db::cache::Anime])> = vec![
+                            ("continue_watching", state::CategoryRow::ContinueWatching, &home_data.continue_watching),
+                            ("watchlist",         state::CategoryRow::Watchlist,        &home_data.watchlist),
+                            ("recommended",       state::CategoryRow::Recommended,      &home_data.recommended),
+                            ("trending",          state::CategoryRow::Trending,         &home_data.trending),
+                            ("popular",           state::CategoryRow::Popular,          &home_data.popular),
+                            ("top_rated",         state::CategoryRow::TopRated,         &home_data.top_rated),
+                            ("seasonal",          state::CategoryRow::Seasonal,         &home_data.seasonal),
+                        ];
+                        let visible: Vec<_> = rows.into_iter().filter(|(_, _, items)| !items.is_empty()).collect();
+                        if let Some((key, cat_row, items)) = visible.get(clicked_row_idx) {
+                            state.active_row = cat_row.clone();
+                            let offset = state.row_offset(key);
+                            let target_idx = offset + clicked_card_col;
+                            if let Some(anime) = items.get(target_idx) {
+                                state.row_offsets.insert(key.to_string(), target_idx);
+                                open_detail_from_anime(state, anime.clone(), pool, tx).await;
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                }
+                Screen::Detail => {
+                    // Hint bar / back
+                    if my == 0 {
+                        if mx < 8 {
+                            state.go_back();
+                            return true;
+                        } else if mx < 25 {
+                            begin_playback_flow(state, pool, cfg, false, tx).await;
+                            return true;
+                        } else if mx < 45 {
+                            state.episode_view_mode = match state.episode_view_mode {
+                                state::EpisodeViewMode::List => state::EpisodeViewMode::Split,
+                                state::EpisodeViewMode::Split => state::EpisodeViewMode::List,
+                            };
+                            return true;
+                        } else if mx < 60 {
+                            let q = state.selected_anime.as_ref().map(|a| a.playback_query()).unwrap_or_default();
+                            let ep = state.selected_episode.unwrap_or(1);
+                            let dub = cfg.audio_mode == config::AudioMode::Dub;
+                            let player = cfg.player;
+                            state.open_playback_options(q, 0, dub, player);
+                            if let Some(ref anime) = state.selected_anime {
+                                trigger_stream_detection(anime, ep, dub, tx);
+                            }
+                            return true;
+                        }
+                    }
+                    // Episodes
+                    if my >= 15 {
+                        let rel_ep_row = (my - 15) as usize;
+                        let target_ep = (state.episode_offset + rel_ep_row + 1) as u32;
+                        let max_ep = state.selected_anime.as_ref().and_then(|a| a.episodes).map(|e| e as u32).unwrap_or(1);
+                        if target_ep <= max_ep {
+                            if state.selected_episode == Some(target_ep) {
+                                begin_playback_flow(state, pool, cfg, false, tx).await;
+                            } else {
+                                state.selected_episode = Some(target_ep);
+                            }
+                            return true;
+                        }
+                    }
+                    false
+                }
+                Screen::PlaybackOptions => {
+                    let modal_area = centered_rect(84, 70, term_area);
+                    if mx < modal_area.x || mx >= modal_area.right() || my < modal_area.y || my >= modal_area.bottom() {
+                        state.go_back();
+                        return true;
+                    }
+                    // Header options: row 2 of modal
+                    if my == modal_area.y + 2 {
+                        let rel_x = mx.saturating_sub(modal_area.x);
+                            if rel_x < 28 {
+                                state.cycle_playback_player();
+                                state.show_toast(format!("Player: {}", state.selected_player().as_str()), unix_now());
+                                return true;
+                            } else if rel_x < 55 {
+                                if !state.pending_dub && state.dub_available == Some(false) {
+                                    state.show_toast("English Dub is not available for this anime (Sub only)", unix_now());
+                                } else {
+                                    state.pending_dub = !state.pending_dub;
+                                    state.is_loading_subs = true;
+                                    state.playback_qualities.clear();
+                                    state.playback_sub_languages.clear();
+                                    state.playback_quality_cursor = 0;
+                                    state.playback_sub_cursor = 0;
+                                    if let Some(ref anime) = state.selected_anime {
+                                        let ep = state.selected_episode.unwrap_or(1);
+                                        trigger_stream_detection(anime, ep, state.pending_dub, tx);
+                                    }
+                                }
+                                return true;
+                            } else {
+                                state.toggle_anime4k();
+                                state.show_toast(format!("Anime4K: {}", state.anime4k_mode.as_str()), unix_now());
+                                return true;
+                            }
+                        }
+                    // Footer
+                    if my >= modal_area.bottom().saturating_sub(3) {
+                        let rel_x = mx.saturating_sub(modal_area.x);
+                        if rel_x < 16 {
+                            let enter_key = event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                            handle_playback_options(enter_key, state, pool, cfg, tx).await;
+                            return true;
+                        } else if rel_x >= modal_area.width.saturating_sub(15) {
+                            state.go_back();
+                            return true;
+                        }
+                    }
+                    // Columns
+                    if my >= modal_area.y + 4 && my < modal_area.bottom().saturating_sub(3) {
+                        let rel_x = mx.saturating_sub(modal_area.x);
+                        let w = modal_area.width;
+                        let col0_w = (w * 20) / 100;
+                        let col1_w = (w * 24) / 100;
+                        let col2_w = (w * 22) / 100;
+                        let rel_item_row = (my - (modal_area.y + 5)) as usize;
+
+                        if rel_x < col0_w {
+                            state.playback_focus_column = 0;
+                            if rel_item_row < state.playback_players.len() {
+                                state.playback_player_cursor = rel_item_row;
+                                return true;
+                            }
+                        } else if rel_x < col0_w + col1_w {
+                            state.playback_focus_column = 1;
+                            if rel_item_row < state.playback_providers.len() {
+                                state.playback_provider_cursor = rel_item_row;
+                                state.sync_active_provider();
+                                return true;
+                            }
+                        } else if rel_x < col0_w + col1_w + col2_w {
+                            state.playback_focus_column = 2;
+                            if rel_item_row < state.playback_qualities.len() {
+                                state.playback_quality_cursor = rel_item_row;
+                                return true;
+                            }
+                        } else {
+                            state.playback_focus_column = 3;
+                            if rel_item_row < state.playback_sub_languages.len() {
+                                state.playback_sub_cursor = rel_item_row;
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                }
+                Screen::Search => {
+                    if my >= 4 {
+                        let item_idx = (my - 4) as usize;
+                        if let Some(anime) = state.search_results.get(item_idx) {
+                            open_detail_from_anime(state, anime.clone(), pool, tx).await;
+                            return true;
+                        }
+                    }
+                    false
+                }
+                _ => {
+                    if my == 0 || mx < 5 {
+                        state.go_back();
+                        return true;
+                    }
+                    false
+                }
+            }
+        }
+        _ => false,
     }
 }
 
