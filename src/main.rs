@@ -772,17 +772,88 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(ref anime) = state.selected_anime.clone() {
                         state.selected_episode = Some(ep);
                         let title = anime.display_title().to_string();
-                        let query = anime.playback_query();
-                        let glsl_shaders = services::shaders::build_shader_arg(state.anime4k_mode);
+                        let season_year = anime.season_year;
+
+                        // Reuse exact playback settings from the previous episode (player, dub, quality, provider, sub_lang)
+                        let prev = state.last_play_options.clone();
+                        let query = prev
+                            .as_ref()
+                            .map(|o| o.title.clone())
+                            .unwrap_or_else(|| anime.playback_query());
+                        let is_dub = prev
+                            .as_ref()
+                            .map(|o| o.dub)
+                            .unwrap_or(cfg.audio_mode == config::AudioMode::Dub);
+                        let player = prev
+                            .as_ref()
+                            .map(|o| o.player.clone())
+                            .unwrap_or_else(|| state.selected_player().as_str().to_string());
+                        let quality = prev
+                            .as_ref()
+                            .map(|o| o.quality.clone())
+                            .unwrap_or_else(|| cfg.quality.as_str().to_string());
+                        let pref_sub_lang = prev
+                            .as_ref()
+                            .and_then(|o| o.sub_lang.clone())
+                            .unwrap_or_else(|| cfg.default_sub_lang.clone());
+                        let was_direct_stream = prev
+                            .as_ref()
+                            .map(|o| o.stream_url.is_some())
+                            .unwrap_or(true);
+
+                        state.show_toast(format!("❖ Remote: Loading Episode {}...", ep), unix_now());
+
+                        // Resolve fresh stream URL and subtitle track for the requested episode
+                        let stream_info = api::subtitles::fetch_stream_info(anime.id, &query, ep, is_dub).await;
+                        state.playback_qualities = stream_info.qualities.clone();
+                        state.playback_sub_languages = stream_info.subtitles.clone();
+                        state.playback_providers = stream_info.providers.clone();
+                        state.dub_available = Some(stream_info.dub_available);
+                        state.pending_master_url = stream_info.master_url.clone();
+
+                        let mut stream_url = None;
+                        if was_direct_stream {
+                            stream_url = stream_info
+                                .qualities
+                                .iter()
+                                .find(|q| q.label.eq_ignore_ascii_case(&quality))
+                                .or_else(|| stream_info.qualities.first())
+                                .map(|q| q.url.clone())
+                                .filter(|u| !u.is_empty())
+                                .or_else(|| stream_info.master_url.clone());
+                        }
+
+                        let chosen_sub = stream_info
+                            .subtitles
+                            .iter()
+                            .find(|s| {
+                                s.name.to_lowercase().contains(&pref_sub_lang.to_lowercase())
+                                    || s.code.to_lowercase().starts_with(&pref_sub_lang.to_lowercase())
+                                    || s.lang_keyword().eq_ignore_ascii_case(&pref_sub_lang)
+                            })
+                            .or_else(|| stream_info.subtitles.first());
+
+                        let sub_lang = chosen_sub
+                            .map(|s| s.lang_keyword().to_string())
+                            .or(Some(pref_sub_lang));
+                        let sub_url = chosen_sub
+                            .map(|s| s.url.clone())
+                            .filter(|u| !u.is_empty());
+
+                        let glsl_shaders = services::shaders::build_shader_arg_for_year(
+                            state.anime4k_mode,
+                            season_year,
+                        );
+
                         let opts = api::player::PlayOptions {
                             title: query,
                             episode: ep,
-                            quality: cfg.quality.as_str().to_string(),
-                            dub: cfg.audio_mode == config::AudioMode::Dub,
-                            player: cfg.player.as_str().to_string(),
-                            sub_lang: None,
-                            sub_url: None,
-                            stream_url: None,
+                            quality,
+                            dub: is_dub,
+                            player,
+                            sub_lang,
+                            sub_url,
+                            stream_url,
                             ipc_socket: None,
                             start_pos: None,
                             glsl_shaders,
@@ -2609,7 +2680,10 @@ async fn handle_playback_options(
                     return;
                 }
 
-                let glsl_shaders = services::shaders::build_shader_arg(state.anime4k_mode);
+                let glsl_shaders = services::shaders::build_shader_arg_for_year(
+                    state.anime4k_mode,
+                    anime.season_year,
+                );
                 let opts = api::player::PlayOptions {
                     title:   query,
                     episode: ep,
@@ -3762,7 +3836,15 @@ async fn start_playback(
     }
 
     let mut opts = opts;
+    state.last_play_options = Some(opts.clone());
     let anime_id = state.selected_anime.as_ref().map(|a| a.id).unwrap_or(0);
+    let season_year = state.selected_anime.as_ref().and_then(|a| a.season_year);
+    let era = services::shaders::AnimeEra::from_year(season_year);
+
+    // Ensure shaders are Era-Adaptive if Anime4K is enabled
+    if state.anime4k_mode != config::Anime4KMode::Off {
+        opts.glsl_shaders = services::shaders::build_shader_arg_for_year(state.anime4k_mode, season_year);
+    }
 
     // 1. Instant 0ms launch if episode was downloaded offline
     if let Some(offline_path) = state.offline_episodes.get(&episode) {
@@ -3833,9 +3915,11 @@ async fn start_playback(
         })
         .collect();
     let r_sub_preset = cfg.subtitle_style.preset.label().to_string();
-    let r_anime4k = cfg.anime4k_mode.as_str().to_string();
+    let r_anime4k = state.anime4k_mode.as_str().to_string();
     let r_audio_mode = if opts.dub { "dub".to_string() } else { "sub".to_string() };
     let r_aid = anime_id;
+    let r_season_year = season_year;
+    let r_era_badge = era.short_badge().to_string();
 
     tokio::spawn(async move {
         {
@@ -3843,6 +3927,8 @@ async fn start_playback(
             st.is_playing = true;
             st.title = r_title;
             st.anime_id = Some(r_aid);
+            st.season_year = r_season_year;
+            st.era_badge = r_era_badge;
             st.episode = r_ep;
             st.episode_title = r_ep_title;
             st.poster_url = r_poster;

@@ -413,7 +413,9 @@ else
 fi
 
 if [ -n "$SOLUS_IPC_SOCKET" ]; then
-    if [ "$is_iina" -eq 0 ] && [ "$is_vlc" -eq 0 ]; then
+    if [ "$is_iina" -eq 1 ]; then
+        args+=("--mpv-input-ipc-server=$SOLUS_IPC_SOCKET")
+    elif [ "$is_vlc" -eq 0 ]; then
         args+=("--input-ipc-server=$SOLUS_IPC_SOCKET")
     fi
 fi
@@ -614,6 +616,10 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                 cmd.arg("--mpv-referrer=https://zokoanime.video/");
                 cmd.arg("--mpv-user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
                 cmd.arg(format!("--mpv-force-media-title={} Episode {}", opts.title, opts.episode));
+                if let Some(ref sock) = opts.ipc_socket {
+                    cmd.env("SOLUS_IPC_SOCKET", sock);
+                    cmd.arg(format!("--mpv-input-ipc-server={}", sock));
+                }
                 if let Some(ref url) = opts.sub_url {
                     if !url.is_empty() {
                         cmd.arg(format!("--mpv-sub-file={}", url));
@@ -848,7 +854,9 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
 
     if let Some(ref sock) = opts.ipc_socket {
         cmd.env("SOLUS_IPC_SOCKET", sock);
-        if !player.contains("iina") && !player.contains("vlc") {
+        if player.contains("iina") {
+            player_flags.push(format!("--mpv-input-ipc-server={}", sock));
+        } else if !player.contains("vlc") {
             player_flags.push(format!("--input-ipc-server={}", sock));
         }
     }

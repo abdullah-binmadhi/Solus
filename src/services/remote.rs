@@ -65,6 +65,10 @@ pub struct RemotePlaybackState {
     pub anime4k: String,
     #[serde(default)]
     pub anime_id: Option<i64>,
+    #[serde(default)]
+    pub season_year: Option<i64>,
+    #[serde(default)]
+    pub era_badge: String,
 }
 
 impl Default for RemotePlaybackState {
@@ -110,6 +114,8 @@ impl Default for RemotePlaybackState {
             episodes: Vec::new(),
             anime4k: "off".to_string(),
             anime_id: None,
+            season_year: None,
+            era_badge: "MODERN HD".to_string(),
         }
     }
 }
@@ -648,23 +654,49 @@ async fn handle_remote_action(
                     s if s.contains("ultra") => crate::config::Anime4KMode::Ultra,
                     _ => crate::config::Anime4KMode::Off,
                 };
-                let shader_arg = crate::services::shaders::build_shader_arg(mode).unwrap_or_default();
-                let cmd = serde_json::json!({ "command": ["set_property", "glsl-shaders", shader_arg] });
-                let _ = send_mpv_json_command(sock_path, cmd).await;
+                let season_year = {
+                    let st = state.read().await;
+                    st.season_year
+                };
+                let era = crate::services::shaders::AnimeEra::from_year(season_year);
+                let era_label = era.label(season_year);
 
-                // Toggle hardware debanding & high-precision scaling alongside shaders
-                let deband_val = if mode == crate::config::Anime4KMode::Off { "no" } else { "yes" };
-                let _ = send_mpv_json_command(
-                    sock_path,
-                    serde_json::json!({ "command": ["set_property", "deband", deband_val] }),
-                )
-                .await;
+                // 1. Clear all currently active GLSL shaders using mpv's runtime list command
+                let clr_cmd = serde_json::json!({ "command": ["change-list", "glsl-shaders", "clr", ""] });
+                let _ = send_mpv_json_command(sock_path, clr_cmd).await;
 
-                // Show instant visual confirmation banner on the video screen
+                // 2. Append each shader file individually for the active mode & era profile
+                let shader_files = crate::services::shaders::build_shader_files(mode, season_year);
+                for file_path in &shader_files {
+                    let append_cmd = serde_json::json!({
+                        "command": ["change-list", "glsl-shaders", "append", file_path]
+                    });
+                    let _ = send_mpv_json_command(sock_path, append_cmd).await;
+                }
+
+                // 3. Also set glsl-shaders property for players that inspect property directly
+                let shader_arg = crate::services::shaders::build_shader_arg_for_year(mode, season_year).unwrap_or_default();
+                let prop_cmd = serde_json::json!({ "command": ["set_property", "glsl-shaders", shader_arg] });
+                let _ = send_mpv_json_command(sock_path, prop_cmd).await;
+
+                // 4. Toggle hardware debanding & high-precision scaling alongside shaders
+                if mode == crate::config::Anime4KMode::Off {
+                    let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "deband", "no"] })).await;
+                    let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "scale", "spline36"] })).await;
+                    let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "cscale", "spline36"] })).await;
+                } else {
+                    let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "scale", "ewa_lanczossharp"] })).await;
+                    let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "cscale", "ewa_lanczossharp"] })).await;
+                    let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "deband", "yes"] })).await;
+                    let iterations = if mode == crate::config::Anime4KMode::Ultra { 2 } else { 1 };
+                    let _ = send_mpv_json_command(sock_path, serde_json::json!({ "command": ["set_property", "deband-iterations", iterations] })).await;
+                }
+
+                // 5. Show instant visual confirmation banner on the video screen with Era profile
                 let osd_label = match mode {
-                    crate::config::Anime4KMode::Off => "✦ Anime4K: OFF (Native Stream)",
-                    crate::config::Anime4KMode::Balanced => "✦ Anime4K: BALANCED 2x (Line Reconstruction + 2x Upscale + Deband)",
-                    crate::config::Anime4KMode::Ultra => "✦ Anime4K: ULTRA 4K (Sobel Line Thinning + 2x CAS + Deband)",
+                    crate::config::Anime4KMode::Off => "✦ Anime4K: OFF (Native Stream)".to_string(),
+                    crate::config::Anime4KMode::Balanced => format!("✦ Anime4K: BALANCED 2x [{era_label} Profile]"),
+                    crate::config::Anime4KMode::Ultra => format!("✦ Anime4K: ULTRA 4K [{era_label} Mastering]"),
                 };
                 let _ = send_mpv_json_command(
                     sock_path,
@@ -677,6 +709,7 @@ async fn handle_remote_action(
                 }
                 let mut st = state.write().await;
                 st.anime4k = mode.as_str().to_string();
+                st.era_badge = era.short_badge().to_string();
             }
         }
         "select_episode" => {
@@ -1225,7 +1258,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
         <button class="btn-pill" id="audio-dub-btn" onclick="sendAction('toggle_audio')">English (Dub)</button>
       </div>
 
-      <div class="section-label">REAL-TIME ANIME4K SHADER</div>
+      <div class="section-label">ERA-ADAPTIVE ANIME4K MASTERING <span class="lang-code" id="era-badge-pill" style="margin-left:6px;background:#1d2a22;color:#50fa7b;">MODERN HD</span></div>
       <div class="btn-group">
         <button class="btn-pill" id="a4k-off" onclick="setAnime4k('off')">Off</button>
         <button class="btn-pill" id="a4k-balanced" onclick="setAnime4k('balanced')">Balanced 2x</button>
@@ -1342,6 +1375,19 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
 
       document.getElementById('audio-badge').innerText = (data.audio_mode || 'sub').toUpperCase();
       document.getElementById('sub-badge').innerText = data.sub_lang || 'Subtitles';
+      const eraBadge = data.era_badge || 'MODERN HD';
+      document.getElementById('res-badge').innerText = eraBadge;
+      const eraPill = document.getElementById('era-badge-pill');
+      if (eraPill) {
+        eraPill.innerText = data.season_year ? `${eraBadge} (${data.season_year})` : eraBadge;
+        if (eraBadge.includes('RETRO')) {
+          eraPill.style.background = '#2b1d0e';
+          eraPill.style.color = '#ffb86c';
+        } else {
+          eraPill.style.background = '#142a1e';
+          eraPill.style.color = '#50fa7b';
+        }
+      }
 
       // Only update poster DOM if URL actually changed
       const posterUrl = (data.poster_url && data.poster_url.startsWith('http')) ? data.poster_url : '';

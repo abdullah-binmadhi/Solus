@@ -46,6 +46,17 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         None => ("", Style::default()),
     };
 
+    let season_year = state.selected_anime.as_ref().and_then(|a| a.season_year);
+    let era = crate::services::shaders::AnimeEra::from_year(season_year);
+    let era_text = match season_year {
+        Some(y) => format!(" [{} • {}] ", era.short_badge(), y),
+        None => format!(" [{}] ", era.short_badge()),
+    };
+    let era_style = match era {
+        crate::services::shaders::AnimeEra::RetroCel => Style::default().fg(Color::Rgb(255, 190, 90)).add_modifier(Modifier::BOLD),
+        crate::services::shaders::AnimeEra::ModernDigital => Style::default().fg(Color::Rgb(90, 210, 255)).add_modifier(Modifier::BOLD),
+    };
+
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -58,6 +69,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             ),
             Span::raw("  "),
             Span::styled(dub_badge_text, dub_badge_style),
+            Span::styled(era_text, era_style),
         ]),
         Line::from(vec![
             Span::styled(" Player: ", Style::default().fg(Color::Rgb(160, 160, 175))),

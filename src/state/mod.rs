@@ -465,6 +465,9 @@ pub struct AppState {
 
     /// Active phase of the in-app update modal
     pub update_modal_phase: Option<UpdateModalPhase>,
+
+    /// Last launched PlayOptions (preserved so remote episode switching reuses exact player, quality, dub/sub, provider, and subtitle language)
+    pub last_play_options: Option<crate::api::player::PlayOptions>,
 }
 
 impl AppState {
@@ -605,6 +608,7 @@ impl AppState {
             cast_playback_pos: 0.0,
             cast_playback_dur: 0.0,
             update_modal_phase: None,
+            last_play_options: None,
         }
     }
 
