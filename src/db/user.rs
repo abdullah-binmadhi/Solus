@@ -324,6 +324,32 @@ pub async fn get_all_watched_anime_ids(pool: &SqlitePool) -> Result<Vec<i64>> {
     Ok(ids)
 }
 
+/// Fetch tracked show IDs (continue watching + watchlist) and watched episode sets for the Calendar.
+pub async fn get_calendar_tracking_snapshot(
+    pool: &SqlitePool,
+) -> Result<(HashSet<i64>, HashMap<i64, HashSet<u32>>)> {
+    let tracked_rows: Vec<i64> = sqlx::query_scalar(
+        "SELECT anime_id FROM continue_watching UNION SELECT anime_id FROM watchlist",
+    )
+    .fetch_all(pool)
+    .await?;
+    let tracked_ids: HashSet<i64> = tracked_rows.into_iter().collect();
+
+    let hist_rows = sqlx::query("SELECT anime_id, episode FROM history")
+        .fetch_all(pool)
+        .await?;
+    let mut watched_map: HashMap<i64, HashSet<u32>> = HashMap::new();
+    for r in hist_rows {
+        let aid: i64 = r.try_get("anime_id").unwrap_or_default();
+        let ep: i64 = r.try_get("episode").unwrap_or_default();
+        if ep > 0 {
+            watched_map.entry(aid).or_default().insert(ep as u32);
+        }
+    }
+
+    Ok((tracked_ids, watched_map))
+}
+
 /// Save the preferred playback query for a show.
 pub async fn set_playback_query(
     pool:     &SqlitePool,

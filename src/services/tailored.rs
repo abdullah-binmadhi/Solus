@@ -75,6 +75,58 @@ pub struct TailoredMatch {
     pub reason_tags: Vec<String>,
 }
 
+/// Real-time interactive tuner controls applied instantaneously over the 120-item scored pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTunerConfig {
+    /// 0 = All Picks, 1 = Hidden Gems, 2 = Acclaimed (82%+), 3 = Modern (2022+)
+    pub discovery_tier: usize,
+    /// Hide Season 2+ / Part 2+ sequels unless toggled off
+    pub hide_sequels: bool,
+    /// Only show FINISHED series
+    pub finished_only: bool,
+    /// Tags boosted with `+` in the Live Vibe Tuner
+    pub boosted_tags: HashSet<String>,
+    /// Tags excluded with `-` in the Live Vibe Tuner
+    pub muted_tags: HashSet<String>,
+    /// Anime IDs dismissed directly with `[x]`
+    pub dismissed_ids: HashSet<i64>,
+    /// Locked "More Like This" `[m]` show: (anime_id, title, genres)
+    pub anchor_anime: Option<(i64, String, Vec<String>)>,
+    /// AniList community peer IDs for `anchor_anime`
+    pub anchor_peer_ids: HashSet<i64>,
+}
+
+impl Default for LiveTunerConfig {
+    fn default() -> Self {
+        Self {
+            discovery_tier: 0,
+            hide_sequels: true,
+            finished_only: false,
+            boosted_tags: HashSet::new(),
+            muted_tags: HashSet::new(),
+            dismissed_ids: HashSet::new(),
+            anchor_anime: None,
+            anchor_peer_ids: HashSet::new(),
+        }
+    }
+}
+
+impl LiveTunerConfig {
+    pub fn has_active_modifiers(&self) -> bool {
+        self.discovery_tier != 0
+            || !self.hide_sequels
+            || self.finished_only
+            || !self.boosted_tags.is_empty()
+            || !self.muted_tags.is_empty()
+            || !self.dismissed_ids.is_empty()
+            || self.anchor_anime.is_some()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Return the master 10 questions with custom Final Fantasy heraldry glyphs.
 pub fn get_questions() -> Vec<TailoredQuestion> {
     vec![
@@ -82,13 +134,13 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
             id: 1,
             title: "Current Mood & Emotional Resonance",
             subtitle: "What energy do you want to feel while watching?",
-            symbol: "❖",
+            symbol: "󰋽",
             is_multi_select: false,
             options: vec![
                 TailoredOption {
                     label: "High Adrenaline & Hype",
                     detail: "Spectacle action, pulse-pounding choreography, triumphal energy",
-                    symbol: "✦",
+                    symbol: "",
                     tags_pos: &[("Action", 35.0), ("Super Power", 25.0), ("Martial Arts", 20.0)],
                     tags_neg: &["Slice of Life"],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -104,7 +156,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Cozy & Heartwarming",
                     detail: "Comforting atmosphere, slow peaceful moments, low tension",
-                    symbol: "✧",
+                    symbol: "◈",
                     tags_pos: &[("Slice of Life", 40.0), ("Comedy", 25.0), ("Iyashikei", 30.0)],
                     tags_neg: &["Horror", "Gore", "Tragedy"],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -112,7 +164,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Emotional Rollercoaster",
                     detail: "Intense romance, bittersweet farewells, heartfelt tear-jerker",
-                    symbol: "⟐",
+                    symbol: "",
                     tags_pos: &[("Drama", 35.0), ("Romance", 30.0), ("Tragedy", 20.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -120,7 +172,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Dark, Bleak & Gritty",
                     detail: "High mortality, existential stakes, unforgiving moral grayness",
-                    symbol: "⬡",
+                    symbol: "",
                     tags_pos: &[("Horror", 35.0), ("Dark Fantasy", 30.0), ("Survival", 25.0)],
                     tags_neg: &["Slice of Life"],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -137,7 +189,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Single Sitting (Movie / OVA)",
                     detail: "Complete self-contained story in 1 to 4 episodes",
-                    symbol: "✦",
+                    symbol: "",
                     tags_pos: &[], tags_neg: &[],
                     min_episodes: Some(1), max_episodes: Some(4), min_year: None, max_year: None, status: None,
                 },
@@ -151,21 +203,21 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Full Season Arc (22–26 Episodes)",
                     detail: "Double cour narrative with rich buildup and satisfying closure",
-                    symbol: "❖",
+                    symbol: "󰋽",
                     tags_pos: &[], tags_neg: &[],
                     min_episodes: Some(20), max_episodes: Some(28), min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "Grand Epic Saga (40+ Episodes)",
                     detail: "Deep world-building, sprawling character evolutions across arcs",
-                    symbol: "⬢",
+                    symbol: "",
                     tags_pos: &[], tags_neg: &[],
                     min_episodes: Some(38), max_episodes: None, min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "Any Length (Best Story Wins)",
                     detail: "No constraint — let quality dictate runtime",
-                    symbol: "✧",
+                    symbol: "◈",
                     tags_pos: &[], tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -175,13 +227,13 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
             id: 3,
             title: "Realm Setting & Atmosphere",
             subtitle: "What world backdrop speaks to you?",
-            symbol: "✦",
+            symbol: "",
             is_multi_select: false,
             options: vec![
                 TailoredOption {
                     label: "High Fantasy & Ancient Magic",
                     detail: "Grand kingdoms, arcane spells, guild adventures, legendary beasts",
-                    symbol: "❖",
+                    symbol: "󰋽",
                     tags_pos: &[("Fantasy", 40.0), ("Magic", 25.0), ("Adventure", 20.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -189,7 +241,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Cyberpunk & Synthetic Future",
                     detail: "Neon megacities, cybernetics, AI consciousness, high-tech dystopia",
-                    symbol: "⬡",
+                    symbol: "",
                     tags_pos: &[("Sci-Fi", 40.0), ("Cyberpunk", 35.0), ("Dystopian", 20.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -205,7 +257,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Historical & Feudal Era",
                     detail: "Samurai duels, historical dynasties, ancient battles, honor",
-                    symbol: "✧",
+                    symbol: "◈",
                     tags_pos: &[("Historical", 40.0), ("Swordplay", 25.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -213,7 +265,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Isekai & Otherworldly Rebirth",
                     detail: "Transported or awakened in a foreign realm with unique laws",
-                    symbol: "⟐",
+                    symbol: "",
                     tags_pos: &[("Isekai", 40.0), ("Fantasy", 20.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -224,13 +276,13 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
             id: 4,
             title: "Protagonist Archetype",
             subtitle: "What style of hero do you want to follow?",
-            symbol: "⬢",
+            symbol: "",
             is_multi_select: false,
             options: vec![
                 TailoredOption {
                     label: "The Calculated Mastermind",
                     detail: "Genius tactician who outthinks enemies 5 steps ahead",
-                    symbol: "❖",
+                    symbol: "󰋽",
                     tags_pos: &[("Smart Male Lead", 35.0), ("Anti-Hero", 20.0), ("Psychological", 20.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -238,8 +290,8 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "The Scrappy Underdog",
                     detail: "Starts from the bottom, overcomes defeat through sheer willpower",
-                    symbol: "✦",
-                    tags_pos: &[("Underdog", 35.0), ("Shounen", 20.0), ("Action", 15.0)],
+                    symbol: "",
+                    tags_pos: &[("Underdog", 30.0), ("Coming of Age", 20.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -247,14 +299,14 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                     label: "The Calm & Overpowered Veteran",
                     detail: "Experienced, composed, casually dominant when pushed",
                     symbol: "◈",
-                    tags_pos: &[("Overpowered Main Character", 30.0), ("Action", 20.0)],
+                    tags_pos: &[("Overpowered Main Character", 30.0), ("Primarily Adult Cast", 15.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "The Relatable Everyday Survivor",
                     detail: "Normal person grounded in realism navigating chaotic forces",
-                    symbol: "✧",
+                    symbol: "◈",
                     tags_pos: &[("Coming of Age", 25.0), ("Drama", 20.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -262,7 +314,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "The Dynamic Ensemble Fellowship",
                     detail: "No single hero — balanced cast with interlocking storylines",
-                    symbol: "⟐",
+                    symbol: "",
                     tags_pos: &[("Ensemble Cast", 35.0), ("Adventure", 20.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -273,13 +325,13 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
             id: 5,
             title: "Core Conflict Dynamics",
             subtitle: "What drives the tension forward?",
-            symbol: "⟐",
+            symbol: "",
             is_multi_select: false,
             options: vec![
                 TailoredOption {
                     label: "Spectacular Martial & Spell Combat",
                     detail: "High-level choreography, flashy powers, thrilling battle climaxes",
-                    symbol: "✦",
+                    symbol: "",
                     tags_pos: &[("Action", 35.0), ("Martial Arts", 30.0), ("Super Power", 25.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -295,7 +347,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Intimate Romantic & Personal Tension",
                     detail: "Sparks, chemistry, personal obstacles, emotional honesty",
-                    symbol: "✧",
+                    symbol: "◈",
                     tags_pos: &[("Romance", 40.0), ("Drama", 25.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -303,7 +355,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Surviving a Hostile Environment",
                     detail: "Death games, harsh wastelands, constant threat of death",
-                    symbol: "⬡",
+                    symbol: "",
                     tags_pos: &[("Survival", 35.0), ("Death Game", 30.0), ("Horror", 20.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -311,7 +363,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Comedic Misadventures & Chaos",
                     detail: "Bickering parties, chaotic misunderstandings, genuine laughs",
-                    symbol: "❖",
+                    symbol: "󰋽",
                     tags_pos: &[("Comedy", 40.0), ("Parody", 25.0)],
                     tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -322,13 +374,13 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
             id: 6,
             title: "Darkness & Stakes Level",
             subtitle: "How grim and serious can the world get?",
-            symbol: "⬡",
+            symbol: "",
             is_multi_select: false,
             options: vec![
                 TailoredOption {
                     label: "Uplifting & Inspiring",
                     detail: "Comforting tone where good triumphs and hope endures",
-                    symbol: "✧",
+                    symbol: "◈",
                     tags_pos: &[("Wholesome", 30.0), ("Adventure", 20.0)],
                     tags_neg: &["Gore", "Tragedy", "Horror"],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -336,8 +388,8 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Balanced (Serious with Light)",
                     detail: "Consequential stakes, character growth, but retains hope",
-                    symbol: "✦",
-                    tags_pos: &[("Action", 20.0), ("Adventure", 20.0)],
+                    symbol: "",
+                    tags_pos: &[("Adventure", 20.0), ("Drama", 15.0)],
                     tags_neg: &["Gore"],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -352,7 +404,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Brutal, Unforgiving & Visceral",
                     detail: "High body count, psychological trauma, graphic danger",
-                    symbol: "❖",
+                    symbol: "󰋽",
                     tags_pos: &[("Horror", 35.0), ("Gore", 30.0), ("Tragedy", 25.0)],
                     tags_neg: &["Slice of Life"],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
@@ -363,20 +415,20 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
             id: 7,
             title: "Visual Era & Animation Craft",
             subtitle: "What visual era matches your eyes?",
-            symbol: "✧",
+            symbol: "◈",
             is_multi_select: false,
             options: vec![
                 TailoredOption {
                     label: "Cutting-Edge Modern (2020s)",
                     detail: "Ultra-crisp digital cinematography, fluid composite effects",
-                    symbol: "✦",
+                    symbol: "",
                     tags_pos: &[], tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: Some(2020), max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "Modern Golden Classics (2010–2019)",
                     detail: "Peak studio adaptations, legendary art style consistency",
-                    symbol: "❖",
+                    symbol: "󰋽",
                     tags_pos: &[], tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: Some(2010), max_year: Some(2019), status: None,
                 },
@@ -390,7 +442,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Timeless (Any Release Year)",
                     detail: "Story and direction triumph over release era",
-                    symbol: "⟐",
+                    symbol: "",
                     tags_pos: &[], tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -400,7 +452,7 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
             id: 8,
             title: "Completion Status",
             subtitle: "Do you need a full conclusion right now?",
-            symbol: "❖",
+            symbol: "󰋽",
             is_multi_select: false,
             options: vec![
                 TailoredOption {
@@ -413,14 +465,14 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Active & Airing in Broadcast",
                     detail: "Fresh currently broadcasting anime with active community talk",
-                    symbol: "✦",
+                    symbol: "",
                     tags_pos: &[], tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: Some("RELEASING"),
                 },
                 TailoredOption {
                     label: "Ongoing Multi-Season Journey",
                     detail: "Fine with unfinished adaptations if multiple seasons exist",
-                    symbol: "✧",
+                    symbol: "◈",
                     tags_pos: &[], tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -436,28 +488,28 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
                 TailoredOption {
                     label: "Direct & Entertaining (Popcorn Fun)",
                     detail: "Instant gratification, straightforward goals, zero headache",
-                    symbol: "✦",
-                    tags_pos: &[("Action", 25.0), ("Comedy", 20.0)], tags_neg: &[],
+                    symbol: "",
+                    tags_pos: &[("Comedy", 20.0), ("Adventure", 15.0)], tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "Thought-Provoking & Philosophical",
                     detail: "Questions nature of humanity, ethics, existential puzzles",
-                    symbol: "❖",
+                    symbol: "󰋽",
                     tags_pos: &[("Philosophy", 35.0), ("Psychological", 30.0)], tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "Sprawling Politics & World Lore",
                     detail: "Deep faction politics, strategic geography, ancient history",
-                    symbol: "⬢",
+                    symbol: "",
                     tags_pos: &[("Politics", 35.0), ("War", 25.0), ("Fantasy", 20.0)], tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "Intimate Character Psychology",
                     detail: "Nuanced emotional flaws, deep character relationships",
-                    symbol: "⟐",
+                    symbol: "",
                     tags_pos: &[("Drama", 35.0), ("Coming of Age", 25.0)], tags_neg: &[],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -467,34 +519,34 @@ pub fn get_questions() -> Vec<TailoredQuestion> {
             id: 10,
             title: "Absolute Deal-Breakers",
             subtitle: "Toggle tags you strictly want excluded (Multi-Select)",
-            symbol: "⬡",
+            symbol: "",
             is_multi_select: true,
             options: vec![
                 TailoredOption {
                     label: "No Excessive Fanservice / Ecchi",
                     detail: "Exclude gratuitous sexualized tropes or bathhouse tropes",
-                    symbol: "⬡",
+                    symbol: "",
                     tags_pos: &[], tags_neg: &["Ecchi", "Harem"],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "No Extreme Gore or Torture",
                     detail: "Exclude visceral mutilation, horror gore, or torture scenes",
-                    symbol: "⬡",
+                    symbol: "",
                     tags_pos: &[], tags_neg: &["Gore", "Horror"],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "No Slow-Burn Pacing",
                     detail: "Exclude shows that take 5+ episodes to get moving",
-                    symbol: "⬡",
+                    symbol: "",
                     tags_pos: &[], tags_neg: &["Slow Paced"],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "No High School Tropes",
                     detail: "Exclude high school romance, club drama, or teenage tropes",
-                    symbol: "⬡",
+                    symbol: "",
                     tags_pos: &[], tags_neg: &["School"],
                     min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -511,7 +563,7 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             TailoredOption {
                 label: "Fluid Martial Arts & Close-Quarters Combat",
                 detail: "Brutal hand-to-hand choreography, weapons mastery, visceral impact",
-                symbol: "✦",
+                symbol: "",
                 tags_pos: &[("Martial Arts", 40.0), ("Hand-to-Hand Combat", 35.0), ("Super Power", 20.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
@@ -525,14 +577,14 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             TailoredOption {
                 label: "Tournament Arcs & Ascendant Powers",
                 detail: "Rankings, escalating power ceilings, intense tournament spectacles",
-                symbol: "❖",
+                symbol: "󰋽",
                 tags_pos: &[("Tournament", 40.0), ("Super Power", 30.0), ("Action", 20.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
             TailoredOption {
                 label: "Modern Supernatural & Shadow Assassins",
                 detail: "Underground organizations, bounty hunters, gunplay, urban sorcery",
-                symbol: "⬡",
+                symbol: "",
                 tags_pos: &[("Urban Fantasy", 35.0), ("Assassins", 35.0), ("Gunplay", 25.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
@@ -542,7 +594,7 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             TailoredOption {
                 label: "Cat-and-Mouse Intellectual Mind Games",
                 detail: "Geniuses predicting 10 steps ahead, high-stakes deception, duel of wits",
-                symbol: "✦",
+                symbol: "",
                 tags_pos: &[("Mind Games", 45.0), ("Detective", 35.0), ("Conspiracy", 30.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
@@ -556,14 +608,14 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             TailoredOption {
                 label: "Existential Philosophy & Psychological Breakdown",
                 detail: "What does it mean to be human? Questioning consciousness and reality",
-                symbol: "❖",
+                symbol: "󰋽",
                 tags_pos: &[("Philosophy", 45.0), ("Psychological", 35.0), ("Dystopian", 25.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
             TailoredOption {
                 label: "Neo-Noir Investigation & Cyberpunk Crime",
                 detail: "Rain-slicked streets, corrupt syndicates, tech intrigue, hardboiled mystery",
-                symbol: "⬡",
+                symbol: "",
                 tags_pos: &[("Noir", 40.0), ("Cyberpunk", 35.0), ("Crime", 30.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
@@ -573,7 +625,7 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             TailoredOption {
                 label: "Healing Iyashikei & Tranquil Nature",
                 detail: "Quiet countryside, gentle pacing, stress-relieving meditative beauty",
-                symbol: "✦",
+                symbol: "",
                 tags_pos: &[("Iyashikei", 45.0), ("Rural", 35.0), ("Outdoor", 30.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
@@ -587,14 +639,14 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             TailoredOption {
                 label: "Found Family & Tender Companionship",
                 detail: "Unlikely bonds, guardianship, wholesome warmth, mutual support",
-                symbol: "❖",
+                symbol: "󰋽",
                 tags_pos: &[("Family Life", 45.0), ("Parenting", 40.0), ("Slice of Life", 25.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
             TailoredOption {
                 label: "Eccentric Character Banter & Gentle Comedy",
                 detail: "Hilarious misunderstandings, lovable oddballs, lighthearted school days",
-                symbol: "⬡",
+                symbol: "",
                 tags_pos: &[("Comedy", 40.0), ("School", 30.0), ("Parody", 25.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
@@ -604,7 +656,7 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             TailoredOption {
                 label: "Heart-Wrenching Romantic Tragedy",
                 detail: "Uncontrollable destiny, tearful departures, profound emotional catharsis",
-                symbol: "✦",
+                symbol: "",
                 tags_pos: &[("Tragedy", 45.0), ("Melodrama", 40.0), ("Romance", 30.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
@@ -618,14 +670,14 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             TailoredOption {
                 label: "Bittersweet Supernatural Farewells",
                 detail: "Spirits, crossing boundaries, unfinished business, emotional closure",
-                symbol: "❖",
+                symbol: "󰋽",
                 tags_pos: &[("Afterlife", 45.0), ("Supernatural", 35.0), ("Drama", 30.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
             TailoredOption {
                 label: "Slow-Burn Love & Unspoken Yearning",
                 detail: "Gentle romantic development, unspoken devotion, lingering glances",
-                symbol: "⬡",
+                symbol: "",
                 tags_pos: &[("Romance", 45.0), ("Love Triangle", 30.0), ("Drama", 25.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
@@ -635,7 +687,7 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             TailoredOption {
                 label: "Vengeance Quest & Dark Fantasy Bloodshed",
                 detail: "A wronged warrior, ruthless retribution, punishing moral grayness",
-                symbol: "✦",
+                symbol: "",
                 tags_pos: &[("Revenge", 45.0), ("Dark Fantasy", 40.0), ("Gore", 30.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
@@ -649,14 +701,14 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             TailoredOption {
                 label: "Dystopian Tyranny, Rebellion & Cyber-Underworld",
                 detail: "Authoritarian rule, cybernetics, high-tech oppression, desperate resistance",
-                symbol: "❖",
+                symbol: "󰋽",
                 tags_pos: &[("Dystopian", 45.0), ("Cyberpunk", 40.0), ("Anti-Hero", 30.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
             TailoredOption {
                 label: "Eldritch Horrors & Demonic Nightmares",
                 detail: "Inhuman monsters, body horror, dread of the unknown, cosmic terror",
-                symbol: "⬡",
+                symbol: "",
                 tags_pos: &[("Horror", 45.0), ("Monsters", 40.0), ("Demons", 30.0)],
                 tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
             },
@@ -668,7 +720,7 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             id: 101,
             title: "Narrative Trope & Plot Catalyst",
             subtitle: "Select the specific storyline mechanisms you crave (Select all that apply)",
-            symbol: "❖",
+            symbol: "󰋽",
             is_multi_select: true,
             options: trope_options,
         },
@@ -676,13 +728,13 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             id: 102,
             title: "Pacing & Hook Velocity",
             subtitle: "How should the story deliver its narrative rhythm? (Select all that apply)",
-            symbol: "✦",
+            symbol: "",
             is_multi_select: true,
             options: vec![
                 TailoredOption {
                     label: "Fast-Burn & Immediate Hook",
                     detail: "Grabs you from minute 1 of Episode 1; breathless tempo with constant momentum",
-                    symbol: "✦",
+                    symbol: "",
                     tags_pos: &[("Fast Paced", 35.0), ("Action", 20.0), ("Thriller", 20.0)],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -696,14 +748,14 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
                 TailoredOption {
                     label: "Episodic Precision & Vignettes",
                     detail: "Standalone adventures and mini-arcs united by an overarching mystery",
-                    symbol: "❖",
+                    symbol: "󰋽",
                     tags_pos: &[("Episodic", 35.0), ("Adventure", 25.0)],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "Continuous Arc Escalation",
                     detail: "Stakes doubling continuously every arc with zero filler episodes",
-                    symbol: "⬡",
+                    symbol: "",
                     tags_pos: &[("Survival", 30.0), ("Super Power", 25.0)],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -719,7 +771,7 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
                 TailoredOption {
                     label: "Grounded Cinematic Realism & Gritty Lighting",
                     detail: "Mature linework, atmospheric shadows, cinematic framing (Wit, Mappa, Production I.G)",
-                    symbol: "✦",
+                    symbol: "",
                     tags_pos: &[("Cinematic", 35.0), ("Seinen", 25.0), ("Noir", 20.0)],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -733,14 +785,14 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
                 TailoredOption {
                     label: "Painterly Landscapes & Scenic Visual Poetry",
                     detail: "Breathtaking backdrops, ethereal lighting, emotional stillness (Kyoto Animation, CloverWorks)",
-                    symbol: "❖",
+                    symbol: "󰋽",
                     tags_pos: &[("Scenic", 35.0), ("Iyashikei", 30.0), ("Atmospheric", 25.0)],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "Expressive Avant-Garde & Surrealism",
                     detail: "Abstract compositions, bold color theory, unique auteur vision (Shaft, Science SARU)",
-                    symbol: "⬡",
+                    symbol: "",
                     tags_pos: &[("Surrealism", 40.0), ("Psychological", 25.0)],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -750,13 +802,13 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             id: 104,
             title: "Emotional Aftertaste & Catharsis",
             subtitle: "What resonance should linger with you after the final credits roll?",
-            symbol: "✧",
+            symbol: "◈",
             is_multi_select: true,
             options: vec![
                 TailoredOption {
                     label: "Triumphant Euphoria & Hype",
                     detail: "Unstoppable human resolve, fist-pumping victory, tearful triumph against all odds",
-                    symbol: "✦",
+                    symbol: "",
                     tags_pos: &[("Inspiring", 40.0), ("Super Power", 25.0), ("Action", 20.0)],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -770,14 +822,14 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
                 TailoredOption {
                     label: "Mind-Shattering Twist & Reality Fracture",
                     detail: "Twists that completely recontextualize every preceding scene; existential dizziness",
-                    symbol: "❖",
+                    symbol: "󰋽",
                     tags_pos: &[("Plot Twist", 45.0), ("Mind Games", 35.0), ("Psychological", 30.0)],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
                 TailoredOption {
                     label: "Bleak Existential Dread & Uncompromising Stakes",
                     detail: "No plot armor, irreversible tragedy, ruthless psychological survival",
-                    symbol: "⬡",
+                    symbol: "",
                     tags_pos: &[("Tragedy", 40.0), ("Survival", 35.0), ("Horror", 25.0)],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -787,13 +839,13 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
             id: 105,
             title: "Curation Rarity & Discovery Tier",
             subtitle: "Filter out generic algorithms — what discovery depth do you desire?",
-            symbol: "⬡",
+            symbol: "",
             is_multi_select: true,
             options: vec![
                 TailoredOption {
                     label: "Hidden Masterpieces Only (Anti-Generic)",
                     detail: "High-scoring critical darlings (78%+) that mainstream audiences overlooked",
-                    symbol: "✦",
+                    symbol: "",
                     tags_pos: &[],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -807,14 +859,14 @@ pub fn get_refinement_questions(q1_mood_choice: usize) -> Vec<TailoredQuestion> 
                 TailoredOption {
                     label: "Vintage Golden Era Legends (Pre-2010)",
                     detail: "Hand-drawn masterworks from the golden age with unmatched soul and craft",
-                    symbol: "❖",
+                    symbol: "󰋽",
                     tags_pos: &[],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: Some(2010), status: None,
                 },
                 TailoredOption {
                     label: "Apex Legendary Titans (All-Time Giants)",
                     detail: "Undisputed titans of the medium regardless of era or popularity",
-                    symbol: "⬡",
+                    symbol: "",
                     tags_pos: &[],
                     tags_neg: &[], min_episodes: None, max_episodes: None, min_year: None, max_year: None, status: None,
                 },
@@ -868,63 +920,63 @@ pub fn calculate_persona(answers: &TailoredAnswers) -> Persona {
         _ => 20,
     };
 
-    // Derive Persona Title and Palette inspired by Final Fantasy XIV Lore
+    // Derive clear viewer profile title and palette
     let (title, epithet, symbol, primary, accent, resonance) = match (setting_idx, mood_idx) {
         (1, 1) | (1, 0) => (
-            "❖ ARCHON OF ALLAGAN CIPHERS",
-            "Synthesizer of futuristic secrets, calculation, and neon dystopias",
-            "⬡",
+            "CYBERPUNK STRATEGIST",
+            "Drawn to futuristic sci-fi, psychological thrillers, and tactical intrigue",
+            "◈",
             Color::Rgb(0, 240, 255),    // Neon Cyan
             Color::Rgb(255, 0, 127),    // Hot Pink
             vec!["Cyberpunk", "Psychological", "Tactical Mind"],
         ),
         (0, 1) | (0, _) if depth_idx == 1 || depth_idx == 2 => (
-            "✦ CHRONICLER OF THE FORBIDDEN GUBAL",
-            "Keeper of ancient arcane volumes, geopolitical strife, and deep lore",
+            "LORE & MYSTERY ARCHIVIST",
+            "Drawn to intricate worldbuilding, political intrigue, and deep lore",
             "◈",
             Color::Rgb(251, 191, 36),   // Star Amber
-            Color::Rgb(189, 147, 249),  // Aether Purple
-            vec!["High Fantasy", "Arcane Lore", "Geopolitics"],
+            Color::Rgb(189, 147, 249),  // Lavender Purple
+            vec!["High Fantasy", "Worldbuilding", "Politics"],
         ),
         (0, 0) | (_, 0) if hero_idx == 1 => (
-            "◈ VANGUARD OF THE ASTRAL HEAVENS",
-            "Unyielding spirit that defies gods through sheer will and martial mastery",
-            "✦",
+            "ACTION & UNDERDOG SEEKER",
+            "Drawn to high-energy combat, perseverance, and spectacle action",
+            "",
             Color::Rgb(255, 110, 50),   // Solar Orange
             Color::Rgb(255, 230, 0),    // Flame Gold
-            vec!["Martial Mastery", "Underdog Grit", "Spectacle Action"],
+            vec!["Martial Arts", "Underdog Grit", "Action"],
         ),
         (_, 2) => (
-            "✧ WANDERER OF THE CRYSTALLINE SEA",
-            "Seeker of peaceful hearths, gentle melodies, and low-tension solace",
-            "✧",
+            "COZY SLICE-OF-LIFE FAN",
+            "Drawn to relaxing pacing, gentle atmospheres, and heartwarming comfort",
+            "󰋜",
             Color::Rgb(80, 250, 123),   // Emerald Green
             Color::Rgb(125, 207, 255),  // Sky Blue
-            vec!["Iyashikei", "Slice of Life", "Warmth & Comfort"],
+            vec!["Iyashikei", "Slice of Life", "Comfort"],
         ),
         (_, 4) | (_, _) if dark_idx >= 2 => (
-            "⬡ SHADOWBRINGER OF THE ABYSS",
-            "Dweller in morally gray depths where survival demands cold sacrifice",
-            "⬢",
+            "DARK & MATURE REALIST",
+            "Drawn to high-stakes survival, moral ambiguity, and mature drama",
+            "◈",
             Color::Rgb(255, 65, 84),    // Blood Crimson
             Color::Rgb(160, 140, 190),  // Ash Slate
             vec!["Dark Fantasy", "Survival", "Moral Ambiguity"],
         ),
         (_, 3) => (
-            "⟐ ALCHEMIST OF RESONANT HEARTS",
-            "Attuned to the fragile bonds of love, devastating grief, and remembrance",
-            "⟐",
+            "EMOTIONAL DRAMA SEEKER",
+            "Drawn to deep character bonds, romance, and moving stories",
+            "",
             Color::Rgb(255, 121, 198),  // Rose Quartz
             Color::Rgb(189, 147, 249),  // Lavender
-            vec!["Drama & Tears", "Romance", "Emotional Resonance"],
+            vec!["Drama", "Romance", "Character Study"],
         ),
         _ => (
-            "❖ AZEM'S TRAVELER OF THE STAR",
-            "Wanderer of infinite horizons, discovering unmatched tales across realms",
-            "❖",
-            Color::Rgb(189, 147, 249),  // Azem Gold-Purple
+            "ADVENTURE EXPLORER",
+            "Drawn to grand journeys, discovery, and dynamic ensemble casts",
+            "󰋽",
+            Color::Rgb(189, 147, 249),  // Lavender Purple
             Color::Rgb(251, 191, 36),
-            vec!["Adventure", "Discovery", "Dynamic Fellowship"],
+            vec!["Adventure", "Discovery", "Ensemble Cast"],
         ),
     };
 
@@ -945,11 +997,67 @@ pub fn calculate_persona(answers: &TailoredAnswers) -> Persona {
     }
 }
 
-/// Score candidates from the SQLite database cache and AniList API.
+/// Detect whether an anime title is a sequel season (Season 2+, 2nd Season, Part 2, etc.)
+/// so fresh discovery isn't cluttered with mid-series entries.
+pub fn is_sequel_season(anime: &Anime) -> bool {
+    let candidates = [
+        anime.title_english.as_deref().unwrap_or(""),
+        anime.title_romaji.as_str(),
+    ];
+
+    for raw in candidates {
+        let lower = raw.trim().to_lowercase();
+        if lower.is_empty() {
+            continue;
+        }
+        let markers = [
+            "season 2",
+            "season 3",
+            "season 4",
+            "season 5",
+            "season 6",
+            "2nd season",
+            "3rd season",
+            "4th season",
+            "5th season",
+            "part 2",
+            "part 3",
+            "cour 2",
+            "2nd cour",
+            "final season",
+            "the final chapters",
+            ": season ",
+        ];
+        if markers.iter().any(|m| lower.contains(m)) {
+            return true;
+        }
+        let suffixes = [
+            " ii", " iii", " iv", " v", " s2", " s3", " s4", " 2", " 3", " 4",
+        ];
+        if suffixes.iter().any(|s| lower.ends_with(s)) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Score candidates from the SQLite database cache and AniList API using tiered mood coherence.
 pub fn score_anime(anime: &Anime, answers: &TailoredAnswers) -> Option<TailoredMatch> {
     let questions = get_questions();
 
-    // 1. Hard Exclusion Gate: Deal-breakers
+    // 0. Watchability Gate: Exclude unreleased or zero-episode / music entries
+    if anime.status.as_deref() == Some("NOT_YET_RELEASED") {
+        return None;
+    }
+    if anime.format.as_deref() == Some("MUSIC") {
+        return None;
+    }
+    if anime.episodes == Some(0) {
+        return None;
+    }
+
+    // 1. Hard Exclusion Gate: Deal-breakers (Q10)
     let anime_genres = anime.genre_list();
     let genre_lower: HashSet<String> = anime_genres.iter().map(|g| g.to_lowercase()).collect();
 
@@ -963,7 +1071,7 @@ pub fn score_anime(anime: &Anime, answers: &TailoredAnswers) -> Option<TailoredM
         }
     }
 
-    // 2. Length Filter
+    // 2. Length Filter (Q2)
     let q2_opt = &questions[1].options[answers.choices[1]];
     let ep_count = anime.episodes.unwrap_or(0);
     if let Some(min) = q2_opt.min_episodes {
@@ -977,7 +1085,7 @@ pub fn score_anime(anime: &Anime, answers: &TailoredAnswers) -> Option<TailoredM
         }
     }
 
-    // 3. Status Filter
+    // 3. Status Filter (Q8)
     let q8_opt = &questions[7].options[answers.choices[7]];
     if let Some(req_status) = q8_opt.status {
         if anime.status.as_deref() != Some(req_status) {
@@ -985,7 +1093,7 @@ pub fn score_anime(anime: &Anime, answers: &TailoredAnswers) -> Option<TailoredM
         }
     }
 
-    // 4. Era Filter
+    // 4. Era Filter (Q7)
     let q7_opt = &questions[6].options[answers.choices[6]];
     let year = anime.season_year.unwrap_or(2020);
     if let Some(min_yr) = q7_opt.min_year {
@@ -999,35 +1107,145 @@ pub fn score_anime(anime: &Anime, answers: &TailoredAnswers) -> Option<TailoredM
         }
     }
 
-    // 5. Positive Weighted Tag Matching
-    let mut score = 40.0f32;
+    // 5. Tiered Weighted Tag Matching & Primary Mood Coherence
+    let mood_idx = answers.choices[0];
+    let q1_opt = &questions[0].options[mood_idx];
+    let mut mood_weight = 0.0f32;
+    let mut mood_hits = 0usize;
     let mut reasons = Vec::new();
 
+    for &(tag, weight) in q1_opt.tags_pos {
+        if genre_lower.contains(&tag.to_lowercase()) {
+            mood_weight += weight;
+            mood_hits += 1;
+            if reasons.len() < 3 && !reasons.contains(&tag.to_string()) {
+                reasons.push(tag.to_string());
+            }
+        }
+    }
+
+    // Extra Cozy anchors recognized on AniList
+    if mood_idx == 2 {
+        for extra in ["iyashikei", "cute girls doing cute things", "healing", "food", "cooking"] {
+            if genre_lower.contains(extra) && mood_hits == 0 {
+                mood_weight += 30.0;
+                mood_hits += 1;
+            }
+        }
+    }
+
+    // Negative tag penalties across Questions 1..=9
+    let mut neg_penalty = 0.0f32;
     for (q_idx, &choice_idx) in answers.choices.iter().enumerate() {
+        if let Some(opt) = questions.get(q_idx).and_then(|q| q.options.get(choice_idx)) {
+            for &neg in opt.tags_neg {
+                if genre_lower.contains(&neg.to_lowercase()) {
+                    neg_penalty += if q_idx == 0 { 35.0 } else { 20.0 };
+                }
+            }
+        }
+    }
+
+    // Cross-Mood Clash Penalty: stop battle shounen from invading Cozy Slice-of-Life (and vice versa)
+    let has_sol_or_iyashikei = genre_lower.contains("slice of life") || genre_lower.contains("iyashikei");
+    let has_action_or_shounen = genre_lower.contains("action")
+        || genre_lower.contains("shounen")
+        || genre_lower.contains("battle")
+        || genre_lower.contains("martial arts");
+    let has_dark_harsh = genre_lower.contains("horror")
+        || genre_lower.contains("gore")
+        || genre_lower.contains("survival")
+        || genre_lower.contains("death game");
+
+    let mut clash_penalty = 0.0f32;
+    match mood_idx {
+        // Cozy & Heartwarming
+        2 => {
+            if !has_sol_or_iyashikei && (has_action_or_shounen || has_dark_harsh) {
+                clash_penalty += 55.0;
+            } else if !has_sol_or_iyashikei && mood_hits == 0 {
+                clash_penalty += 30.0;
+            }
+        }
+        // High Adrenaline & Hype
+        0 => {
+            if has_sol_or_iyashikei && !genre_lower.contains("action") && !genre_lower.contains("sports") {
+                clash_penalty += 45.0;
+            }
+        }
+        // Deep & Mind-Bending
+        1 => {
+            let has_mind = ["psychological", "mystery", "thriller", "philosophy", "detective", "sci-fi"]
+                .iter()
+                .any(|t| genre_lower.contains(*t));
+            if !has_mind {
+                clash_penalty += 38.0;
+            }
+        }
+        // Emotional Rollercoaster
+        3 => {
+            let has_emo = ["drama", "romance", "tragedy", "psychological", "coming of age"]
+                .iter()
+                .any(|t| genre_lower.contains(*t));
+            if !has_emo {
+                clash_penalty += 32.0;
+            }
+        }
+        // Dark, Bleak & Gritty
+        _ => {
+            let has_grim = ["horror", "dark fantasy", "psychological", "survival", "tragedy", "thriller"]
+                .iter()
+                .any(|t| genre_lower.contains(*t));
+            if has_sol_or_iyashikei && !has_grim {
+                clash_penalty += 50.0;
+            } else if !has_grim {
+                clash_penalty += 30.0;
+            }
+        }
+    }
+
+    // Exclude blatant mood clashes unless an explicit anchor overrides it later
+    if clash_penalty >= 45.0 && !has_sol_or_iyashikei {
+        return None;
+    }
+
+    // Secondary weighted tag alignment (Q2..=Q9)
+    let mut sec_weight = 0.0f32;
+    for (q_idx, &choice_idx) in answers.choices.iter().enumerate().skip(1) {
         if let Some(opt) = questions.get(q_idx).and_then(|q| q.options.get(choice_idx)) {
             for &(tag, weight) in opt.tags_pos {
                 if genre_lower.contains(&tag.to_lowercase()) {
-                    score += weight;
-                    if reasons.len() < 3 && !reasons.contains(&format!("✦ {}", tag)) {
-                        reasons.push(format!("✦ {}", tag));
+                    sec_weight += weight;
+                    if reasons.len() < 3 && !reasons.contains(&tag.to_string()) {
+                        reasons.push(tag.to_string());
                     }
                 }
             }
         }
     }
 
-    // Add quality score bonus
-    let quality_bonus = anime.score.unwrap_or(70) as f32 * 0.35;
-    score += quality_bonus;
+    // Normalized tiered percentage (genuine spread across 70%..=98%)
+    let coherence_base = if mood_hits >= 1 { 24.0 } else { 4.0 };
+    let mood_primary_score = (mood_weight / 35.0).min(1.0) * 34.0;
+    let mood_extra_score = ((mood_weight - 35.0).max(0.0) / 45.0).min(1.0) * 6.0;
+    let sec_score = (sec_weight / 45.0).min(1.0) * 22.0;
+    let quality_score = ((anime.score.unwrap_or(70) as f32 - 60.0).clamp(0.0, 35.0) / 35.0) * 12.0;
 
-    // Normalize match percentage between 75% and 99%
-    let match_percentage = ((score / 150.0) * 100.0).clamp(76.0, 99.0) as u8;
+    let raw_pct = coherence_base + mood_primary_score + mood_extra_score + sec_score + quality_score
+        - neg_penalty
+        - clash_penalty;
+
+    let max_cap = if mood_hits == 0 { 78.0 } else { 98.0 };
+    if raw_pct < 56.0 {
+        return None;
+    }
+    let match_percentage = raw_pct.clamp(64.0, max_cap).round() as u8;
 
     if reasons.is_empty() {
         if let Some(first_genre) = anime_genres.first() {
-            reasons.push(format!("◈ {}", first_genre));
+            reasons.push(first_genre.clone());
         }
-        reasons.push(format!("❖ {} Score", anime.score.unwrap_or(80)));
+        reasons.push(format!(" {} Score", anime.score.unwrap_or(80)));
     }
 
     Some(TailoredMatch {
@@ -1035,6 +1253,172 @@ pub fn score_anime(anime: &Anime, answers: &TailoredAnswers) -> Option<TailoredM
         match_percentage,
         reason_tags: reasons,
     })
+}
+
+/// Extract the top dynamic genre/tag chips present across the scored candidate pool
+/// so the user can boost (`+`) or hide (`-`) real tags present in their recommendations.
+pub fn extract_tuner_tags(pool: &[TailoredMatch], answers: &TailoredAnswers) -> Vec<String> {
+    use std::collections::HashMap;
+    let questions = get_questions();
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for m in pool.iter().take(60) {
+        for g in m.anime.genre_list().into_iter().take(6) {
+            *counts.entry(g).or_insert(0) += 1;
+        }
+    }
+
+    // Seed mood tags first so key primary mood genres are always easy to toggle
+    let mut ordered = Vec::new();
+    if let Some(q1) = questions[0].options.get(answers.choices[0]) {
+        for &(tag, _) in q1.tags_pos {
+            if !ordered.iter().any(|t: &String| t.eq_ignore_ascii_case(tag)) {
+                ordered.push(tag.to_string());
+            }
+        }
+    }
+
+    let mut freq: Vec<(String, usize)> = counts.into_iter().collect();
+    freq.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    for (tag, _) in freq {
+        if !ordered.iter().any(|t| t.eq_ignore_ascii_case(&tag)) {
+            ordered.push(tag);
+        }
+        if ordered.len() >= 9 {
+            break;
+        }
+    }
+
+    ordered.truncate(9);
+    ordered
+}
+
+/// Instantaneously filter and re-rank the candidate pool according to the Live Vibe Tuner controls
+/// and return up to 30 recommendations.
+pub fn apply_live_tuner(
+    pool: &[TailoredMatch],
+    _answers: &TailoredAnswers,
+    tuner: &LiveTunerConfig,
+) -> Vec<TailoredMatch> {
+    let mut filtered: Vec<TailoredMatch> = pool
+        .iter()
+        .filter_map(|m| {
+            // 1. Dismissed shows (`[x]`)
+            if tuner.dismissed_ids.contains(&m.anime.id) {
+                return None;
+            }
+
+            // 2. Anchor anime itself is excluded so peers surface
+            if let Some((anchor_id, _, _)) = &tuner.anchor_anime {
+                if m.anime.id == *anchor_id {
+                    return None;
+                }
+            }
+
+            // 3. Sequel Guard
+            if tuner.hide_sequels && is_sequel_season(&m.anime) {
+                return None;
+            }
+
+            // 4. Finished Only toggle
+            if tuner.finished_only && m.anime.status.as_deref() != Some("FINISHED") {
+                return None;
+            }
+
+            // 5. Discovery Tier filters
+            match tuner.discovery_tier {
+                1 => {
+                    // Hidden Gems: good quality under-the-radar picks (score >= 74)
+                    if m.anime.score.unwrap_or(0) < 74 {
+                        return None;
+                    }
+                }
+                2 => {
+                    // Acclaimed 82%+
+                    if m.anime.score.unwrap_or(0) < 82 {
+                        return None;
+                    }
+                }
+                3 => {
+                    // Modern 2022+
+                    if m.anime.season_year.unwrap_or(0) < 2022 {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+
+            let genres = m.anime.genre_list();
+            let genre_lower: HashSet<String> = genres.iter().map(|g| g.to_lowercase()).collect();
+
+            // 6. Muted `-` tags
+            for muted in &tuner.muted_tags {
+                if genre_lower.contains(&muted.to_lowercase()) {
+                    return None;
+                }
+            }
+
+            // 7. Score adjustment from `+` Boosted tags, Hidden Gems weighting, and `[m]` Anchor similarity
+            let mut pct = m.match_percentage as i32;
+            let mut reasons = m.reason_tags.clone();
+
+            for boosted in &tuner.boosted_tags {
+                if genre_lower.contains(&boosted.to_lowercase()) {
+                    pct += 8;
+                    if !reasons.iter().any(|r| r.eq_ignore_ascii_case(boosted)) {
+                        reasons.insert(0, format!("+{}", boosted));
+                    }
+                } else {
+                    pct -= 6;
+                }
+            }
+
+            // Hidden Gems subtly favors 75..85 gems over ultra-mainstream 90+ giants
+            if tuner.discovery_tier == 1 {
+                let sc = m.anime.score.unwrap_or(75);
+                if (75..=84).contains(&sc) {
+                    pct += 5;
+                    if !reasons.iter().any(|r| r == "Hidden Gem") {
+                        reasons.push("Hidden Gem".to_string());
+                    }
+                }
+            }
+
+            // Locked `[m]` "More Like This" anchor boost
+            if let Some((_, ref anchor_title, ref anchor_genres)) = tuner.anchor_anime {
+                if tuner.anchor_peer_ids.contains(&m.anime.id) {
+                    pct += 16;
+                    reasons.insert(0, format!("Similar to {}", anchor_title));
+                } else {
+                    let shared = anchor_genres
+                        .iter()
+                        .filter(|g| genre_lower.contains(&g.to_lowercase()))
+                        .count();
+                    if shared >= 2 {
+                        pct += (shared as i32 * 3).min(12);
+                    }
+                }
+            }
+
+            reasons.truncate(3);
+
+            Some(TailoredMatch {
+                anime: m.anime.clone(),
+                match_percentage: pct.clamp(60, 99) as u8,
+                reason_tags: reasons,
+            })
+        })
+        .collect();
+
+    filtered.sort_by(|a, b| {
+        b.match_percentage
+            .cmp(&a.match_percentage)
+            .then_with(|| b.anime.score.cmp(&a.anime.score))
+    });
+
+    filtered.truncate(30);
+    filtered
 }
 
 /// Score candidates with additional weighting from the 6 Crucible refinement questions & Keystone Anchor.
@@ -1066,7 +1450,7 @@ pub fn score_anime_refined(
         if peers.contains(&anime.id) {
             extra_score += 35.0;
             let anchor_name = refinement.anchor_title.as_deref().unwrap_or("Anchor");
-            refined_reasons.insert(0, format!("❖ Peer of {}", anchor_name));
+            refined_reasons.insert(0, format!("Similar to {}", anchor_name));
         }
     }
 
@@ -1077,7 +1461,7 @@ pub fn score_anime_refined(
                 for &(tag, weight) in opt.tags_pos {
                     if genre_lower.contains(&tag.to_lowercase()) {
                         extra_score += weight * 1.2;
-                        let badge = format!("✦ {}", tag);
+                        let badge = tag.to_string();
                         if !refined_reasons.contains(&badge) {
                             refined_reasons.push(badge);
                         }
@@ -1094,7 +1478,7 @@ pub fn score_anime_refined(
                 for &(tag, weight) in opt.tags_pos {
                     if genre_lower.contains(&tag.to_lowercase()) {
                         extra_score += weight;
-                        let badge = format!("◈ {}", opt.label.split('&').next().unwrap_or(opt.label).trim());
+                        let badge = opt.label.split('&').next().unwrap_or(opt.label).trim().to_string();
                         if !refined_reasons.contains(&badge) && refined_reasons.len() < 4 {
                             refined_reasons.push(badge);
                         }
@@ -1135,7 +1519,7 @@ pub fn score_anime_refined(
         // Hidden Masterpieces Only: boost if score >= 78
         if anime.score.unwrap_or(0) >= 78 {
             extra_score += 15.0;
-            refined_reasons.push("◈ Hidden Gem".to_string());
+            refined_reasons.push("Hidden Gem".to_string());
         }
     }
     if refinement.rarity_selections.contains(&1) {
@@ -1143,7 +1527,7 @@ pub fn score_anime_refined(
         if let Some(y) = anime.season_year {
             if (2014..=2025).contains(&y) {
                 extra_score += 12.0;
-                refined_reasons.push("✦ Modern Landmark".to_string());
+                refined_reasons.push("Modern Hit".to_string());
             }
         }
     }
@@ -1152,7 +1536,7 @@ pub fn score_anime_refined(
         if let Some(y) = anime.season_year {
             if y <= 2010 {
                 extra_score += 18.0;
-                refined_reasons.push("❖ Golden Era Classic".to_string());
+                refined_reasons.push("Classic Era".to_string());
             }
         }
     }
@@ -1169,8 +1553,8 @@ pub fn score_anime_refined(
     })
 }
 
-/// Query both the local cache and AniList GraphQL using 350+ micro-tags and excluded watched IDs.
-pub async fn generate_tailored_matches_advanced(
+/// Build a rich 120-item scored candidate pool from AniList + local cache for instant live tuning.
+pub async fn generate_tailored_pool_advanced(
     pool: &sqlx::SqlitePool,
     client: &crate::api::anilist::AniListClient,
     answers: &TailoredAnswers,
@@ -1184,17 +1568,34 @@ pub async fn generate_tailored_matches_advanced(
         .await
         .unwrap_or_default();
 
-    // 2. Build tag query for AniList
-    let mut tags_in: Vec<String> = Vec::new();
+    // 2. Build clean Primary Mood + Setting tag queries for AniList
+    let mut mood_tags_in: Vec<String> = Vec::new();
+    let mut combined_tags_in: Vec<String> = Vec::new();
     let mut tags_not_in: Vec<String> = Vec::new();
 
-    // Positive tags from Mood (Q1), Setting (Q3), Stakes (Q4)
-    for q_idx in [0, 2, 3] {
-        if let Some(opt) = questions.get(q_idx).and_then(|q| q.options.get(answers.choices[q_idx])) {
-            for &(tag, _) in opt.tags_pos {
-                if !tags_in.contains(&tag.to_string()) {
-                    tags_in.push(tag.to_string());
-                }
+    if let Some(opt) = questions[0].options.get(answers.choices[0]) {
+        for &(tag, _) in opt.tags_pos {
+            let s = tag.to_string();
+            if !mood_tags_in.contains(&s) {
+                mood_tags_in.push(s.clone());
+            }
+            if !combined_tags_in.contains(&s) {
+                combined_tags_in.push(s);
+            }
+        }
+        for &neg in opt.tags_neg {
+            if !tags_not_in.contains(&neg.to_string()) {
+                tags_not_in.push(neg.to_string());
+            }
+        }
+    }
+
+    // Setting tags (Q3) added only to the combined precision query (not diluting pure mood discovery)
+    if let Some(opt) = questions.get(2).and_then(|q| q.options.get(answers.choices[2])) {
+        for &(tag, _) in opt.tags_pos {
+            let s = tag.to_string();
+            if !combined_tags_in.contains(&s) {
+                combined_tags_in.push(s);
             }
         }
     }
@@ -1210,40 +1611,16 @@ pub async fn generate_tailored_matches_advanced(
         }
     }
 
-    // If refinement is present, add targeted multi-select tags
-    if let Some(refine) = refinement {
-        let refine_questions = get_refinement_questions(answers.choices[0]);
-        // Tropes
-        if let Some(q) = refine_questions.first() {
-            for &idx in &refine.trope_selections {
-                if let Some(opt) = q.options.get(idx) {
-                    for &(tag, _) in opt.tags_pos {
-                        if !tags_in.contains(&tag.to_string()) {
-                            tags_in.insert(0, tag.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        // Pacing
-        if let Some(q) = refine_questions.get(1) {
-            for &idx in &refine.pacing_selections {
-                if let Some(opt) = q.options.get(idx) {
-                    for &(tag, _) in opt.tags_pos {
-                        if !tags_in.contains(&tag.to_string()) {
-                            tags_in.push(tag.to_string());
-                        }
-                    }
-                }
-            }
-        }
+    // Also exclude explicit Action pollution on AniList when Cozy & Heartwarming is chosen
+    if answers.choices[0] == 2 && !tags_not_in.iter().any(|t| t.eq_ignore_ascii_case("Horror")) {
+        tags_not_in.push("Horror".to_string());
     }
 
     let mut candidate_anime: Vec<Anime> = Vec::new();
     let mut seen_ids: HashSet<i64> = watched_ids.iter().copied().collect();
     let mut peer_ids: HashSet<i64> = HashSet::new();
 
-    // 3. If Keystone Anchor Anime is selected, fetch AniList community peer recommendations
+    // 3. If an explicit anchor anime is active via refinement, include peer recommendations
     if let Some(refine) = refinement {
         if let Some(anchor_id) = refine.anchor_anime_id {
             if let Ok(peers) = client.fetch_peer_recommendations(anchor_id, now).await {
@@ -1258,19 +1635,14 @@ pub async fn generate_tailored_matches_advanced(
         }
     }
 
-    // 4. Query AniList GraphQL directly for candidate anime matching these tags
-    let max_pop = if let Some(refine) = refinement {
-        if refine.rarity_selections.contains(&0) {
-            Some(100000) // Anti-generic filter: limit popularity to discover hidden gems!
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // 4. Query AniList concurrently: Query A (Primary Mood + Setting) & Query B (Pure Mood Pool for deep coverage)
+    let (res_combined, res_mood) = tokio::join!(
+        client.tailored_search(&combined_tags_in, &tags_not_in, Some(70), None, &watched_ids, now),
+        client.tailored_search(&mood_tags_in, &tags_not_in, Some(72), None, &watched_ids, now),
+    );
 
-    if let Ok(remote_anime) = client.tailored_search(&tags_in, &tags_not_in, Some(75), max_pop, &watched_ids, now).await {
-        for a in remote_anime {
+    for batch in [res_combined, res_mood].into_iter().flatten() {
+        for a in batch {
             let _ = crate::db::cache::upsert_anime(pool, &a).await;
             if seen_ids.insert(a.id) {
                 candidate_anime.push(a);
@@ -1280,7 +1652,7 @@ pub async fn generate_tailored_matches_advanced(
 
     // 5. Also fetch high-scoring local cached anime
     let local_rows = sqlx::query_as::<_, Anime>(
-        "SELECT id, title_english, title_romaji, title_native, description, episodes, status, season, season_year, score, format, genres, cover_url, cover_blob, has_dub, updated_at, next_airing_episode FROM anime ORDER BY score DESC LIMIT 300;"
+        "SELECT id, title_english, title_romaji, title_native, description, episodes, status, season, season_year, score, format, genres, cover_url, cover_blob, has_dub, updated_at, next_airing_episode FROM anime ORDER BY score DESC LIMIT 350;"
     )
     .fetch_all(pool)
     .await
@@ -1311,11 +1683,24 @@ pub async fn generate_tailored_matches_advanced(
             .then_with(|| b.anime.score.cmp(&a.anime.score))
     });
 
-    matches.truncate(15);
+    matches.truncate(120);
     matches
 }
 
-/// Query the local cache and rank anime based on the user's tailored answers.
+/// Query both the local cache and AniList GraphQL and return the top 30 tailored recommendations.
+#[allow(dead_code)]
+pub async fn generate_tailored_matches_advanced(
+    pool: &sqlx::SqlitePool,
+    client: &crate::api::anilist::AniListClient,
+    answers: &TailoredAnswers,
+    refinement: Option<&TailoredRefinement>,
+    now: i64,
+) -> Vec<TailoredMatch> {
+    let pool_matches = generate_tailored_pool_advanced(pool, client, answers, refinement, now).await;
+    apply_live_tuner(&pool_matches, answers, &LiveTunerConfig::default())
+}
+
+/// Query the local cache and rank anime based on the user's tailored answers (top 30).
 #[allow(dead_code)]
 pub async fn generate_tailored_matches(
     pool: &sqlx::SqlitePool,
@@ -1332,7 +1717,7 @@ pub async fn generate_tailored_matches(
     let mut seen_ids = HashSet::new();
 
     for anime in rows {
-        if seen_ids.insert(anime.id) {
+        if seen_ids.insert(anime.id) && !is_sequel_season(&anime) {
             if let Some(m) = score_anime(&anime, answers) {
                 matches.push(m);
             }
@@ -1346,11 +1731,11 @@ pub async fn generate_tailored_matches(
             .then_with(|| b.anime.score.cmp(&a.anime.score))
     });
 
-    matches.truncate(15);
+    matches.truncate(30);
     matches
 }
 
-/// Calculate the Umbral (dark/lore/intellect) vs. Astral (action/emotion/hype) aetheric balance.
+/// Calculate Serious/Analytical vs. Action/Emotional tone balance.
 pub fn calculate_polarity(persona: &Persona) -> (u8, u8, &'static str, &'static str) {
     let intellect = persona.gauges[0].1 as f32;
     let lore = persona.gauges[1].1 as f32;
@@ -1366,21 +1751,21 @@ pub fn calculate_polarity(persona: &Persona) -> (u8, u8, &'static str, &'static 
     let astral_pct = 100 - umbral_pct;
 
     let aspect = if umbral_pct >= 65 {
-        "Umbral Shadow & Void"
+        "Analytical & Dark"
     } else if umbral_pct <= 35 {
-        "Astral Light & Lightning"
+        "High-Energy & Bright"
     } else {
-        "Equilibrium of Dawn & Dusk"
+        "Balanced Tone"
     };
 
     let demographic = if darkness >= 70.0 || intellect >= 85.0 {
-        "Seinen / Mature Lore"
+        "Seinen / Mature"
     } else if combat >= 75.0 {
-        "Shonen Kinetic & Spectacle"
+        "Shonen / Action"
     } else if emotion >= 75.0 {
-        "Josei / Emotional Drama"
+        "Josei / Drama"
     } else {
-        "Universal Astral"
+        "All-Audience Appeal"
     };
 
     (umbral_pct, astral_pct, aspect, demographic)
@@ -1426,7 +1811,7 @@ pub fn get_dimension_descriptor(gauge_name: &str, value: u8) -> &'static str {
 /// Type alias for FFXIV Primal Elemental affinities: (Fire/Lightning, Wind/Ice, Earth/Water, Dominant).
 pub type PrimalElements = ((u8, &'static str), (u8, &'static str), (u8, &'static str), &'static str);
 
-/// Compute FFXIV Primal Elemental affinities: (Fire/Lightning, Wind/Ice, Earth/Water, Dominant).
+/// Compute core genre category affinities: (Action/Pacing, Mystery/Strategy, Worldbuilding/Comfort, Dominant).
 pub fn get_primal_elements(persona: &Persona) -> PrimalElements {
     let int_val = persona.gauges[0].1 as f32;
     let lore_val = persona.gauges[1].1 as f32;
@@ -1434,24 +1819,24 @@ pub fn get_primal_elements(persona: &Persona) -> PrimalElements {
     let combat_val = persona.gauges[3].1 as f32;
     let dark_val = persona.gauges[4].1 as f32;
 
-    // Fire & Lightning: Kinetic Action & Spectacle
+    // Action & Spectacle
     let fire = ((combat_val * 0.70) + ((100.0 - dark_val).max(0.0) * 0.30)).clamp(15.0, 95.0).round() as u8;
 
-    // Wind & Ice: Intellectual Mystery, Calculation & Void
+    // Mystery & Strategy
     let wind = ((int_val * 0.65) + (dark_val * 0.35)).clamp(15.0, 95.0).round() as u8;
 
-    // Earth & Water: Setting Lore, Solace & Emotional Resonance
+    // Worldbuilding & Comfort
     let earth = ((lore_val * 0.50) + (emo_val * 0.50)).clamp(15.0, 95.0).round() as u8;
 
     let dominant = if earth >= fire && earth >= wind {
-        "Astral Earth & Water (Peaceful Solace & Worldcraft)"
+        "Worldbuilding & Comfort (Story & Atmosphere)"
     } else if wind >= fire {
-        "Umbral Wind & Ice (Tactical Mystery & Calculation)"
+        "Mystery & Strategy (Tactical & Deep Lore)"
     } else {
-        "Astral Fire & Lightning (Kinetic Energy & Hype)"
+        "Action & Spectacle (High-Energy Pacing)"
     };
 
-    ((fire, "Fire & Lightning (Kinetic Action)"), (wind, "Wind & Ice (Intellectual Mystery)"), (earth, "Earth & Water (World Lore & Solace)"), dominant)
+    ((fire, "Action & Pacing"), (wind, "Mystery & Strategy"), (earth, "World & Comfort"), dominant)
 }
 
 /// Returns a compact active weight/filter pill for question q_idx.
@@ -1528,83 +1913,83 @@ pub fn get_question_active_pill(answers: &TailoredAnswers, q_idx: usize) -> &'st
     }
 }
 
-/// Generate 8 dynamic Adventurer-Plate-style tasting note badges from user answers.
+/// Generate 8 dynamic preference badges from user answers.
 pub fn get_tasting_notes(answers: &TailoredAnswers) -> Vec<&'static str> {
     let mut notes = Vec::new();
 
     // 1. Mood note
     match answers.choices[0] {
-        0 => notes.push("❖ High Adrenaline"),
-        1 => notes.push("❖ Tactical Mind Games"),
-        2 => notes.push("❖ Hearth Solace"),
-        3 => notes.push("❖ Devastating Emotion"),
-        _ => notes.push("❖ Visceral Stakes"),
+        0 => notes.push("High Adrenaline"),
+        1 => notes.push("Tactical Mind Games"),
+        2 => notes.push("Cozy & Relaxing"),
+        3 => notes.push("Emotional Drama"),
+        _ => notes.push("Dark & Intense"),
     }
 
     // 2. Setting note
     match answers.choices[2] {
-        0 => notes.push("◈ High Fantasy Realm"),
-        1 => notes.push("◈ Cyberpunk Noir"),
-        2 => notes.push("◈ Modern Urban"),
-        3 => notes.push("◈ Feudal Samurai"),
-        _ => notes.push("◈ Otherworldly Odyssey"),
+        0 => notes.push("High Fantasy"),
+        1 => notes.push("Cyberpunk & Sci-Fi"),
+        2 => notes.push("Modern Urban"),
+        3 => notes.push("Historical Samurai"),
+        _ => notes.push("Isekai Adventure"),
     }
 
     // 3. Hero note
     match answers.choices[3] {
-        0 => notes.push("✦ Mastermind Lead"),
-        1 => notes.push("✦ Relentless Underdog"),
-        2 => notes.push("✦ Hardened Veteran"),
-        3 => notes.push("✦ Relatable Normalcy"),
-        _ => notes.push("✦ Ensemble Synergy"),
+        0 => notes.push("Strategist Lead"),
+        1 => notes.push("Underdog Growth"),
+        2 => notes.push("Skilled Veteran"),
+        3 => notes.push("Relatable Lead"),
+        _ => notes.push("Ensemble Cast"),
     }
 
     // 4. Darkness note
     match answers.choices[5] {
-        0 => notes.push("⬡ Noble Spirit"),
-        1 => notes.push("⬡ Balanced Bittersweet"),
-        2 => notes.push("⬡ Morally Gray Depths"),
-        _ => notes.push("⬡ Severe Mortality"),
+        0 => notes.push("Uplifting Tone"),
+        1 => notes.push("Balanced Tone"),
+        2 => notes.push("Morally Gray"),
+        _ => notes.push("High Stakes & Gritty"),
     }
 
     // 5. Depth note
     match answers.choices[8] {
-        0 => notes.push("✧ Popcorn Thrills"),
-        1 => notes.push("✧ Philosophical Core"),
-        2 => notes.push("✧ Intricate Geopolitics"),
-        _ => notes.push("✧ Deep Psychology"),
+        0 => notes.push("Fast Pacing"),
+        1 => notes.push("Philosophical"),
+        2 => notes.push("Political Intrigue"),
+        _ => notes.push("Deep Psychology"),
     }
 
     // 6. Conflict note
     match answers.choices[4] {
-        0 => notes.push("⟐ Grand Wars & Factions"),
-        1 => notes.push("⟐ High-Stakes Intrigue"),
-        2 => notes.push("⟐ Intimate Romance"),
-        3 => notes.push("⟐ Tournament Glory"),
-        _ => notes.push("⟐ Survival & Horror"),
+        0 => notes.push("Large-Scale Wars"),
+        1 => notes.push("Mystery & Intrigue"),
+        2 => notes.push("Romance & Drama"),
+        3 => notes.push("Tournaments"),
+        _ => notes.push("Survival Stakes"),
     }
 
     // 7. Length / Deal-Breaker note
     if answers.deal_breakers.contains(&0) {
-        notes.push("⬢ Purified Canon (No Ecchi)");
+        notes.push("No Fanservice / Ecchi");
     } else if answers.deal_breakers.contains(&1) {
-        notes.push("⬢ Measured (No Gore)");
+        notes.push("No Heavy Gore");
     } else if answers.deal_breakers.contains(&2) {
-        notes.push("⬢ Zero Pacing Drag");
+        notes.push("No Slow Pacing");
     } else {
         match answers.choices[1] {
-            0 => notes.push("⬢ Micro Mini-Series"),
-            1 => notes.push("⬢ Complete 1-Cour Arc"),
-            2 => notes.push("⬢ Expansive 2-Cour"),
-            _ => notes.push("⬢ Multi-Season Saga"),
+            0 => notes.push("Short Mini-Series"),
+            1 => notes.push("1-Cour (10-13 eps)"),
+            2 => notes.push("2-Cour (20-26 eps)"),
+            _ => notes.push("Long-Running (50+)"),
         }
     }
 
     // 8. Status / Canon note
     match answers.choices[7] {
-        0 => notes.push("✦ Concluded Canon Story"),
-        1 => notes.push("✦ Active Releasing Arc"),
-        _ => notes.push("✦ Timeless Classic Canon"),
+        0 => notes.push("Finished Series"),
+        1 => notes.push("Currently Airing"),
+        _ => notes.push("Any Release Status"),
     }
 
     notes
@@ -1826,19 +2211,19 @@ pub fn get_thematic_hook(anime: &Anime) -> &'static str {
     let lower: Vec<String> = genres.iter().map(|g| g.to_lowercase()).collect();
 
     if lower.iter().any(|g| g == "psychological" || g == "mystery" || g == "thriller") {
-        "✦ A calculated descent into high-stakes moral dilemmas where intellect is weaponized."
+        "A calculated descent into high-stakes moral dilemmas where intellect is weaponized."
     } else if lower.iter().any(|g| g == "sci-fi" || g == "mecha") {
-        "✦ In a neon dystopia where human soul and machine collide, truth demands sacrifice."
+        "In a neon dystopia where human soul and machine collide, truth demands sacrifice."
     } else if lower.iter().any(|g| g == "fantasy") && lower.iter().any(|g| g == "action" || g == "adventure") {
-        "✦ An odyssey through ancient perils where mythological destiny and mortality clash."
+        "An odyssey through ancient perils where destiny and survival clash."
     } else if lower.iter().any(|g| g == "action" || g == "martial arts") {
-        "✦ Pulse-pounding adrenaline and ferocious combat where survival requires unyielding grit."
+        "Pulse-pounding adrenaline and ferocious combat where survival requires unyielding grit."
     } else if lower.iter().any(|g| g == "drama" || g == "romance") {
-        "✦ A profound exploration of sorrow, fragile connections, and the weight of remembrance."
+        "A moving exploration of sorrow, fragile connections, and lasting memories."
     } else if lower.iter().any(|g| g == "slice of life" || g == "comedy") {
-        "✦ Gentle solace and heartwarming escapades discovered in the beauty of the everyday."
+        "Gentle warmth and lighthearted moments discovered in everyday life."
     } else {
-        "✦ A captivating chronicle through unforeseen peril, comradeship, and triumph."
+        "A captivating journey through unforeseen peril, camaraderie, and triumph."
     }
 }
 
@@ -1862,7 +2247,7 @@ mod tests {
         answers.choices[3] = 0; // Mastermind
 
         let persona = calculate_persona(&answers);
-        assert!(persona.title.contains("ARCHON OF ALLAGAN CIPHERS"));
+        assert!(persona.title.contains("CYBERPUNK STRATEGIST"));
         assert_eq!(persona.gauges[0].1, 100); // 100% intellect
     }
 
@@ -1872,7 +2257,7 @@ mod tests {
         answers.choices[5] = 3; // Brutal & Unforgiving
 
         let persona = calculate_persona(&answers);
-        assert!(persona.title.contains("SHADOWBRINGER OF THE ABYSS"));
+        assert!(persona.title.contains("DARK & MATURE REALIST"));
         assert_eq!(persona.gauges[4].1, 100); // 100% darkness
     }
 
@@ -1921,9 +2306,9 @@ mod tests {
         answers.choices[5] = 3; // Brutal Darkness
         answers.choices[0] = 1; // Deep Intellect
         let persona = calculate_persona(&answers);
-        let (umbral, astral, aspect, _) = calculate_polarity(&persona);
-        assert!(umbral > astral);
-        assert!(aspect.contains("Umbral"));
+        let (analytical, energetic, aspect, _) = calculate_polarity(&persona);
+        assert!(analytical > energetic);
+        assert!(aspect.contains("Analytical"));
     }
 
     #[test]
@@ -2030,7 +2415,105 @@ mod tests {
         };
 
         let scored = score_anime_refined(&anime, &answers, &refinement, Some(&peers)).unwrap();
-        assert!(scored.reason_tags.iter().any(|t| t.contains("Peer of Death Note")));
+        assert!(scored.reason_tags.iter().any(|t| t.contains("Similar to Death Note")));
         assert!(scored.match_percentage >= 95);
+    }
+
+    #[test]
+    fn test_cozy_mood_rejects_battle_shounen_and_rewards_slice_of_life() {
+        let mut answers = TailoredAnswers::default();
+        answers.choices[0] = 2; // Cozy & Heartwarming
+        answers.choices[1] = 4; // Any Length
+        answers.choices[2] = 0; // High Fantasy
+        answers.choices[3] = 1; // Underdog
+        answers.choices[5] = 1; // Balanced
+        answers.choices[6] = 3; // Timeless
+        answers.choices[7] = 2; // Any Status
+        answers.choices[8] = 0; // Popcorn Fun
+
+        let battle_shounen = Anime {
+            id: 21,
+            title_romaji: "Black Clover".to_string(),
+            genres: serde_json::to_string(&vec!["Action", "Adventure", "Comedy", "Fantasy", "Shounen"]).unwrap(),
+            episodes: Some(170),
+            status: Some("FINISHED".to_string()),
+            score: Some(81),
+            ..Default::default()
+        };
+
+        let cozy_fantasy = Anime {
+            id: 457,
+            title_romaji: "Mushishi".to_string(),
+            genres: serde_json::to_string(&vec!["Adventure", "Mystery", "Slice of Life", "Iyashikei", "Supernatural"]).unwrap(),
+            episodes: Some(26),
+            status: Some("FINISHED".to_string()),
+            score: Some(87),
+            ..Default::default()
+        };
+
+        assert!(score_anime(&battle_shounen, &answers).is_none());
+        let cozy_score = score_anime(&cozy_fantasy, &answers).unwrap();
+        assert!(cozy_score.match_percentage >= 84);
+    }
+
+    #[test]
+    fn test_is_sequel_season_detects_sequels() {
+        let s2 = Anime {
+            title_english: Some("Black Clover Season 2".to_string()),
+            title_romaji: "Black Clover Season 2".to_string(),
+            ..Default::default()
+        };
+        let p2 = Anime {
+            title_romaji: "Aoashi 2nd Season".to_string(),
+            ..Default::default()
+        };
+        let s1 = Anime {
+            title_english: Some("Frieren: Beyond Journey's End".to_string()),
+            title_romaji: "Sousou no Frieren".to_string(),
+            ..Default::default()
+        };
+        assert!(is_sequel_season(&s2));
+        assert!(is_sequel_season(&p2));
+        assert!(!is_sequel_season(&s1));
+    }
+
+    #[test]
+    fn test_apply_live_tuner_returns_30_and_applies_filters() {
+        let answers = TailoredAnswers::default();
+        let mut pool = Vec::new();
+        for i in 1..=45 {
+            pool.push(TailoredMatch {
+                anime: Anime {
+                    id: i,
+                    title_romaji: if i == 2 {
+                        "Show Season 2".to_string()
+                    } else {
+                        format!("Sample Anime {}", i)
+                    },
+                    genres: serde_json::to_string(&if i == 5 {
+                        vec!["Slice of Life", "Iyashikei"]
+                    } else {
+                        vec!["Slice of Life", "Comedy"]
+                    }).unwrap(),
+                    status: Some(if i % 2 == 0 { "RELEASING" } else { "FINISHED" }.to_string()),
+                    season_year: Some(2023),
+                    score: Some(85),
+                    ..Default::default()
+                },
+                match_percentage: 86,
+                reason_tags: vec!["Slice of Life".to_string()],
+            });
+        }
+
+        let mut tuner = LiveTunerConfig::default();
+        let default_res = apply_live_tuner(&pool, &answers, &tuner);
+        assert_eq!(default_res.len(), 30);
+        assert!(!default_res.iter().any(|m| m.anime.id == 2)); // Season 2 hidden
+
+        tuner.boosted_tags.insert("Iyashikei".to_string());
+        tuner.dismissed_ids.insert(1);
+        let tuned_res = apply_live_tuner(&pool, &answers, &tuner);
+        assert!(!tuned_res.iter().any(|m| m.anime.id == 1));
+        assert_eq!(tuned_res[0].anime.id, 5); // Boosted Iyashikei moves to #1
     }
 }

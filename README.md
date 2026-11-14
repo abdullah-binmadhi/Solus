@@ -41,15 +41,17 @@ Watching anime on the web usually means choosing between a bloated streaming sit
 **Solus fixes all of that by skipping the browser entirely:**
 
 - **No Ads. No Pop-ups. No Ad-Blocker Required.** — When you press `Enter` on an episode, it opens cleanly in your media player (`mpv`, `iina`, or `vlc`). No banners, no redirects, no nonsense.
+- **Cinematic Bento Home & Balanced Command Dock** — Top shelf pills (`1`–`6`), a 3-zone Spotlight Hero stage with live telemetry HUD, a Smart Bento dock pairing *Continue Watching* beside *My Watchlist*, and a cleanly structured 2-row Command Dock with clickable action chips that never clip.
+- **Seasonal Anime & Movie Release Calendar (`c`)** — Browse weekly episode airings and movie/OVA premieres across past, current, and upcoming weeks (`H` / `L` or `[` / `]`). Tracked shows pin cleanly to the top of each day with local airtime countdowns, `All` / `Tracked` / `Movies` scope filters (`f`), one-key Watchlist toggling (`+`), and instant streaming (`Enter`) the moment an episode airs.
 - **Split-Deck Fuzzy Feature Command Hub (`s`)** — An omni-searchable control palette inspired by Raycast and Neovim Telescope. Search any feature, typography style, or setting in real time with Skim fuzzy matching, preview details on the live inspector card, and trigger actions with `Enter`—no need to memorize cryptic hotkeys.
 - **Cinema-Grade Subtitles & Signage Collision Guard** — Four hand-tuned typography presets (`Studio Minimal`, `Netflix Clean`, `Anime Fansub`, `OLED Plate`) with custom stroke outlines, drop shadows, and pill backdrops. Dialogue that collides with translated Japanese signs is automatically lifted upward in real time so you never miss a beat.
 - **Zero-Setup Local LAN Mobile Remote Companion (`m`)** — Scan an in-terminal ASCII QR code from your smartphone to launch an embedded OLED touch remote on your local Wi-Fi. Scrub through episodes, play/pause, adjust volume, skip intro/outro, and switch sub/dub right from your couch.
-- **Native AirPlay & Smart TV Direct Streamer (`c`)** — Scan your local Wi-Fi for Apple TV, LG webOS, Samsung Tizen, and Sony Bravia TVs. Beam decrypted 1080p/4K master streams directly to television hardware decoders with a full-screen TV Command Deck.
+- **Native AirPlay & Smart TV Direct Streamer (`c` on Detail)** — Scan your local Wi-Fi for Apple TV, LG webOS, Samsung Tizen, and Sony Bravia TVs. Beam decrypted 1080p/4K master streams directly to television hardware decoders with a full-screen TV Command Deck.
 - **Real-Time Anime4K Upscaling & Adaptive Ambilight** — Direct GPU GLSL shader upscaling reconstructs crisp line-art in real time, while cover-adaptive Ambilight extracts vibrant color histograms from anime posters to softly tint terminal borders.
 - **Watch in Your Language** — Flip between `SUB` and `DUB` with one key (`d`), or press `o` to choose your video quality (`1080p`, `720p`, `480p`) and subtitle language—including **English, Arabic, Spanish, French, German, Russian, Portuguese, Italian**, and more.
 - **Seamless AniList Compatibility** — Connect your AniList account by username or drop in your saved JSON backup file (`s` → AniList). Your **Continue Watching** and **Watchlist** stay in sync, and dropped shows stay gone.
 - **Fluid Background Auto-Updater (`u`)** — Zero-lag startup update checks throttled with a 4-hour SQLite cache, atomic in-place binary swapping, and multi-architecture binary distribution.
-- **Discovery That Actually Knows Your Taste (`w`)** — Tired of scrolling for an hour? Take an interactive taste quiz, press `f` to narrow down the exact vibe you want, and search by an anime you already love (*Death Note*, *Monster*, *Steins;Gate*). Solus curates personalized gems instead of generic top-10 lists.
+- **Discovery That Actually Knows Your Taste (`w`)** — Take a fast 10-question taste quiz to unlock **30 tailored matches** scored across genres, pacing, and mood. Toggle the **Live Vibe Tuner (`f`)** to interactively reshape results in real time without answering another quiz, or anchor similar picks to any show you love (`m`).
 - **Anime Wrapped & Viewing Telemetry (`a`)** — Press `a` to view your total watch time, completed episodes, favorite studio affinity radar, and seasonal pacing graphs rendered in high-density Braille charts.
 
 ---
@@ -247,12 +249,17 @@ Solus is engine-agnostic and supports multiple media player backends. You can sw
 | :--- | :--- |
 | `j` / `k` or `↑` / `↓` | Move between category rows (*Continue Watching*, *Watchlist*, *Trending*, etc.) |
 | `h` / `l` or `←` / `→` | Scroll anime cards left / right |
-| `Enter` | Open the **Detail & Episode Inspector** screen for the highlighted anime |
+| `1` – `6` | Jump directly to a shelf matching the Top Bar shelf pills |
+| `Enter` / `d` | Open the **Detail & Episode Inspector** screen for the highlighted anime |
 | `r` | Immediately resume the next unwatched episode of the highlighted anime |
-| `x` / `d` / `Del` | Remove highlighted anime from *Continue Watching* or *Watchlist* |
-| `w` | Open **For You // Tailored** (interactive recommendation engine) |
+| `+` | Add or remove the highlighted anime from your **Watchlist** |
+| `x` / `Del` | Remove highlighted anime from *Continue Watching* / *Watchlist* (or stop playback) |
+| `c` / `C` | Open **Seasonal Anime & Movie Release Calendar** (weekly airings & countdowns) |
+| `w` | Open **For You // Tailored** (top-30 recommendation engine & live vibe tuner) |
 | `a` | Open **Anime Wrapped & Taste Analytics** (watch time, genres, telemetry) |
 | `m` / `M` | Display **Mobile Touch Remote ASCII QR Code Modal** |
+| `T` | Cycle color theme palette (`Solus Dark`, `Anime Violet`, etc.) |
+| `L` | Open **AniList Login / Cloud Library Sync** |
 | `s` | Open **Split-Deck Fuzzy Feature Command Hub** |
 | `/` | Open instant fuzzy title search |
 | `!` | Open Dependency Health Doctor (validates mpv, ani-cli, ffmpeg) |
@@ -261,6 +268,21 @@ Solus is engine-agnostic and supports multiple media player backends. You can sw
 | `Shift+R` | Refresh Home rows from AniList |
 | `?` | Open keyboard shortcuts help modal |
 | `q` / `Esc` | Quit Solus |
+
+### Seasonal & Movie Release Calendar (`c`)
+| Key | Action |
+| :--- | :--- |
+| `h` / `l` or `←` / `→` | Move between `MON`–`SUN` (rolls seamlessly into previous/next week at edges) |
+| `1` – `7` | Jump directly to a weekday (`Monday`–`Sunday`) |
+| `H` / `L` or `[` / `]` | Jump backward or forward week-by-week (up to ±8 weeks) |
+| `t` | Snap back to **Today** (*This Week*) |
+| `j` / `k` or `↑` / `↓` | Browse chronological episodes and movie premieres for the selected day |
+| `f` | Cycle scope filter (`All` → `Tracked` → `Movies`) |
+| `Enter` | Stream aired episode/movie immediately, or view overview for upcoming releases |
+| `+` | Toggle the focused anime in your **Watchlist** and pin it as Tracked |
+| `d` | Open full **Detail & Episode Inspector** for the highlighted title |
+| `r` | Force-refresh the currently displayed week from AniList |
+| `Esc` / `q` / `c` | Close Calendar and return |
 
 ### Detail Screen & Split-Deck Episode Inspector
 | Key | Action |
@@ -300,12 +322,14 @@ Solus is engine-agnostic and supports multiple media player backends. You can sw
 ### Tailored Discovery (`w`)
 | Key | Action |
 | :--- | :--- |
-| `j` / `k` or `↑` / `↓` | Move through quiz choices or recommended anime |
-| `Space` | Select multiple answers during the **6-Question Refinement (`f`)** |
-| `Enter` | Confirm your choices / open the selected anime |
-| `f` | Refine results with deeper mood questions + **Anchor Anime Search** |
+| `j` / `k` or `↑` / `↓` | Move through quiz choices or the **30 curated anime recommendations** |
+| `Enter` | Confirm quiz answers / open the highlighted recommendation |
+| `f` | Toggle the **Live Vibe Tuner** bar to interactively filter by mood, match mode, era, or tags |
+| `m` | Search by an **Anchor Anime** ("More Like This") to pivot recommendations cleanly |
+| `Space` | Toggle vibe chips directly inside the **Live Vibe Tuner** |
+| `+` | Add or remove the focused recommendation from your **Watchlist** |
 | `r` | Retake the taste quiz from the start |
-| `Esc` | Back to Home |
+| `Esc` | Close tuner / return to Home |
 
 ---
 

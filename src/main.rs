@@ -57,10 +57,20 @@ enum AppMessage {
     PublicSyncCompleted(std::result::Result<(api::anilist::ViewerInfo, services::importer::ImportStats), String>),
     /// Backup exported to disk (exported count or error message)
     BackupExportCompleted(std::result::Result<usize, String>),
-    /// Tailored recommendations generated
+    /// Tailored recommendations scored candidate pool generated
     TailoredResultsReady(Vec<services::tailored::TailoredMatch>),
-    /// Live search results for Keystone Anchor Anime
-    AnchorSearchResultsReady(Vec<db::cache::Anime>),
+    /// AniList community peer recommendations loaded for `[m]` More Like This anchor
+    TunerPeersReady(i64, Vec<db::cache::Anime>),
+    /// Weekly release calendar data fetched for `week_offset`
+    CalendarWeekReady {
+        week_offset: i32,
+        tz_offset_secs: i64,
+        tracked_ids: std::collections::HashSet<i64>,
+        watched_map: std::collections::HashMap<i64, std::collections::HashSet<u32>>,
+        releases: Vec<api::anilist::CalendarRelease>,
+    },
+    /// Weekly release calendar fetch failed for `week_offset`
+    CalendarWeekFailed(i32, String),
     /// Episode titles, streaming thumbnails and synopses loaded (anime_id, map of ep -> (title, Option<thumbnail_url>, Option<synopsis>))
     EpisodeMetadataReady(i64, std::collections::HashMap<u32, (String, Option<String>, Option<String>)>),
     /// Episode thumbnail image downloaded and decoded (anime_id, episode_num, image)
@@ -602,22 +612,74 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                AppMessage::TailoredResultsReady(results) => {
-                    for m in &results {
+                AppMessage::TailoredResultsReady(pool_matches) => {
+                    state.open_tailored_results(pool_matches);
+                    for m in &state.tailored_results {
                         if !state.cover_cache.contains_key(&m.anime.id) && !state.loading_covers.contains(&m.anime.id) {
                             state.loading_covers.insert(m.anime.id);
                             trigger_cover_download(m.anime.clone(), pool.clone(), tx.clone());
                         }
                     }
-                    state.open_tailored_results(results);
                     if let Some(first) = state.tailored_results.first() {
                         state.cover_anime_id = Some(first.anime.id);
                     }
                 }
-                AppMessage::AnchorSearchResultsReady(results) => {
-                    state.is_searching_anchor = false;
-                    state.refine_anchor_results = results;
-                    state.refine_anchor_cursor = 0;
+                AppMessage::TunerPeersReady(anchor_id, peers) => {
+                    let is_same_anchor = state
+                        .tuner_config
+                        .anchor_anime
+                        .as_ref()
+                        .is_some_and(|(id, _, _)| *id == anchor_id);
+                    if is_same_anchor {
+                        let existing_ids: std::collections::HashSet<i64> =
+                            state.tailored_pool.iter().map(|m| m.anime.id).collect();
+                        for p in peers {
+                            state.tuner_config.anchor_peer_ids.insert(p.id);
+                            if !existing_ids.contains(&p.id) {
+                                let m = services::tailored::score_anime(&p, &state.tailored_answers)
+                                    .unwrap_or_else(|| services::tailored::TailoredMatch {
+                                        anime: p.clone(),
+                                        match_percentage: 82,
+                                        reason_tags: p.genre_list().into_iter().take(2).collect(),
+                                    });
+                                state.tailored_pool.push(m);
+                            }
+                        }
+                        state.recompute_tailored_results();
+                        for m in state.tailored_results.iter().take(8) {
+                            if !state.cover_cache.contains_key(&m.anime.id) && !state.loading_covers.contains(&m.anime.id) {
+                                state.loading_covers.insert(m.anime.id);
+                                trigger_cover_download(m.anime.clone(), pool.clone(), tx.clone());
+                            }
+                        }
+                        state.show_toast("Updated with AniList community similar picks", unix_now());
+                    }
+                }
+                AppMessage::CalendarWeekReady {
+                    week_offset,
+                    tz_offset_secs,
+                    tracked_ids,
+                    watched_map,
+                    releases,
+                } => {
+                    state.calendar_tz_offset_secs = tz_offset_secs;
+                    state.calendar_tracked_ids = tracked_ids;
+                    state.calendar_watched_map = watched_map;
+                    state.calendar_cache.insert(week_offset, releases);
+                    if state.calendar_week_offset == week_offset {
+                        state.is_loading_calendar = false;
+                        if state.screen == Screen::Calendar {
+                            prefetch_calendar_covers(&mut state, &pool, &tx);
+                        }
+                    }
+                }
+                AppMessage::CalendarWeekFailed(week_offset, err) => {
+                    if state.calendar_week_offset == week_offset {
+                        state.is_loading_calendar = false;
+                        if state.screen == Screen::Calendar {
+                            state.show_toast(format!("Calendar refresh failed: {}", err), unix_now());
+                        }
+                    }
                 }
                 AppMessage::EpisodeMetadataReady(anime_id, meta) => {
                     if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
@@ -961,6 +1023,10 @@ async fn main() -> anyhow::Result<()> {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
                         ui::update_modal::render_overlay(frame, &state);
                     }
+                    Screen::Calendar => {
+                        render_base_screen(frame, &mut state, &home_data, &base_screen);
+                        ui::calendar::render_overlay(frame, &mut state);
+                    }
                 }
                 // Toast notification renders on top of everything
                 if let Some(ref msg) = toast_msg {
@@ -1034,7 +1100,7 @@ async fn handle_key(
         Screen::Playback => handle_playback(key, state, pool, cfg, tx).await,
         Screen::Search   => handle_search(key, state, pool, tx).await,
         Screen::Help     => { state.go_back(); }
-        Screen::Settings => handle_settings(key, state, cfg, tx).await,
+        Screen::Settings => handle_settings(key, state, pool, cfg, tx).await,
         Screen::Setup    => handle_setup(key, state).await,
         Screen::AniListLogin => handle_login(key, state, home_data, pool, cfg, tx).await,
         Screen::TailoredWizard => handle_tailored_wizard(key, state),
@@ -1045,6 +1111,7 @@ async fn handle_key(
         Screen::CastModal => handle_cast_modal(key, state, tx).await,
         Screen::CastDeck => handle_cast_deck(key, state).await,
         Screen::UpdateModal => handle_update_modal(key, state, tx).await,
+        Screen::Calendar => handle_calendar(key, state, home_data, pool, cfg, tx).await,
     }
 }
 
@@ -1264,77 +1331,136 @@ async fn handle_mouse(
             let (mx, my) = (mouse.column, mouse.row);
             match state.screen {
                 Screen::Home => {
-                    // Featured Banner (top 10 rows)
-                    if my < 10 {
+                    let hero_start = ui::home::TOP_BAR_HEIGHT;
+                    let rows_start = hero_start + ui::home::HERO_HEIGHT;
+
+                    // Top Navigation Bar shelf pills
+                    if my < hero_start {
+                        if let Some(target_row) = ui::home::top_bar_shelf_at(home_data, term_w, mx) {
+                            state.active_row = target_row;
+                            refresh_home_cover(state, home_data, pool, tx);
+                            return true;
+                        }
+                    }
+
+                    // Featured Hero Stage
+                    if my >= hero_start && my < rows_start {
                         let banner_anime = active_anime(state, home_data).or_else(|| home_data.featured.clone());
                         if let Some(anime) = banner_anime {
                             open_detail_from_anime(state, anime, pool, tx).await;
                             return true;
                         }
                     }
-                    // Bottom Navigation Bar (footer)
-                    if my >= term_h.saturating_sub(2) {
-                        if mx < 18 {
-                            state.open_search();
-                            return true;
-                        } else if mx < 35 {
-                            state.open_tailored_wizard();
-                            return true;
-                        } else if mx < 55 {
-                            state.theme_index = (state.theme_index + 1) % ui::theme::THEMES.len();
-                            let theme_name = state.theme().name;
-                            state.show_toast(format!("Theme: {}", theme_name), unix_now());
-                            return true;
-                        } else if mx < 80 {
-                            state.open_login();
-                            return true;
-                        }
+
+                    // Bottom Command Dock (2-row responsive footer)
+                    if let Some(action) = ui::home::footer_action_at(state, term_w, term_h, mx, my) {
+                        use ui::home::HomeFooterAction::*;
+                        let code = match action {
+                            Search => KeyCode::Char('/'),
+                            Calendar => KeyCode::Char('c'),
+                            Wizard => KeyCode::Char('w'),
+                            Analytics => KeyCode::Char('a'),
+                            Remote => KeyCode::Char('m'),
+                            Doctor => KeyCode::Char('!'),
+                            Theme => KeyCode::Char('T'),
+                            Login => KeyCode::Char('L'),
+                            StopPlayback => KeyCode::Char('X'),
+                            UpdateNow => KeyCode::Char('U'),
+                            OpenDetail => KeyCode::Enter,
+                            Resume => KeyCode::Char('r'),
+                            Watchlist => KeyCode::Char('+'),
+                            Remove => KeyCode::Char('x'),
+                            Refresh => KeyCode::Char('R'),
+                            Settings => KeyCode::Char('s'),
+                            Help => KeyCode::Char('?'),
+                            Quit => KeyCode::Char('q'),
+                        };
+                        handle_home(event::KeyEvent::from(code), state, home_data, pool, cfg, tx).await;
+                        return true;
                     }
-                    // Rows & Cards
-                    if my >= 11 && my < term_h.saturating_sub(2) {
-                        let rel_y = my - 11;
-                        let row_h = 12;
-                        let clicked_row_idx = (rel_y / row_h) as usize;
-                        let card_pitch = 24;
-                        let clicked_card_col = (mx / card_pitch) as usize;
 
-                        let rows: Vec<(&str, state::CategoryRow, &[db::cache::Anime])> = vec![
-                            ("continue_watching", state::CategoryRow::ContinueWatching, &home_data.continue_watching),
-                            ("watchlist",         state::CategoryRow::Watchlist,        &home_data.watchlist),
-                            ("recommended",       state::CategoryRow::Recommended,      &home_data.recommended),
-                            ("trending",          state::CategoryRow::Trending,         &home_data.trending),
-                            ("popular",           state::CategoryRow::Popular,          &home_data.popular),
-                            ("top_rated",         state::CategoryRow::TopRated,         &home_data.top_rated),
-                            ("seasonal",          state::CategoryRow::Seasonal,         &home_data.seasonal),
-                        ];
-                        let visible: Vec<_> = rows.into_iter().filter(|(_, _, items)| !items.is_empty()).collect();
-                        let row_count = visible.len();
-                        if row_count > 0 {
-                            let max_rows_that_fit = ((term_h.saturating_sub(11 + 2)) / row_h).max(1) as usize;
-                            let visible_rows = row_count.min(max_rows_that_fit);
+                    // Smart Bento Tiers & Cards
+                    if my >= rows_start && my < term_h.saturating_sub(ui::home::FOOTER_HEIGHT) {
+                        let rel_y = my - rows_start;
+                        let row_h = ui::home::ROW_HEIGHT;
+                        let clicked_tier_idx = (rel_y / row_h) as usize;
+                        let card_pitch = ui::home::CARD_WIDTH + ui::home::CARD_GAP;
+                        let tiers = ui::home::build_shelf_tiers(home_data, term_w);
 
-                            let active_key = match state.active_row {
-                                state::CategoryRow::ContinueWatching => "continue_watching",
-                                state::CategoryRow::Watchlist        => "watchlist",
-                                state::CategoryRow::Recommended      => "recommended",
-                                state::CategoryRow::Trending         => "trending",
-                                state::CategoryRow::Popular          => "popular",
-                                state::CategoryRow::TopRated         => "top_rated",
-                                state::CategoryRow::Seasonal         => "seasonal",
-                            };
-                            let active_idx = visible.iter().position(|(key, _, _)| *key == active_key).unwrap_or(0);
-                            let start_idx = active_idx.saturating_sub(visible_rows.saturating_sub(1));
+                        if !tiers.is_empty() {
+                            let avail_h = term_h.saturating_sub(rows_start + ui::home::FOOTER_HEIGHT);
+                            let max_rows_that_fit = (avail_h / row_h).max(1) as usize;
+                            let visible_rows = tiers.len().min(max_rows_that_fit);
 
-                            if clicked_row_idx < visible_rows {
-                                let actual_row_idx = start_idx + clicked_row_idx;
-                                if let Some((key, cat_row, items)) = visible.get(actual_row_idx) {
-                                    state.active_row = cat_row.clone();
-                                    let offset = state.row_offset(key);
-                                    let target_idx = offset + clicked_card_col;
-                                    if let Some(anime) = items.get(target_idx) {
-                                        state.row_offsets.insert(key.to_string(), target_idx);
-                                        open_detail_from_anime(state, anime.clone(), pool, tx).await;
-                                        return true;
+                            let active_tier_idx = tiers
+                                .iter()
+                                .position(|tier| match tier {
+                                    ui::home::ShelfTier::BentoSplit => matches!(
+                                        state.active_row,
+                                        state::CategoryRow::ContinueWatching | state::CategoryRow::Watchlist
+                                    ),
+                                    ui::home::ShelfTier::Single(r) => *r == state.active_row,
+                                })
+                                .unwrap_or(0);
+                            let start_idx = active_tier_idx.saturating_sub(visible_rows.saturating_sub(1));
+
+                            if clicked_tier_idx < visible_rows {
+                                let actual_tier_idx = start_idx + clicked_tier_idx;
+                                if let Some(tier) = tiers.get(actual_tier_idx) {
+                                    match tier {
+                                        ui::home::ShelfTier::BentoSplit => {
+                                            let left_w = ui::home::bento_left_width(home_data.continue_watching.len());
+                                            if mx < left_w {
+                                                let inner_x = mx.saturating_sub(2);
+                                                let col = (inner_x / card_pitch) as usize;
+                                                let offset = state.row_offset("continue_watching");
+                                                let vis_n = home_data.continue_watching.len().min(2);
+                                                let start = ui::home::row_view_start(offset, home_data.continue_watching.len(), vis_n);
+                                                let target_idx = start + col;
+                                                if let Some(anime) = home_data.continue_watching.get(target_idx).cloned() {
+                                                    state.active_row = state::CategoryRow::ContinueWatching;
+                                                    state.row_offsets.insert("continue_watching".to_string(), target_idx);
+                                                    open_detail_from_anime(state, anime, pool, tx).await;
+                                                    return true;
+                                                }
+                                            } else if mx > left_w {
+                                                let right_x = left_w + 1;
+                                                let wl_inner_w = term_w.saturating_sub(right_x + 3);
+                                                let vis_n = ((wl_inner_w + ui::home::CARD_GAP) / card_pitch).max(1) as usize;
+                                                let inner_x = mx.saturating_sub(right_x + 2);
+                                                let col = (inner_x / card_pitch) as usize;
+                                                let offset = state.row_offset("watchlist");
+                                                let start = ui::home::row_view_start(offset, home_data.watchlist.len(), vis_n);
+                                                let target_idx = start + col;
+                                                if let Some(anime) = home_data.watchlist.get(target_idx).cloned() {
+                                                    state.active_row = state::CategoryRow::Watchlist;
+                                                    state.row_offsets.insert("watchlist".to_string(), target_idx);
+                                                    open_detail_from_anime(state, anime, pool, tx).await;
+                                                    return true;
+                                                }
+                                            }
+                                        }
+                                        ui::home::ShelfTier::Single(cat_row) => {
+                                            let (key, items): (&str, &[db::cache::Anime]) = match cat_row {
+                                                state::CategoryRow::ContinueWatching => ("continue_watching", &home_data.continue_watching),
+                                                state::CategoryRow::Watchlist        => ("watchlist", &home_data.watchlist),
+                                                state::CategoryRow::Trending         => ("trending", &home_data.trending),
+                                                state::CategoryRow::Popular          => ("popular", &home_data.popular),
+                                                state::CategoryRow::TopRated         => ("top_rated", &home_data.top_rated),
+                                                state::CategoryRow::Seasonal         => ("seasonal", &home_data.seasonal),
+                                            };
+                                            let vis_n = ((term_w + ui::home::CARD_GAP) / card_pitch).max(1) as usize;
+                                            let col = (mx / card_pitch) as usize;
+                                            let offset = state.row_offset(key);
+                                            let start = ui::home::row_view_start(offset, items.len(), vis_n);
+                                            let target_idx = start + col;
+                                            if let Some(anime) = items.get(target_idx).cloned() {
+                                                state.active_row = cat_row.clone();
+                                                state.row_offsets.insert(key.to_string(), target_idx);
+                                                open_detail_from_anime(state, anime, pool, tx).await;
+                                                return true;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1542,13 +1668,29 @@ async fn handle_home(
 
         // Row navigation — skip rows with no content so the cursor never
         // lands on an invisible row where Enter would do nothing.
-        KeyCode::Char('j') | KeyCode::Down => {
+        KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
             state.active_row = next_non_empty_row(&state.active_row, home_data, 1);
             refresh_home_cover(state, home_data, pool, tx);
         }
-        KeyCode::Char('k') | KeyCode::Up => {
+        KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
             state.active_row = next_non_empty_row(&state.active_row, home_data, -1);
             refresh_home_cover(state, home_data, pool, tx);
+        }
+
+        // Direct shelf jump shortcuts (1..=6 matching the Top Bar shelf pills)
+        KeyCode::Char(c @ '1'..='6') => {
+            let target = match c {
+                '1' => state::CategoryRow::ContinueWatching,
+                '2' => state::CategoryRow::Watchlist,
+                '3' => state::CategoryRow::Trending,
+                '4' => state::CategoryRow::Popular,
+                '5' => state::CategoryRow::TopRated,
+                _   => state::CategoryRow::Seasonal,
+            };
+            if row_len(&target, home_data) > 0 {
+                state.active_row = target;
+                refresh_home_cover(state, home_data, pool, tx);
+            }
         }
 
         // Card navigation within row
@@ -1588,6 +1730,9 @@ async fn handle_home(
             state.screen = Screen::RemoteModal;
         }
         KeyCode::Char('/') => state.open_search(),
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            open_and_fetch_calendar(state, pool, tx).await;
+        }
         KeyCode::Char('?') => state.open_help(),
         KeyCode::Char('s') => state.open_settings(),
         KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -1775,7 +1920,6 @@ fn active_row_key_max(state: &AppState, data: &ui::home::HomeData) -> (String, u
     match state.active_row {
         ContinueWatching => ("continue_watching".to_string(), data.continue_watching.len()),
         Watchlist        => ("watchlist".to_string(),         data.watchlist.len()),
-        Recommended      => ("recommended".to_string(),       data.recommended.len()),
         Trending         => ("trending".to_string(),          data.trending.len()),
         Popular          => ("popular".to_string(),           data.popular.len()),
         TopRated         => ("top_rated".to_string(),         data.top_rated.len()),
@@ -1791,7 +1935,6 @@ fn active_anime(state: &AppState, data: &ui::home::HomeData) -> Option<db::cache
     let list     = match state.active_row {
         ContinueWatching => &data.continue_watching,
         Watchlist        => &data.watchlist,
-        Recommended      => &data.recommended,
         Trending         => &data.trending,
         Popular          => &data.popular,
         TopRated         => &data.top_rated,
@@ -2061,7 +2204,6 @@ fn row_len(row: &state::CategoryRow, data: &ui::home::HomeData) -> usize {
     match row {
         ContinueWatching => data.continue_watching.len(),
         Watchlist        => data.watchlist.len(),
-        Recommended      => data.recommended.len(),
         Trending         => data.trending.len(),
         Popular          => data.popular.len(),
         TopRated         => data.top_rated.len(),
@@ -2079,7 +2221,7 @@ fn next_non_empty_row(
 ) -> state::CategoryRow {
     use state::CategoryRow::*;
     let order: &[state::CategoryRow] = &[
-        ContinueWatching, Watchlist, Recommended, Trending, Popular, TopRated, Seasonal,
+        ContinueWatching, Watchlist, Trending, Popular, TopRated, Seasonal,
     ];
     let pos = order.iter().position(|r| r == current).unwrap_or(2) as i32;
     let mut i = pos + direction;
@@ -2791,6 +2933,7 @@ async fn handle_search(
 async fn handle_settings(
     key: event::KeyEvent,
     state: &mut AppState,
+    pool: &sqlx::SqlitePool,
     cfg: &mut config::Config,
     tx: &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
@@ -2828,23 +2971,23 @@ async fn handle_settings(
         }
         KeyCode::Enter => {
             if let Some(item) = filtered.get(selected_idx).cloned() {
-                execute_hub_action(&item, cfg, state, 1, tx).await;
+                execute_hub_action(&item, cfg, state, pool, 1, tx).await;
             }
         }
         KeyCode::Left => {
             if let Some(item) = filtered.get(selected_idx).cloned() {
-                execute_hub_action(&item, cfg, state, -1, tx).await;
+                execute_hub_action(&item, cfg, state, pool, -1, tx).await;
             }
         }
         KeyCode::Right => {
             if let Some(item) = filtered.get(selected_idx).cloned() {
-                execute_hub_action(&item, cfg, state, 1, tx).await;
+                execute_hub_action(&item, cfg, state, pool, 1, tx).await;
             }
         }
         KeyCode::Char(' ') => {
             if state.settings_query.is_empty() {
                 if let Some(item) = filtered.get(selected_idx).cloned() {
-                    execute_hub_action(&item, cfg, state, 1, tx).await;
+                    execute_hub_action(&item, cfg, state, pool, 1, tx).await;
                 }
             } else {
                 state.settings_query.push(' ');
@@ -2863,6 +3006,7 @@ async fn execute_hub_action(
     item: &ui::settings::HubItem,
     cfg: &mut config::Config,
     state: &mut AppState,
+    pool: &sqlx::SqlitePool,
     delta: i32,
     tx: &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
@@ -3007,6 +3151,9 @@ async fn execute_hub_action(
         HealthDoctor => {
             refresh_dependency_status(state);
             state.open_setup();
+        }
+        OpenCalendar => {
+            open_and_fetch_calendar(state, pool, tx).await;
         }
         AniListSync => {
             state.open_login();
@@ -3375,6 +3522,350 @@ fn trigger_analytics_fetch(
     });
 }
 
+// ── Seasonal & Movie Release Calendar ─────────────────────────────────────────
+
+async fn open_and_fetch_calendar(
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let now = unix_now();
+    let tz = services::calendar::local_tz_offset_secs(pool).await;
+    if let Ok((tracked, watched)) = db::user::get_calendar_tracking_snapshot(pool).await {
+        state.calendar_tracked_ids = tracked;
+        state.calendar_watched_map = watched;
+    }
+    state.open_calendar(tz, now);
+    if state.calendar_cache.contains_key(&0) {
+        state.is_loading_calendar = false;
+        prefetch_calendar_covers(state, pool, tx);
+    }
+    // Always fetch or silently refresh current week so newly aired episodes appear accurately
+    spawn_calendar_week_fetch(state, 0, tz, now, pool.clone(), tx.clone());
+}
+
+fn spawn_calendar_week_fetch(
+    state: &mut AppState,
+    week_offset: i32,
+    tz_offset_secs: i64,
+    now: i64,
+    pool: sqlx::SqlitePool,
+    tx: tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    if !state.calendar_cache.contains_key(&week_offset) && state.calendar_week_offset == week_offset {
+        state.is_loading_calendar = true;
+    }
+    let bounds = services::calendar::compute_week_bounds(now, tz_offset_secs, week_offset);
+    let auth_token = state.auth.token.clone();
+    tokio::spawn(async move {
+        let client = api::anilist::AniListClient::with_token(auth_token);
+        match client
+            .fetch_weekly_schedule(
+                bounds.start_unix,
+                bounds.end_unix,
+                bounds.query_prev_ymd,
+                bounds.query_next_ymd,
+                tz_offset_secs,
+                now,
+            )
+            .await
+        {
+            Ok(releases) => {
+                for rel in &releases {
+                    let _ = db::cache::upsert_anime(&pool, &rel.anime).await;
+                }
+                let (tracked_ids, watched_map) = db::user::get_calendar_tracking_snapshot(&pool)
+                    .await
+                    .unwrap_or_default();
+                let _ = tx
+                    .send(AppMessage::CalendarWeekReady {
+                        week_offset,
+                        tz_offset_secs,
+                        tracked_ids,
+                        watched_map,
+                        releases,
+                    })
+                    .await;
+            }
+            Err(err) => {
+                let _ = tx
+                    .send(AppMessage::CalendarWeekFailed(week_offset, err.to_string()))
+                    .await;
+            }
+        }
+    });
+}
+
+fn calendar_day_entries(state: &AppState) -> Vec<services::calendar::CalendarDayEntry> {
+    let now = if state.calendar_today_unix > 0 {
+        state.calendar_today_unix
+    } else {
+        unix_now()
+    };
+    let tz = state.calendar_tz_offset_secs;
+    let bounds = services::calendar::compute_week_bounds(now, tz, state.calendar_week_offset);
+    let releases = state
+        .calendar_cache
+        .get(&state.calendar_week_offset)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let (mut buckets, _) = services::calendar::build_week_buckets(
+        releases,
+        state.calendar_filter,
+        &state.calendar_tracked_ids,
+        &state.calendar_watched_map,
+        &bounds,
+        tz,
+    );
+    let idx = state.calendar_day_idx.min(6);
+    std::mem::take(&mut buckets[idx])
+}
+
+fn focused_calendar_entry(state: &AppState) -> Option<services::calendar::CalendarDayEntry> {
+    let entries = calendar_day_entries(state);
+    if entries.is_empty() {
+        None
+    } else {
+        let idx = state.calendar_cursor.min(entries.len().saturating_sub(1));
+        entries.into_iter().nth(idx)
+    }
+}
+
+fn prefetch_calendar_covers(
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let entries = calendar_day_entries(state);
+    if entries.is_empty() {
+        return;
+    }
+    let safe_cursor = state.calendar_cursor.min(entries.len().saturating_sub(1));
+    if let Some(focused) = entries.get(safe_cursor) {
+        let fid = focused.anime().id;
+        state.cover_anime_id = Some(fid);
+        if state.cover_failed_anime_id != Some(fid) {
+            state.cover_failed_anime_id = None;
+        }
+        if !state.detail_cache.contains_key(&fid)
+            && !state.cover_cache.contains_key(&fid)
+            && !state.loading_covers.contains(&fid)
+        {
+            state.loading_covers.insert(fid);
+            trigger_cover_download(focused.anime().clone(), pool.clone(), tx.clone());
+        }
+    }
+    for entry in entries.iter().take(8) {
+        let id = entry.anime().id;
+        if !state.detail_cache.contains_key(&id)
+            && !state.cover_cache.contains_key(&id)
+            && !state.loading_covers.contains(&id)
+        {
+            state.loading_covers.insert(id);
+            trigger_cover_download(entry.anime().clone(), pool.clone(), tx.clone());
+        }
+    }
+}
+
+fn switch_calendar_week(
+    state: &mut AppState,
+    new_offset: i32,
+    new_day_idx: usize,
+    pool: &sqlx::SqlitePool,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let clamped_offset = new_offset.clamp(-8, 8);
+    state.calendar_week_offset = clamped_offset;
+    state.calendar_day_idx = new_day_idx.min(6);
+    state.calendar_cursor = 0;
+
+    let now = unix_now();
+    state.calendar_today_unix = now;
+    let tz = state.calendar_tz_offset_secs;
+
+    if state.calendar_cache.contains_key(&clamped_offset) {
+        state.is_loading_calendar = false;
+        prefetch_calendar_covers(state, pool, tx);
+    } else {
+        spawn_calendar_week_fetch(state, clamped_offset, tz, now, pool.clone(), tx.clone());
+    }
+}
+
+async fn handle_calendar(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    home_data: &ui::home::HomeData,
+    pool: &sqlx::SqlitePool,
+    cfg: &config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Char('C') => {
+            state.go_back();
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if state.calendar_day_idx > 0 {
+                state.calendar_day_idx -= 1;
+                state.calendar_cursor = 0;
+                prefetch_calendar_covers(state, pool, tx);
+            } else if state.calendar_week_offset > -8 {
+                switch_calendar_week(state, state.calendar_week_offset - 1, 6, pool, tx);
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            if state.calendar_day_idx < 6 {
+                state.calendar_day_idx += 1;
+                state.calendar_cursor = 0;
+                prefetch_calendar_covers(state, pool, tx);
+            } else if state.calendar_week_offset < 8 {
+                switch_calendar_week(state, state.calendar_week_offset + 1, 0, pool, tx);
+            }
+        }
+        KeyCode::Char('H') | KeyCode::Char('[') => {
+            if state.calendar_week_offset > -8 {
+                switch_calendar_week(
+                    state,
+                    state.calendar_week_offset - 1,
+                    state.calendar_day_idx,
+                    pool,
+                    tx,
+                );
+            } else {
+                state.show_toast("Reached earliest 8-week archive limit", unix_now());
+            }
+        }
+        KeyCode::Char('L') | KeyCode::Char(']') => {
+            if state.calendar_week_offset < 8 {
+                switch_calendar_week(
+                    state,
+                    state.calendar_week_offset + 1,
+                    state.calendar_day_idx,
+                    pool,
+                    tx,
+                );
+            } else {
+                state.show_toast("Reached farthest 8-week horizon limit", unix_now());
+            }
+        }
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            let now = unix_now();
+            state.calendar_today_unix = now;
+            let today_idx = services::calendar::today_weekday_idx(now, state.calendar_tz_offset_secs);
+            switch_calendar_week(state, 0, today_idx, pool, tx);
+        }
+        KeyCode::Char(d) if ('1'..='7').contains(&d) => {
+            let day_idx = (d as u8 - b'1') as usize;
+            state.calendar_day_idx = day_idx;
+            state.calendar_cursor = 0;
+            prefetch_calendar_covers(state, pool, tx);
+        }
+        KeyCode::Char('f') | KeyCode::Char('F') => {
+            state.calendar_filter = state.calendar_filter.next();
+            state.calendar_cursor = 0;
+            prefetch_calendar_covers(state, pool, tx);
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            let now = unix_now();
+            state.calendar_today_unix = now;
+            let offset = state.calendar_week_offset;
+            let tz = state.calendar_tz_offset_secs;
+            spawn_calendar_week_fetch(state, offset, tz, now, pool.clone(), tx.clone());
+            state.show_toast("Refreshing release schedule...", now);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let entries = calendar_day_entries(state);
+            if !entries.is_empty() && state.calendar_cursor + 1 < entries.len() {
+                state.calendar_cursor += 1;
+                prefetch_calendar_covers(state, pool, tx);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if state.calendar_cursor > 0 {
+                state.calendar_cursor -= 1;
+                prefetch_calendar_covers(state, pool, tx);
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(entry) = focused_calendar_entry(state) {
+                open_detail_from_anime(state, entry.anime().clone(), pool, tx).await;
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(entry) = focused_calendar_entry(state) {
+                let now = unix_now();
+                let ep = entry.release.episode;
+                if entry.release.airing_at <= now {
+                    let mut anime = entry.anime().clone();
+                    if anime.status.as_deref() == Some("NOT_YET_RELEASED") {
+                        anime.status = Some("RELEASING".to_string());
+                    }
+                    if anime.status.as_deref() == Some("RELEASING") {
+                        let min_next = (ep as i64).saturating_add(1);
+                        if anime.next_airing_episode.unwrap_or(0) < min_next {
+                            anime.next_airing_episode = Some(min_next);
+                        }
+                    } else if anime.episodes.unwrap_or(0) < ep as i64 {
+                        anime.episodes = Some(ep as i64);
+                    }
+                    open_detail_from_anime(state, anime, pool, tx).await;
+                    if !state.episode_list.contains(&ep) {
+                        state.episode_list.push(ep);
+                        state.episode_list.sort_unstable();
+                    }
+                    state.selected_episode = Some(ep);
+                    begin_playback_flow(state, pool, cfg, false, tx).await;
+                } else {
+                    open_detail_from_anime(state, entry.anime().clone(), pool, tx).await;
+                    state.show_toast(
+                        format!(
+                            "Episode {} airs {} at {} — showing series overview",
+                            ep, entry.day_label, entry.local_hhmm
+                        ),
+                        now,
+                    );
+                }
+            }
+        }
+        KeyCode::Char('+') => {
+            if let Some(entry) = focused_calendar_entry(state) {
+                let anime_id = entry.anime().id;
+                let now = unix_now();
+                let auth_token = state.auth.token.clone();
+                let user_id = state.auth.user_id;
+                let removed = if db::user::is_in_watchlist(pool, anime_id).await.unwrap_or(false) {
+                    let _ = db::user::remove_from_watchlist(pool, anime_id).await;
+                    if !home_data.continue_watching.iter().any(|a| a.id == anime_id) {
+                        state.calendar_tracked_ids.remove(&anime_id);
+                    }
+                    state.show_toast("Removed from watchlist", now);
+                    true
+                } else {
+                    let _ = db::cache::upsert_anime(pool, entry.anime()).await;
+                    let _ = db::user::add_to_watchlist(pool, anime_id, now).await;
+                    state.calendar_tracked_ids.insert(anime_id);
+                    state.show_toast("Added to watchlist", now);
+                    false
+                };
+                let pool2 = pool.clone();
+                let tx2 = tx.clone();
+                tokio::spawn(async move {
+                    if let Some(token) = auth_token {
+                        let client = api::anilist::AniListClient::with_token(Some(token));
+                        if removed {
+                            let _ = client.delete_media_list_entry(user_id, anime_id).await;
+                        } else {
+                            let _ = client.save_planning_entry(anime_id).await;
+                        }
+                    }
+                    let wl = services::sync::load_watchlist(&pool2).await.unwrap_or_default();
+                    let _ = tx2.send(AppMessage::WatchlistUpdated(wl)).await;
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
 // ── Playback screen ───────────────────────────────────────────────────────────
 
 async fn handle_playback(
@@ -3582,46 +4073,33 @@ fn trigger_generate_tailored(
     let pool2 = pool.clone();
     let tx2 = tx.clone();
     let answers = state.tailored_answers.clone();
-    let refinement = state.tailored_refinement.clone();
     tokio::spawn(async move {
         let client = api::anilist::AniListClient::new();
         let now = unix_now();
-        let matches = services::tailored::generate_tailored_matches_advanced(
+        let matches = services::tailored::generate_tailored_pool_advanced(
             &pool2,
             &client,
             &answers,
-            refinement.as_ref(),
+            None,
             now,
         ).await;
         let _ = tx2.send(AppMessage::TailoredResultsReady(matches)).await;
     });
 }
 
-fn finalize_refinement_and_generate(
-    state: &mut AppState,
-    pool: &sqlx::SqlitePool,
-    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+fn trigger_tuner_peers(
+    anchor_id: i64,
+    pool: sqlx::SqlitePool,
+    tx: tokio::sync::mpsc::Sender<AppMessage>,
 ) {
-    let refinement = services::tailored::TailoredRefinement {
-        trope_selections: state.refine_selections[0].clone(),
-        pacing_selections: state.refine_selections[1].clone(),
-        visual_selections: state.refine_selections[2].clone(),
-        aftertaste_selections: state.refine_selections[3].clone(),
-        rarity_selections: state.refine_selections[4].clone(),
-        anchor_anime_id: state.refine_anchor_selected.as_ref().map(|a| a.id),
-        anchor_title: state.refine_anchor_selected.as_ref().map(|a| a.display_title().to_string()),
-    };
-    state.tailored_refinement = Some(refinement);
-    state.close_tailored_refine();
-    trigger_generate_tailored(state, pool, tx);
-}
-
-fn trigger_anchor_search(query: String, tx: tokio::sync::mpsc::Sender<AppMessage>) {
     tokio::spawn(async move {
         let client = api::anilist::AniListClient::new();
         let now = unix_now();
-        let results = client.search(&query, now).await.unwrap_or_default();
-        let _ = tx.send(AppMessage::AnchorSearchResultsReady(results)).await;
+        let peers = client.fetch_peer_recommendations(anchor_id, now).await.unwrap_or_default();
+        for p in &peers {
+            let _ = db::cache::upsert_anime(&pool, p).await;
+        }
+        let _ = tx.send(AppMessage::TunerPeersReady(anchor_id, peers)).await;
     });
 }
 
@@ -3632,105 +4110,67 @@ async fn handle_tailored_results(
     cfg: &config::Config,
     tx: &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
-    if state.is_refining_tailored {
-        let refine_questions = services::tailored::get_refinement_questions(state.tailored_answers.choices[0]);
-        let step = state.tailored_refine_step.min(5);
-
-        if step < 5 {
-            let q = &refine_questions[step];
-
-            match key.code {
-                KeyCode::Esc => {
-                    state.close_tailored_refine();
-                }
-                KeyCode::Char('b') => {
-                    if state.tailored_refine_step > 0 {
-                        state.tailored_refine_step -= 1;
-                        state.tailored_refine_cursor = 0;
-                    }
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    state.tailored_refine_cursor = state.tailored_refine_cursor.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if state.tailored_refine_cursor + 1 < q.options.len() {
-                        state.tailored_refine_cursor += 1;
-                    }
-                }
-                KeyCode::Char(' ') => {
-                    let cursor = state.tailored_refine_cursor;
-                    let set = &mut state.refine_selections[step];
-                    if set.contains(&cursor) {
-                        set.remove(&cursor);
-                    } else {
-                        set.insert(cursor);
-                    }
-                }
-                KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                    let idx = (c as usize) - ('1' as usize);
-                    if idx < q.options.len() {
-                        let set = &mut state.refine_selections[step];
-                        if set.contains(&idx) {
-                            set.remove(&idx);
-                        } else {
-                            set.insert(idx);
-                        }
-                    }
-                }
-                KeyCode::Enter => {
-                    // Advance to next Crucible step
-                    state.tailored_refine_step += 1;
-                    state.tailored_refine_cursor = 0;
-                }
-                _ => {}
+    if state.tuner_open {
+        let tag_count = state.tuner_available_tags.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('f') | KeyCode::Char('F') => {
+                state.tuner_open = false;
             }
-        } else {
-            // Step 6 (index 5): Keystone Anchor Anime Search
-            match key.code {
-                KeyCode::Esc => {
-                    state.close_tailored_refine();
-                }
-                KeyCode::Char('b') if state.refine_anchor_query.is_empty() => {
-                    state.tailored_refine_step = 4;
-                    state.tailored_refine_cursor = 0;
-                }
-                KeyCode::Backspace => {
-                    state.refine_anchor_query.pop();
-                    if !state.refine_anchor_query.trim().is_empty() {
-                        state.is_searching_anchor = true;
-                        trigger_anchor_search(state.refine_anchor_query.clone(), tx.clone());
-                    } else {
-                        state.refine_anchor_results.clear();
-                        state.refine_anchor_selected = None;
-                        state.is_searching_anchor = false;
-                    }
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if !state.refine_anchor_results.is_empty() {
-                        state.refine_anchor_cursor = state.refine_anchor_cursor.saturating_sub(1);
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if !state.refine_anchor_results.is_empty() && state.refine_anchor_cursor + 1 < state.refine_anchor_results.len() {
-                        state.refine_anchor_cursor += 1;
-                    }
-                }
-                KeyCode::Char('s') if state.refine_anchor_query.is_empty() => {
-                    finalize_refinement_and_generate(state, pool, tx);
-                }
-                KeyCode::Enter => {
-                    if let Some(chosen) = state.refine_anchor_results.get(state.refine_anchor_cursor).cloned() {
-                        state.refine_anchor_selected = Some(chosen);
-                    }
-                    finalize_refinement_and_generate(state, pool, tx);
-                }
-                KeyCode::Char(c) => {
-                    state.refine_anchor_query.push(c);
-                    state.is_searching_anchor = true;
-                    trigger_anchor_search(state.refine_anchor_query.clone(), tx.clone());
-                }
-                _ => {}
+            KeyCode::Left | KeyCode::Char('h') => {
+                state.tuner_col = state.tuner_col.saturating_sub(1);
             }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let max_col = if state.tuner_row == 0 {
+                    6
+                } else {
+                    tag_count.saturating_sub(1)
+                };
+                if state.tuner_col < max_col {
+                    state.tuner_col += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.tuner_row = 0;
+                state.tuner_col = state.tuner_col.min(6);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if tag_count > 0 {
+                    state.tuner_row = 1;
+                    state.tuner_col = state.tuner_col.min(tag_count - 1);
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                if state.tuner_row == 0 {
+                    match state.tuner_col {
+                        0..=3 => state.tuner_config.discovery_tier = state.tuner_col,
+                        4 => state.tuner_config.hide_sequels = !state.tuner_config.hide_sequels,
+                        5 => state.tuner_config.finished_only = !state.tuner_config.finished_only,
+                        _ => state.tuner_config.reset(),
+                    }
+                } else if let Some(tag) = state.tuner_available_tags.get(state.tuner_col).cloned() {
+                    if state.tuner_config.boosted_tags.contains(&tag) {
+                        state.tuner_config.boosted_tags.remove(&tag);
+                        state.tuner_config.muted_tags.insert(tag);
+                    } else if state.tuner_config.muted_tags.contains(&tag) {
+                        state.tuner_config.muted_tags.remove(&tag);
+                    } else {
+                        state.tuner_config.boosted_tags.insert(tag);
+                    }
+                }
+                state.recompute_tailored_results();
+                if let Some(focused) = state.tailored_results.get(state.tailored_results_cursor) {
+                    if !state.cover_cache.contains_key(&focused.anime.id) && !state.loading_covers.contains(&focused.anime.id) {
+                        state.loading_covers.insert(focused.anime.id);
+                        trigger_cover_download(focused.anime.clone(), pool.clone(), tx.clone());
+                    }
+                }
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                state.tuner_config.reset();
+                state.recompute_tailored_results();
+                state.show_toast("Live Vibe Tuner reset", unix_now());
+            }
+            _ => {}
         }
         return;
     }
@@ -3740,7 +4180,60 @@ async fn handle_tailored_results(
             state.screen = Screen::Home;
         }
         KeyCode::Char('f') | KeyCode::Char('F') => {
-            state.open_tailored_refine();
+            state.toggle_live_tuner();
+        }
+        KeyCode::Char('c') | KeyCode::Char('C') => {
+            if state.tuner_config.has_active_modifiers() {
+                state.tuner_config.reset();
+                state.recompute_tailored_results();
+                state.show_toast("Live Vibe Tuner reset", unix_now());
+            }
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            if let Some(focused) = state.tailored_results.get(state.tailored_results_cursor).cloned() {
+                let already_anchored = state
+                    .tuner_config
+                    .anchor_anime
+                    .as_ref()
+                    .is_some_and(|(id, _, _)| *id == focused.anime.id);
+                if already_anchored {
+                    state.tuner_config.anchor_anime = None;
+                    state.tuner_config.anchor_peer_ids.clear();
+                    state.recompute_tailored_results();
+                    state.show_toast("Cleared 'More Like This' similarity lock", unix_now());
+                } else {
+                    let title = focused.anime.display_title().to_string();
+                    let genres = focused.anime.genre_list();
+                    let anchor_id = focused.anime.id;
+                    state.tuner_config.anchor_anime = Some((anchor_id, title.clone(), genres));
+                    state.tuner_config.anchor_peer_ids.clear();
+                    state.recompute_tailored_results();
+                    state.tailored_results_cursor = 0;
+                    if let Some(top) = state.tailored_results.first() {
+                        state.cover_anime_id = Some(top.anime.id);
+                        if !state.cover_cache.contains_key(&top.anime.id) && !state.loading_covers.contains(&top.anime.id) {
+                            state.loading_covers.insert(top.anime.id);
+                            trigger_cover_download(top.anime.clone(), pool.clone(), tx.clone());
+                        }
+                    }
+                    state.show_toast(format!("Finding shows similar to {}...", title), unix_now());
+                    trigger_tuner_peers(anchor_id, pool.clone(), tx.clone());
+                }
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Char('X') => {
+            if let Some(focused) = state.tailored_results.get(state.tailored_results_cursor).cloned() {
+                let title = focused.anime.short_title();
+                state.tuner_config.dismissed_ids.insert(focused.anime.id);
+                state.recompute_tailored_results();
+                if let Some(next_focused) = state.tailored_results.get(state.tailored_results_cursor) {
+                    if !state.cover_cache.contains_key(&next_focused.anime.id) && !state.loading_covers.contains(&next_focused.anime.id) {
+                        state.loading_covers.insert(next_focused.anime.id);
+                        trigger_cover_download(next_focused.anime.clone(), pool.clone(), tx.clone());
+                    }
+                }
+                state.show_toast(format!("Hidden '{}' · Next best match surfaced", title), unix_now());
+            }
         }
         KeyCode::Char('r') => {
             state.screen = Screen::TailoredSummary;

@@ -1,3 +1,4 @@
+pub mod calendar;
 pub mod cast;
 pub mod downloader;
 pub mod importer;

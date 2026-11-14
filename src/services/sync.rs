@@ -258,6 +258,7 @@ fn score_candidates(
 }
 
 /// Build a lightweight "Because You Watched" row from recent watch behavior.
+#[cfg(test)]
 fn build_recommendations(
     continue_watching: &[cache::Anime],
     watchlist:         &[cache::Anime],
@@ -388,14 +389,6 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
     let continue_watching = continue_watching.unwrap_or_default();
     let watchlist         = watchlist.unwrap_or_default();
     let featured          = trending.first().cloned();
-    let (recommended, recommended_reasons) = build_recommendations(
-        &continue_watching,
-        &watchlist,
-        &trending,
-        &popular,
-        &top_rated,
-        &seasonal,
-    );
     let resume_next: HashMap<i64, u32> = continue_entries
         .into_iter()
         .map(|entry| {
@@ -417,7 +410,6 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
     for row in [
         &continue_watching,
         &watchlist,
-        &recommended,
         &trending,
         &popular,
         &top_rated,
@@ -444,7 +436,6 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
         &[
             &continue_watching,
             &watchlist,
-            &recommended,
             &trending,
             &popular,
             &top_rated,
@@ -459,8 +450,6 @@ pub async fn load_cached_home_data(pool: &SqlitePool) -> Result<HomeData> {
         featured,
         continue_watching,
         watchlist,
-        recommended,
-        recommended_reasons,
         progress_labels,
         resume_next,
         trending,

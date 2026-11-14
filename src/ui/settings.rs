@@ -31,6 +31,7 @@ pub enum HubActionId {
     AutoUpdateMode,
     HealthDoctor,
     AniListSync,
+    OpenCalendar,
 }
 
 /// The interaction type of each hub action.
@@ -222,6 +223,15 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
             badge: if state.auth.token.is_some() { "[󰄬] Connected".to_string() } else { "[ ] Offline".to_string() },
             description: "Synchronizes Watching, Completed, and Planning lists with AniList and manages offline JSON backups.",
             kind: HubActionKind::Launch("AniListLogin"),
+        },
+        HubItem {
+            id: HubActionId::OpenCalendar,
+            category: "❖ DISCOVERY & SCHEDULE",
+            label: "Seasonal & Movie Calendar",
+            keywords: "calendar schedule airing episodes releases week movies upcoming prev",
+            badge: "[ Shortcut: c ]".to_string(),
+            description: "Browse seasonal anime episodes and movie releases day-by-day across previous, current, and upcoming weeks.",
+            kind: HubActionKind::Launch("Calendar"),
         },
     ]
 }

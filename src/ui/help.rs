@@ -10,7 +10,7 @@ use ratatui::{
 
 /// Render the help overlay centered on screen.
 pub fn render_overlay(frame: &mut Frame) {
-    let area = centered_rect(55, 70, frame.area());
+    let area = centered_rect(58, 76, frame.area());
     frame.render_widget(Clear, area);
 
     let keybindings = vec![
@@ -27,6 +27,7 @@ pub fn render_overlay(frame: &mut Frame) {
             ("u",          "Jump 4 eps up (Detail) / Toggle Anime4K (Options)"),
             ("r",          "Quick resume from Home / Recalculate metrics"),
             ("a",          "Anime Wrapped & Taste Analytics Dashboard (Home)"),
+            ("c",          "Seasonal Anime & Movie Release Calendar (Home)"),
             ("L",          "AniList Account Login / Cloud Library Sync (Home)"),
             ("w",          "Tailored Recommendation Wizard (Home) / Watched (Detail)"),
             ("D",          "Batch Offline Downloader Modal (Detail)"),

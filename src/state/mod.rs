@@ -43,6 +43,8 @@ pub enum Screen {
     CastDeck,
     /// In-app self-updater modal dialog
     UpdateModal,
+    /// Seasonal Anime & Movie Release Calendar popup (`[c]`)
+    Calendar,
 }
 
 /// Phases of the in-app self-updater modal dialog.
@@ -68,11 +70,10 @@ pub enum UpdateModalPhase {
 }
 
 /// Which category row the cursor is on (Home screen).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CategoryRow {
     ContinueWatching,
     Watchlist,
-    Recommended,
     Trending,
     Popular,
     TopRated,
@@ -362,8 +363,11 @@ pub struct AppState {
     /// If editing a single question from the dashboard, which question is being modified
     pub tailored_editing_step: Option<usize>,
 
-    /// Results returned by the tailored recommendation engine
+    /// Visible filtered/sorted top 30 tailored recommendations
     pub tailored_results: Vec<crate::services::tailored::TailoredMatch>,
+
+    /// Full scored candidate pool (up to 120 items) for instant zero-latency live tuning
+    pub tailored_pool: Vec<crate::services::tailored::TailoredMatch>,
 
     /// Active cursor on the TailoredResults screen
     pub tailored_results_cursor: usize,
@@ -371,35 +375,20 @@ pub struct AppState {
     /// Whether tailored recommendations are currently being fetched/calculated
     pub is_generating_tailored: bool,
 
-    /// Answers to the 6 follow-up refinement questions
-    pub tailored_refinement: Option<crate::services::tailored::TailoredRefinement>,
+    /// Whether the Live Vibe Tuner dock is expanded above results (`[f]`)
+    pub tuner_open: bool,
 
-    /// Whether refinement questionnaire modal is open over results
-    pub is_refining_tailored: bool,
+    /// Focused row inside the Live Vibe Tuner (`0` = Discovery & Scope, `1` = Dynamic Tag Chips)
+    pub tuner_row: usize,
 
-    /// Refinement questionnaire step (0..=5: 0-4 are multi-select, 5 is Keystone Anchor)
-    pub tailored_refine_step: usize,
+    /// Focused pill column inside the active Live Vibe Tuner row
+    pub tuner_col: usize,
 
-    /// Refinement cursor within current question
-    pub tailored_refine_cursor: usize,
+    /// Live Vibe Tuner active filters, boosts, exclusions, and `[m]` similarity anchor
+    pub tuner_config: crate::services::tailored::LiveTunerConfig,
 
-    /// Multi-select checkboxes for refinement steps 0..=4
-    pub refine_selections: [HashSet<usize>; 5],
-
-    /// Search input query for Step 6 Keystone Anchor Anime
-    pub refine_anchor_query: String,
-
-    /// Live candidate anime search results for Step 6 Keystone Anchor
-    pub refine_anchor_results: Vec<crate::db::cache::Anime>,
-
-    /// Cursor for selecting among Keystone Anchor candidates
-    pub refine_anchor_cursor: usize,
-
-    /// Selected Keystone Anchor Anime
-    pub refine_anchor_selected: Option<crate::db::cache::Anime>,
-
-    /// Whether an anchor anime search is currently in-flight
-    pub is_searching_anchor: bool,
+    /// Top genres/tags extracted from the current candidate pool for one-key boost/hide chips
+    pub tuner_available_tags: Vec<String>,
 
     /// Live playback second and duration progress per episode for the inspected anime
     pub anime_progress: HashMap<u32, (f64, f64)>,
@@ -471,6 +460,18 @@ pub struct AppState {
     pub playback_gen: u64,
 
     pub last_play_options: Option<crate::api::player::PlayOptions>,
+
+    /// Release Calendar (`[c]`) state
+    pub calendar_week_offset: i32,
+    pub calendar_day_idx: usize,
+    pub calendar_cursor: usize,
+    pub calendar_filter: crate::services::calendar::CalendarFilter,
+    pub calendar_cache: HashMap<i32, Vec<crate::api::anilist::CalendarRelease>>,
+    pub calendar_tracked_ids: HashSet<i64>,
+    pub calendar_watched_map: HashMap<i64, HashSet<u32>>,
+    pub calendar_tz_offset_secs: i64,
+    pub calendar_today_unix: i64,
+    pub is_loading_calendar: bool,
 }
 
 impl AppState {
@@ -566,24 +567,14 @@ impl AppState {
             tailored_summary_cursor: 0,
             tailored_editing_step: None,
             tailored_results: Vec::new(),
+            tailored_pool:    Vec::new(),
             tailored_results_cursor: 0,
             is_generating_tailored: false,
-            tailored_refinement: None,
-            is_refining_tailored: false,
-            tailored_refine_step: 0,
-            tailored_refine_cursor: 0,
-            refine_selections: [
-                HashSet::new(),
-                HashSet::new(),
-                HashSet::new(),
-                HashSet::new(),
-                HashSet::new(),
-            ],
-            refine_anchor_query: String::new(),
-            refine_anchor_results: Vec::new(),
-            refine_anchor_cursor: 0,
-            refine_anchor_selected: None,
-            is_searching_anchor: false,
+            tuner_open:       false,
+            tuner_row:        0,
+            tuner_col:        0,
+            tuner_config:     crate::services::tailored::LiveTunerConfig::default(),
+            tuner_available_tags: Vec::new(),
             anime_progress:   HashMap::new(),
             anime_fillers:    HashMap::new(),
             offline_episodes: HashMap::new(),
@@ -613,6 +604,16 @@ impl AppState {
             update_modal_phase: None,
             playback_gen: 0,
             last_play_options: None,
+            calendar_week_offset: 0,
+            calendar_day_idx: 0,
+            calendar_cursor: 0,
+            calendar_filter: crate::services::calendar::CalendarFilter::All,
+            calendar_cache: HashMap::new(),
+            calendar_tracked_ids: HashSet::new(),
+            calendar_watched_map: HashMap::new(),
+            calendar_tz_offset_secs: 0,
+            calendar_today_unix: 0,
+            is_loading_calendar: false,
         }
     }
 
@@ -690,7 +691,7 @@ impl AppState {
                     Screen::Home
                 }
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal => {
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal | Screen::Calendar => {
                 if self.overlay_base == self.screen {
                     Screen::Home
                 } else {
@@ -827,40 +828,56 @@ impl AppState {
         self.screen = Screen::TailoredSummary;
     }
 
-    /// Open the Tailored Algorithm results shelf with recommendations.
-    pub fn open_tailored_results(&mut self, results: Vec<crate::services::tailored::TailoredMatch>) {
-        self.tailored_results = results;
+    /// Open the Tailored Algorithm results shelf with the scored candidate pool and live top-30 view.
+    pub fn open_tailored_results(&mut self, pool: Vec<crate::services::tailored::TailoredMatch>) {
+        self.tuner_available_tags = crate::services::tailored::extract_tuner_tags(&pool, &self.tailored_answers);
+        self.tailored_pool = pool;
+        self.tuner_config.reset();
+        self.tuner_open = false;
+        self.tuner_row = 0;
+        self.tuner_col = 0;
+        self.recompute_tailored_results();
         self.tailored_results_cursor = 0;
         self.is_generating_tailored = false;
-        self.is_refining_tailored = false;
         self.screen = Screen::TailoredResults;
     }
 
-    /// Open the 6-question Crucible adaptive refinement overlay over results shelf.
-    pub fn open_tailored_refine(&mut self) {
-        self.is_refining_tailored = true;
-        self.tailored_refine_step = 0;
-        self.tailored_refine_cursor = 0;
-        self.refine_selections = [
-            HashSet::new(),
-            HashSet::new(),
-            HashSet::new(),
-            HashSet::new(),
-            HashSet::new(),
-        ];
-        self.refine_anchor_query.clear();
-        self.refine_anchor_results.clear();
-        self.refine_anchor_cursor = 0;
-        self.refine_anchor_selected = None;
-        self.is_searching_anchor = false;
+    /// Re-filter and re-rank `tailored_results` (up to 30 matches) instantly from `tailored_pool` + `tuner_config`.
+    pub fn recompute_tailored_results(&mut self) {
+        self.tailored_results = crate::services::tailored::apply_live_tuner(
+            &self.tailored_pool,
+            &self.tailored_answers,
+            &self.tuner_config,
+        );
+        if self.tailored_results.is_empty() {
+            self.tailored_results_cursor = 0;
+            self.cover_anime_id = None;
+        } else if self.tailored_results_cursor >= self.tailored_results.len() {
+            self.tailored_results_cursor = self.tailored_results.len() - 1;
+        }
+        if let Some(focused) = self.tailored_results.get(self.tailored_results_cursor) {
+            self.cover_anime_id = Some(focused.anime.id);
+        }
     }
 
-    /// Close the adaptive refinement overlay.
-    pub fn close_tailored_refine(&mut self) {
-        self.is_refining_tailored = false;
-        self.tailored_refine_step = 0;
-        self.tailored_refine_cursor = 0;
-        self.is_searching_anchor = false;
+    /// Toggle the compact Live Vibe Tuner bar above the recommendations shelf (`[f]`).
+    pub fn toggle_live_tuner(&mut self) {
+        self.tuner_open = !self.tuner_open;
+        self.tuner_row = 0;
+        self.tuner_col = 0;
+    }
+
+    /// Open the Seasonal & Movie Release Calendar popup (`[c]`), snapping to Today's day on first open.
+    pub fn open_calendar(&mut self, tz_offset_secs: i64, now_unix: i64) {
+        if self.screen != Screen::Calendar {
+            self.overlay_base = self.current_base_screen();
+            self.calendar_tz_offset_secs = tz_offset_secs;
+            self.calendar_today_unix = now_unix;
+            self.calendar_week_offset = 0;
+            self.calendar_day_idx = crate::services::calendar::today_weekday_idx(now_unix, tz_offset_secs);
+            self.calendar_cursor = 0;
+            self.screen = Screen::Calendar;
+        }
     }
 
     /// Open the playback query picker for the current anime.
@@ -1034,7 +1051,7 @@ impl AppState {
             Screen::Detail | Screen::Playback | Screen::PlaybackQuery | Screen::PlaybackOptions => {
                 Screen::Detail
             }
-            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal => self.overlay_base.clone(),
+            Screen::Search | Screen::Help | Screen::Settings | Screen::Setup | Screen::AniListLogin | Screen::TailoredWizard | Screen::TailoredSummary | Screen::TailoredResults | Screen::TasteAnalytics | Screen::RemoteModal | Screen::CastModal | Screen::UpdateModal | Screen::Calendar => self.overlay_base.clone(),
             Screen::CastDeck => Screen::Detail,
             Screen::Home => Screen::Home,
         }

@@ -144,6 +144,64 @@ pub struct RawTag {
     pub is_media_spoiler: Option<bool>,
 }
 
+/// Canonical release entry for the Seasonal Anime & Movie Release Calendar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalendarRelease {
+    pub schedule_id: i64,
+    pub airing_at: i64,
+    pub episode: u32,
+    pub is_movie_premiere: bool,
+    pub anime: Anime,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RawFuzzyDate {
+    year: Option<i64>,
+    month: Option<i64>,
+    day: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeeklyScheduleResponse {
+    data: WeeklyScheduleData,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeeklyScheduleData {
+    p1: Option<SchedulePagePayload>,
+    p2: Option<SchedulePagePayload>,
+    p3: Option<SchedulePagePayload>,
+    movies: Option<MoviePagePayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SchedulePagePayload {
+    #[serde(rename = "pageInfo")]
+    page_info: Option<PageInfoPayload>,
+    #[serde(rename = "airingSchedules")]
+    airing_schedules: Vec<RawAiringSchedule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PageInfoPayload {
+    #[serde(rename = "hasNextPage")]
+    has_next_page: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawAiringSchedule {
+    id: i64,
+    airing_at: i64,
+    episode: i64,
+    media: Option<RawAnime>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MoviePagePayload {
+    media: Vec<RawAnime>,
+}
+
 /// Raw anime as returned by AniList — mapped to our `Anime` model.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,6 +220,10 @@ struct RawAnime {
     tags:          Option<Vec<RawTag>>,
     cover_image:   Option<RawCoverImage>,
     next_airing_episode: Option<RawNextAiringEpisode>,
+    #[serde(default)]
+    is_adult:      Option<bool>,
+    #[serde(default)]
+    start_date:    Option<RawFuzzyDate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -584,7 +646,7 @@ impl AniListClient {
                 $maxPop: Int,
                 $excludedIds: [Int]
             ) {{
-                Page(page: 1, perPage: 40) {{
+                Page(page: 1, perPage: 50) {{
                     media(
                         genre_in: $genresIn,
                         genre_not_in: $genresNotIn,
@@ -668,6 +730,203 @@ impl AniListClient {
             }
         }
         Ok(results)
+    }
+
+    /// Fetch an entire 7-day Monday..=Sunday schedule (seasonal episodes + theatrical/OVA/special movies).
+    pub async fn fetch_weekly_schedule(
+        &self,
+        week_start_unix: i64,
+        week_end_unix: i64,
+        query_prev_ymd: i64,
+        query_next_ymd: i64,
+        tz_offset_secs: i64,
+        now: i64,
+    ) -> Result<Vec<CalendarRelease>> {
+        let query = format!(
+            r#"query(
+                $start: Int,
+                $end: Int,
+                $ymdStart: FuzzyDateInt,
+                $ymdEnd: FuzzyDateInt
+            ) {{
+                p1: Page(page: 1, perPage: 50) {{
+                    airingSchedules(airingAt_greater: $start, airingAt_lesser: $end, sort: [TIME, ID]) {{
+                        id
+                        airingAt
+                        episode
+                        media {{
+                            isAdult
+                            {}
+                        }}
+                    }}
+                }}
+                p2: Page(page: 2, perPage: 50) {{
+                    airingSchedules(airingAt_greater: $start, airingAt_lesser: $end, sort: [TIME, ID]) {{
+                        id
+                        airingAt
+                        episode
+                        media {{
+                            isAdult
+                            {}
+                        }}
+                    }}
+                }}
+                p3: Page(page: 3, perPage: 50) {{
+                    pageInfo {{ hasNextPage }}
+                    airingSchedules(airingAt_greater: $start, airingAt_lesser: $end, sort: [TIME, ID]) {{
+                        id
+                        airingAt
+                        episode
+                        media {{
+                            isAdult
+                            {}
+                        }}
+                    }}
+                }}
+                movies: Page(page: 1, perPage: 30) {{
+                    media(
+                        type: ANIME,
+                        format_in: [MOVIE, OVA, SPECIAL],
+                        startDate_greater: $ymdStart,
+                        startDate_lesser: $ymdEnd,
+                        isAdult: false,
+                        sort: [POPULARITY_DESC]
+                    ) {{
+                        isAdult
+                        startDate {{ year month day }}
+                        {}
+                    }}
+                }}
+            }}"#,
+            MEDIA_FIELDS, MEDIA_FIELDS, MEDIA_FIELDS, MEDIA_FIELDS
+        );
+
+        let vars = serde_json::json!({
+            "start": week_start_unix.saturating_sub(1),
+            "end": week_end_unix.saturating_add(1),
+            "ymdStart": query_prev_ymd,
+            "ymdEnd": query_next_ymd,
+        });
+
+        let raw = self.gql(&query, vars).await?;
+        let parsed: WeeklyScheduleResponse = serde_json::from_value(raw)
+            .map_err(|e| AppError::Parse(format!("AniList weekly schedule parse error: {e}")))?;
+
+        let mut releases = Vec::new();
+        let mut scheduled_media_ids = std::collections::HashSet::new();
+        let mut p3_has_more = false;
+
+        let mut ingest_schedule = |sched: RawAiringSchedule| {
+            let Some(media) = sched.media else {
+                return;
+            };
+            if media.is_adult.unwrap_or(false) {
+                return;
+            }
+            if matches!(media.format.as_deref(), Some("MANGA" | "NOVEL" | "ONE_SHOT" | "MUSIC")) {
+                return;
+            }
+            let anime = media.into_anime(now);
+            let genres = anime.genre_list();
+            if genres.iter().any(|g| g.eq_ignore_ascii_case("Hentai")) {
+                return;
+            }
+            scheduled_media_ids.insert(anime.id);
+            let is_movie = anime.format.as_deref() == Some("MOVIE");
+            releases.push(CalendarRelease {
+                schedule_id: sched.id,
+                airing_at: sched.airing_at,
+                episode: sched.episode.max(1) as u32,
+                is_movie_premiere: is_movie,
+                anime,
+            });
+        };
+
+        if let Some(p1) = parsed.data.p1 {
+            for s in p1.airing_schedules {
+                ingest_schedule(s);
+            }
+        }
+        if let Some(p2) = parsed.data.p2 {
+            for s in p2.airing_schedules {
+                ingest_schedule(s);
+            }
+        }
+        if let Some(p3) = parsed.data.p3 {
+            p3_has_more = p3.page_info.and_then(|pi| pi.has_next_page).unwrap_or(false);
+            for s in p3.airing_schedules {
+                ingest_schedule(s);
+            }
+        }
+
+        // Peak premiere weeks (e.g. Week 1 of Spring/Fall) can exceed 150 episodes; fetch page 4 if needed
+        if p3_has_more {
+            let p4_query = format!(
+                r#"query($start: Int, $end: Int) {{
+                    Page(page: 4, perPage: 50) {{
+                        airingSchedules(airingAt_greater: $start, airingAt_lesser: $end, sort: [TIME, ID]) {{
+                            id
+                            airingAt
+                            episode
+                            media {{
+                                isAdult
+                                {}
+                            }}
+                        }}
+                    }}
+                }}"#,
+                MEDIA_FIELDS
+            );
+            let p4_vars = serde_json::json!({
+                "start": week_start_unix.saturating_sub(1),
+                "end": week_end_unix.saturating_add(1),
+            });
+            if let Ok(p4_raw) = self.gql(&p4_query, p4_vars).await {
+                if let Ok(p4_parsed) = serde_json::from_value::<serde_json::Value>(p4_raw) {
+                    if let Some(arr) = p4_parsed["data"]["Page"]["airingSchedules"].as_array() {
+                        for v in arr {
+                            if let Ok(s) = serde_json::from_value::<RawAiringSchedule>(v.clone()) {
+                                ingest_schedule(s);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Merge Movies/OVAs/Specials releasing by premiere startDate during this week
+        if let Some(movies) = parsed.data.movies {
+            for media in movies.media {
+                if media.is_adult.unwrap_or(false) || scheduled_media_ids.contains(&media.id) {
+                    continue;
+                }
+                let Some(ref sd) = media.start_date else {
+                    continue;
+                };
+                let (Some(y), Some(m), Some(d)) = (sd.year, sd.month, sd.day) else {
+                    continue;
+                };
+                if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+                    continue;
+                }
+                let days = crate::services::calendar::days_from_civil(y, m as u32, d as u32);
+                let premiere_unix = days * 86400 + 12 * 3600 - tz_offset_secs;
+                let anime = media.into_anime(now);
+                let genres = anime.genre_list();
+                if genres.iter().any(|g| g.eq_ignore_ascii_case("Hentai")) {
+                    continue;
+                }
+                releases.push(CalendarRelease {
+                    schedule_id: -anime.id,
+                    airing_at: premiere_unix,
+                    episode: 1,
+                    is_movie_premiere: true,
+                    anime,
+                });
+            }
+        }
+
+        Ok(releases)
     }
 
     /// Internal: POST query → parse Page response → convert to Vec<Anime>.
@@ -837,6 +1096,8 @@ mod tests {
                 large: Some("https://example.com/cover.jpg".to_string()),
             }),
             next_airing_episode: None,
+            is_adult:      None,
+            start_date:    None,
         }
     }
 
@@ -901,6 +1162,8 @@ mod tests {
             tags:          None,
             cover_image:   None,
             next_airing_episode: None,
+            is_adult:      None,
+            start_date:    None,
         };
         let anime = raw.into_anime(0);
         assert_eq!(anime.title_romaji, "Unknown");

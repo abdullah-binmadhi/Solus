@@ -6,8 +6,12 @@
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols::Marker,
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{
+        canvas::{Canvas, Line as CanvasLine, Points},
+        Block, BorderType, Borders, Clear, Paragraph,
+    },
     Frame,
 };
 
@@ -61,122 +65,233 @@ fn render_gauge_bar(value: u8, width: usize, fill_color: Color) -> Line<'static>
     ])
 }
 
-/// Helper to render the 2D Astral Star Constellation Radar & Aetheric Polarity meter.
-fn render_celestial_radar(persona: &Persona) -> Vec<Line<'static>> {
+/// Render a mathematically symmetrical 5-axis Pentagon Radar Chart using Braille subpixels.
+fn render_pentagon_radar(frame: &mut Frame, area: Rect, persona: &Persona) {
+    if area.width < 28 || area.height < 7 {
+        return;
+    }
+
     let int_val = persona.gauges[0].1;
     let lore_val = persona.gauges[1].1;
     let emo_val = persona.gauges[2].1;
     let combat_val = persona.gauges[3].1;
     let dark_val = persona.gauges[4].1;
 
-    let node_glyph = |v: u8| -> &'static str {
-        if v >= 85 { "❖" } else if v >= 60 { "✦" } else { "✧" }
-    };
-
     let p_color = persona.primary_color;
     let a_color = persona.accent_color;
-    let line_star = Style::default().fg(Color::Rgb(70, 70, 100));
+    let outer_grid_color = Color::Rgb(85, 90, 120);
+    let inner_grid_color = Color::Rgb(46, 50, 68);
+    let spoke_color = Color::Rgb(58, 62, 85);
 
-    let (umbral, astral, aspect, demographic) = calculate_polarity(persona);
+    // 1 horizontal Braille dot = 1 X-unit, 1 vertical Braille dot = 1 Y-unit (square pixels)
+    let x_half = area.width as f64;
+    let y_half = (area.height * 2) as f64;
+    let cx = 0.0f64;
+    let cy = -1.5f64;
+    let r = (y_half - 6.0).min(x_half - 24.0).max(6.0);
 
-    let umbral_chars = ((umbral as usize) * 12) / 100;
-    let astral_chars = 12 - umbral_chars;
-    let umbral_bar = "█".repeat(umbral_chars);
-    let astral_bar = "░".repeat(astral_chars);
-
-    let ((fire_val, fire_desc), (wind_val, wind_desc), (earth_val, earth_desc), dominant) = get_primal_elements(persona);
-    let mut fire_line = vec![
-        Span::styled(format!("   ✦ {:<32}", fire_desc), Style::default().fg(Color::Rgb(190, 190, 210))),
+    // 5 regular pentagon vertices starting at 90° (Top) clockwise:
+    // 0: Top (Intellect), 1: Top-Right (Combat), 2: Bottom-Right (Darkness),
+    // 3: Bottom-Left (Emotion), 4: Top-Left (Lore)
+    let angles: [f64; 5] = [
+        90.0f64.to_radians(),
+        18.0f64.to_radians(),
+        (-54.0f64).to_radians(),
+        (-126.0f64).to_radians(),
+        162.0f64.to_radians(),
     ];
-    fire_line.extend(render_gauge_bar(fire_val, 10, Color::Rgb(255, 110, 50)).spans);
+    let values: [u8; 5] = [int_val, combat_val, dark_val, emo_val, lore_val];
 
-    let mut wind_line = vec![
-        Span::styled(format!("   ✦ {:<32}", wind_desc), Style::default().fg(Color::Rgb(190, 190, 210))),
+    let canvas = Canvas::default()
+        .marker(Marker::Braille)
+        .x_bounds([-x_half, x_half])
+        .y_bounds([-y_half, y_half])
+        .paint(move |ctx| {
+            let outer_pts: Vec<(f64, f64)> = angles
+                .iter()
+                .map(|a| (cx + r * a.cos(), cy + r * a.sin()))
+                .collect();
+            let mid_pts: Vec<(f64, f64)> = angles
+                .iter()
+                .map(|a| (cx + (r * 0.5) * a.cos(), cy + (r * 0.5) * a.sin()))
+                .collect();
+            let data_pts: Vec<(f64, f64)> = angles
+                .iter()
+                .zip(values.iter())
+                .map(|(a, &v)| {
+                    let s = 0.15 + 0.85 * (v as f64 / 100.0);
+                    (cx + r * s * a.cos(), cy + r * s * a.sin())
+                })
+                .collect();
+
+            // 1. Inner 50% pentagon ring
+            for i in 0..5 {
+                let (x1, y1) = mid_pts[i];
+                let (x2, y2) = mid_pts[(i + 1) % 5];
+                ctx.draw(&CanvasLine { x1, y1, x2, y2, color: inner_grid_color });
+            }
+
+            // 2. Radial spoke axes
+            for &(vx, vy) in &outer_pts {
+                ctx.draw(&CanvasLine { x1: cx, y1: cy, x2: vx, y2: vy, color: spoke_color });
+            }
+
+            // 3. Outer 100% pentagon frame
+            for i in 0..5 {
+                let (x1, y1) = outer_pts[i];
+                let (x2, y2) = outer_pts[(i + 1) % 5];
+                ctx.draw(&CanvasLine { x1, y1, x2, y2, color: outer_grid_color });
+            }
+
+            // 4. User Taste Polygon (glowing primary)
+            for i in 0..5 {
+                let (x1, y1) = data_pts[i];
+                let (x2, y2) = data_pts[(i + 1) % 5];
+                ctx.draw(&CanvasLine { x1, y1, x2, y2, color: p_color });
+            }
+
+            // 5. Crisp vertex anchor points
+            ctx.draw(&Points {
+                coords: &data_pts,
+                color: a_color,
+            });
+
+            // 6. Symmetrical axis labels around the 5 corners
+            let top_text = format!("INTELLECT {}%", int_val);
+            let top_half_w = top_text.chars().count() as f64;
+            ctx.print(
+                (cx - top_half_w).max(-x_half + 1.0),
+                (cy + r + 3.2).min(y_half - 1.5),
+                Line::from(vec![
+                    Span::styled("INTELLECT ", Style::default().fg(Color::Rgb(205, 208, 225)).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{}%", int_val), Style::default().fg(a_color).add_modifier(Modifier::BOLD)),
+                ]),
+            );
+
+            // Top-Right: COMBAT
+            ctx.print(
+                (outer_pts[1].0 + 3.0).min(x_half - 24.0),
+                outer_pts[1].1 + 0.5,
+                Line::from(vec![
+                    Span::styled(format!("{}% ", combat_val), Style::default().fg(a_color).add_modifier(Modifier::BOLD)),
+                    Span::styled("COMBAT", Style::default().fg(Color::Rgb(190, 194, 215))),
+                ]),
+            );
+
+            // Bottom-Right: DARKNESS
+            ctx.print(
+                (outer_pts[2].0 + 4.0).min(x_half - 28.0),
+                (outer_pts[2].1 - 1.2).max(-y_half + 1.5),
+                Line::from(vec![
+                    Span::styled(format!("{}% ", dark_val), Style::default().fg(a_color).add_modifier(Modifier::BOLD)),
+                    Span::styled("DARKNESS", Style::default().fg(Color::Rgb(190, 194, 215))),
+                ]),
+            );
+
+            // Bottom-Left: EMOTION (right-aligned to vertex)
+            let emo_str = format!("EMOTION {}%", emo_val);
+            let emo_units = emo_str.chars().count() as f64 * 2.0;
+            ctx.print(
+                (outer_pts[3].0 - 4.0 - emo_units).max(-x_half + 1.0),
+                (outer_pts[3].1 - 1.2).max(-y_half + 1.5),
+                Line::from(vec![
+                    Span::styled("EMOTION ", Style::default().fg(Color::Rgb(190, 194, 215))),
+                    Span::styled(format!("{}%", emo_val), Style::default().fg(a_color).add_modifier(Modifier::BOLD)),
+                ]),
+            );
+
+            // Top-Left: LORE (right-aligned to vertex)
+            let lore_str = format!("LORE {}%", lore_val);
+            let lore_units = lore_str.chars().count() as f64 * 2.0;
+            ctx.print(
+                (outer_pts[4].0 - 3.0 - lore_units).max(-x_half + 1.0),
+                outer_pts[4].1 + 0.5,
+                Line::from(vec![
+                    Span::styled("LORE ", Style::default().fg(Color::Rgb(190, 194, 215))),
+                    Span::styled(format!("{}%", lore_val), Style::default().fg(a_color).add_modifier(Modifier::BOLD)),
+                ]),
+            );
+        });
+
+    frame.render_widget(canvas, area);
+}
+
+/// Render the Bottom-Left Radar + Tone & Genre Affinities quadrant cleanly.
+fn render_radar_and_summary(frame: &mut Frame, area: Rect, persona: &Persona) {
+    let p_color = persona.primary_color;
+    let a_color = persona.accent_color;
+    let (analytical, energetic, tone_label, audience) = calculate_polarity(persona);
+
+    let anal_chars = ((analytical as usize) * 12) / 100;
+    let ener_chars = 12 - anal_chars;
+    let anal_bar = "█".repeat(anal_chars);
+    let ener_bar = "░".repeat(ener_chars);
+
+    let ((action_val, action_desc), (mystery_val, mystery_desc), (world_val, world_desc), dominant) =
+        get_primal_elements(persona);
+
+    let mut action_line = vec![
+        Span::styled(format!("   • {:<26}", action_desc), Style::default().fg(Color::Rgb(190, 190, 210))),
     ];
-    wind_line.extend(render_gauge_bar(wind_val, 10, Color::Rgb(125, 207, 255)).spans);
+    action_line.extend(render_gauge_bar(action_val, 10, Color::Rgb(255, 110, 50)).spans);
 
-    let mut earth_line = vec![
-        Span::styled(format!("   ✦ {:<32}", earth_desc), Style::default().fg(Color::Rgb(190, 190, 210))),
+    let mut mystery_line = vec![
+        Span::styled(format!("   • {:<26}", mystery_desc), Style::default().fg(Color::Rgb(190, 190, 210))),
     ];
-    earth_line.extend(render_gauge_bar(earth_val, 10, Color::Rgb(80, 250, 123)).spans);
+    mystery_line.extend(render_gauge_bar(mystery_val, 10, Color::Rgb(125, 207, 255)).spans);
 
-    let dom_line = vec![
-        Span::styled("   Dominant: ", Style::default().fg(Color::Rgb(140, 140, 160))),
-        Span::styled(dominant, Style::default().fg(p_color).add_modifier(Modifier::BOLD)),
+    let mut world_line = vec![
+        Span::styled(format!("   • {:<26}", world_desc), Style::default().fg(Color::Rgb(190, 190, 210))),
     ];
+    world_line.extend(render_gauge_bar(world_val, 10, Color::Rgb(80, 250, 123)).spans);
 
-    let vel_line = vec![
-        Span::styled("   Velocity: ", Style::default().fg(Color::Rgb(140, 140, 160))),
-        Span::styled("Measured 1-Cour Arc  ·  Spectrum: 80% Uplifting / 20% Bittersweet", Style::default().fg(Color::Rgb(200, 200, 220))),
-    ];
-
-    vec![
-        Line::from(Span::styled("   ── ✦ CELESTIAL ASTROLOGIAN RADAR ──", Style::default().fg(Color::Rgb(140, 140, 160)))),
-        Line::from(vec![
-            Span::styled("              [INTELLECT] ", Style::default().fg(Color::Rgb(200, 200, 225))),
-            Span::styled(format!("{}%", int_val), Style::default().fg(a_color).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled("                   ", Style::default()),
-            Span::styled(node_glyph(int_val), Style::default().fg(p_color).add_modifier(Modifier::BOLD)),
-        ]),
-        Line::from(vec![
-            Span::styled("                  / \\", line_star),
-        ]),
-        Line::from(vec![
-            Span::styled("                 /   \\", line_star),
-        ]),
-        Line::from(vec![
-            Span::styled("  [LORE] ", Style::default().fg(Color::Rgb(180, 180, 200))),
-            Span::styled(format!("{}% ", lore_val), Style::default().fg(a_color)),
-            Span::styled(node_glyph(lore_val), Style::default().fg(p_color).add_modifier(Modifier::BOLD)),
-            Span::styled(" ─────── ", line_star),
-            Span::styled(node_glyph(combat_val), Style::default().fg(p_color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" {}% ", combat_val), Style::default().fg(a_color)),
-            Span::styled("[COMBAT]", Style::default().fg(Color::Rgb(180, 180, 200))),
-        ]),
-        Line::from(vec![
-            Span::styled("                 \\   /", line_star),
-        ]),
-        Line::from(vec![
-            Span::styled("                  \\ /", line_star),
-        ]),
-        Line::from(vec![
-            Span::styled("   [EMO] ", Style::default().fg(Color::Rgb(180, 180, 200))),
-            Span::styled(format!("{}% ", emo_val), Style::default().fg(a_color)),
-            Span::styled(node_glyph(emo_val), Style::default().fg(p_color)),
-            Span::styled("          ", Style::default()),
-            Span::styled(node_glyph(dark_val), Style::default().fg(p_color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" {}% ", dark_val), Style::default().fg(a_color)),
-            Span::styled("[DARK]", Style::default().fg(Color::Rgb(180, 180, 200))),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("   ── AETHERIC BALANCE & SOUL ASPECT ──", Style::default().fg(Color::Rgb(140, 140, 160)))),
+    let summary_lines = vec![
+        Line::from(Span::styled("   ── TONE & PACING BALANCE ───────────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))),
         Line::from(vec![
             Span::styled("   [", Style::default().fg(Color::Rgb(90, 90, 120))),
-            Span::styled(umbral_bar, Style::default().fg(p_color)),
-            Span::styled(astral_bar, Style::default().fg(a_color)),
+            Span::styled(anal_bar, Style::default().fg(p_color)),
+            Span::styled(ener_bar, Style::default().fg(a_color)),
             Span::styled("] ", Style::default().fg(Color::Rgb(90, 90, 120))),
-            Span::styled(format!("{}% Umbral / {}% Astral", umbral, astral), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}% Analytical / {}% Action", analytical, energetic),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
-            Span::styled("   Aspect: ", Style::default().fg(Color::Rgb(140, 140, 160))),
-            Span::styled(aspect, Style::default().fg(p_color).add_modifier(Modifier::BOLD)),
+            Span::styled("   Tone: ", Style::default().fg(Color::Rgb(140, 140, 160))),
+            Span::styled(tone_label, Style::default().fg(p_color).add_modifier(Modifier::BOLD)),
+            Span::styled("  ·  Audience: ", Style::default().fg(Color::Rgb(140, 140, 160))),
+            Span::styled(audience, Style::default().fg(Color::Rgb(200, 200, 220))),
         ]),
+        Line::from(""),
+        Line::from(Span::styled("   ── CORE GENRE AFFINITIES ────────────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))),
+        Line::from(action_line),
+        Line::from(mystery_line),
+        Line::from(world_line),
         Line::from(vec![
-            Span::styled("   Affinity: ", Style::default().fg(Color::Rgb(140, 140, 160))),
-            Span::styled(demographic, Style::default().fg(Color::Rgb(200, 200, 220))),
+            Span::styled("   Primary Focus: ", Style::default().fg(Color::Rgb(140, 140, 160))),
+            Span::styled(dominant, Style::default().fg(p_color).add_modifier(Modifier::BOLD)),
         ]),
-        Line::from(""),
-        Line::from(Span::styled("   ── PRIMAL ELEMENTAL ATTUNEMENT ──", Style::default().fg(Color::Rgb(140, 140, 160)))),
-        Line::from(fire_line),
-        Line::from(wind_line),
-        Line::from(earth_line),
-        Line::from(dom_line),
-        Line::from(""),
-        Line::from(Span::styled("   ── NARRATIVE VELOCITY & DISPERSION ──", Style::default().fg(Color::Rgb(140, 140, 160)))),
-        Line::from(vel_line),
-    ]
+    ];
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Header
+            Constraint::Min(9),    // Symmetrical Pentagon Radar
+            Constraint::Length(9), // Direct stats summary
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "   ── TASTE RADAR (5-AXIS PROFILE) ────────────────────────",
+            Style::default().fg(Color::Rgb(140, 140, 160)),
+        ))),
+        chunks[0],
+    );
+    render_pentagon_radar(frame, chunks[1], persona);
+    frame.render_widget(Paragraph::new(summary_lines), chunks[2]);
 }
 
 /// Render the 10-question wizard modal.
@@ -193,7 +308,7 @@ pub fn render_wizard_modal(frame: &mut Frame, state: &AppState) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.primary))
         .title(Span::styled(
-            format!(" ◈ THE SOLUS TASTE WIZARD • STEP {} OF 10 ◈ ", state.tailored_step + 1),
+            format!(" 󰋽 TASTE WIZARD • STEP {} OF 10 ", state.tailored_step + 1),
             Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD),
         ));
 
@@ -322,7 +437,7 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(persona.primary_color))
         .title(Span::styled(
-            " ❖ THE SOLUS TASTE CONSTELLATION • SOUL PERSONA ❖ ",
+            " 󰋽 SOLUS TASTE PROFILE • VIEWER SUMMARY ",
             Style::default().fg(Color::Black).bg(persona.primary_color).add_modifier(Modifier::BOLD),
         ));
 
@@ -349,12 +464,12 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
     let left_quadrants = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(14), // Top-Left: Persona & Dimensional Gauges
-            Constraint::Min(0),     // Bottom-Left: 2D Celestial Constellation Radar
+            Constraint::Length(13), // Top-Left: Viewer Profile & Taste Gauges
+            Constraint::Min(0),     // Bottom-Left: 5-Axis Pentagon Radar & Affinities
         ])
         .split(panes[0]);
 
-    // Top-Left: Persona & Gauges
+    // Top-Left: Profile & Gauges
     let tl_block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(Color::Rgb(65, 65, 85)));
@@ -362,7 +477,7 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
     frame.render_widget(tl_block, left_quadrants[0]);
 
     let mut tl_lines = vec![
-        Line::from(Span::styled(" ── YOUR ANIME SOUL PERSONA ──────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))),
+        Line::from(Span::styled(" ── YOUR VIEWER PROFILE ────────────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))),
         Line::from(vec![
             Span::styled(format!(" {} ", persona.title), Style::default().fg(Color::Black).bg(persona.primary_color).add_modifier(Modifier::BOLD)),
             Span::styled(" ", Style::default()),
@@ -370,21 +485,21 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
         ]),
     ];
 
-    let mut res_spans = vec![Span::styled(" Resonances: ", Style::default().fg(Color::Rgb(140, 140, 160)))];
+    let mut res_spans = vec![Span::styled(" Top Genres:   ", Style::default().fg(Color::Rgb(140, 140, 160)))];
     for &tag in &persona.resonance_tags {
         res_spans.push(Span::styled(
-            format!("✦ {} ", tag),
+            format!(" {} ", tag),
             Style::default().fg(persona.primary_color).bg(Color::Rgb(30, 25, 45)).add_modifier(Modifier::BOLD),
         ));
         res_spans.push(Span::styled(" ", Style::default()));
     }
     tl_lines.push(Line::from(res_spans));
     tl_lines.push(Line::from(vec![
-        Span::styled(" Soul Crystal: ", Style::default().fg(Color::Rgb(140, 140, 160))),
-        Span::styled("Azem Fourteenth Seat Resonant · Primal Attunement", Style::default().fg(Color::Rgb(190, 190, 210))),
+        Span::styled(" Match Engine: ", Style::default().fg(Color::Rgb(140, 140, 160))),
+        Span::styled("10-Factor Preference Model · Ready", Style::default().fg(Color::Rgb(190, 190, 210))),
     ]));
     tl_lines.push(Line::from(""));
-    tl_lines.push(Line::from(Span::styled(" ── DIMENSIONAL TASTE GAUGES ────────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))));
+    tl_lines.push(Line::from(Span::styled(" ── TASTE BREAKDOWN ────────────────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))));
 
     for &(gauge_name, value) in &persona.gauges {
         let desc = get_dimension_descriptor(gauge_name, value);
@@ -398,15 +513,14 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
     }
     frame.render_widget(Paragraph::new(tl_lines), tl_inner);
 
-    // Bottom-Left: 2D Celestial Constellation Radar & Polarity
+    // Bottom-Left: 5-Axis Symmetrical Pentagon Radar & Affinities
     let bl_block = Block::default()
         .borders(Borders::TOP | Borders::RIGHT)
         .border_style(Style::default().fg(Color::Rgb(65, 65, 85)));
     let bl_inner = bl_block.inner(left_quadrants[1]);
     frame.render_widget(bl_block, left_quadrants[1]);
 
-    let radar_lines = render_celestial_radar(&persona);
-    frame.render_widget(Paragraph::new(radar_lines), bl_inner);
+    render_radar_and_summary(frame, bl_inner, &persona);
 
     // ── RIGHT COLUMN QUADRANTS ──────────────────────────────────────────────────
     let right_quadrants = Layout::default()
@@ -421,7 +535,7 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
     let tr_inner = right_quadrants[0];
     let mut tr_lines = vec![
         Line::from(vec![
-            Span::styled(" ── ◈ ATTUNED MATRIX ", Style::default().fg(Color::Rgb(140, 140, 160))),
+            Span::styled(" ── YOUR SELECTIONS ", Style::default().fg(Color::Rgb(140, 140, 160))),
             Span::styled("[Navigate: j/k, Quick-Edit: Enter] ──────────────────", Style::default().fg(persona.accent_color)),
         ]),
     ];
@@ -469,9 +583,9 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
         };
 
         let badge = if is_cursor {
-            Span::styled("[Attune 󰏫]", Style::default().fg(Color::Black).bg(Color::Rgb(250, 250, 250)).add_modifier(Modifier::BOLD))
+            Span::styled("[Edit 󰏫]  ", Style::default().fg(Color::Black).bg(Color::Rgb(250, 250, 250)).add_modifier(Modifier::BOLD))
         } else {
-            Span::styled("[󰄬]", Style::default().fg(persona.primary_color))
+            Span::styled("[󰄬]     ", Style::default().fg(persona.primary_color))
         };
 
         tr_lines.push(Line::from(vec![
@@ -482,11 +596,11 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
         ]));
     }
     tr_lines.push(Line::from(vec![
-        Span::styled(" ── Vector Resonance: 10/10 Harmonized · Confidence: 99.4% ────────────", Style::default().fg(Color::Rgb(90, 90, 115))),
+        Span::styled(" ── Profile Status: 10/10 Preferences Set · Confidence: 99% ───────────", Style::default().fg(Color::Rgb(90, 90, 115))),
     ]));
     frame.render_widget(Paragraph::new(tr_lines), tr_inner);
 
-    // Bottom-Right: Flavor Profile Pills + Spiritual Kinship + Telemetry + Suggest Button
+    // Bottom-Right: Taste Tags + Similar Anime + Summary + Suggest Button
     let br_block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::Rgb(65, 65, 85)));
@@ -494,7 +608,7 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
     frame.render_widget(br_block, right_quadrants[1]);
 
     let mut br_lines = vec![
-        Line::from(Span::styled(" ── ⬡ ANIME FLAVOR PROFILE ──────────────────────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))),
+        Line::from(Span::styled(" ── SELECTED PREFERENCE TAGS ────────────────────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))),
     ];
 
     let tasting_notes = get_tasting_notes(&state.tailored_answers);
@@ -511,19 +625,19 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
     }
 
     br_lines.push(Line::from(""));
-    br_lines.push(Line::from(Span::styled(" ── ✧ SPIRITUAL KINSHIP ARCHIVES ─────────────────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))));
-    br_lines.push(Line::from(Span::styled("  Landmark titles sharing the same narrative soul DNA:", Style::default().fg(Color::Rgb(150, 150, 170)))));
+    br_lines.push(Line::from(Span::styled(" ── SIMILAR LANDMARK ANIME ────────────────────────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))));
+    br_lines.push(Line::from(Span::styled("  Reference series that match your current preferences:", Style::default().fg(Color::Rgb(150, 150, 170)))));
     let kinship = get_spiritual_kinship_details(&state.tailored_answers);
     for (k_idx, &(title, vibe)) in kinship.iter().enumerate() {
         if k_idx % 2 == 0 {
             let next_title = kinship.get(k_idx + 1);
             let mut line_spans = vec![
-                Span::styled("  ✦ ", Style::default().fg(persona.primary_color)),
+                Span::styled("  • ", Style::default().fg(persona.primary_color)),
                 Span::styled(format!("{:<18}", title), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" ({})  ", vibe), Style::default().fg(Color::Rgb(140, 140, 160))),
             ];
             if let Some(&(t2, v2)) = next_title {
-                line_spans.push(Span::styled("✦ ", Style::default().fg(persona.primary_color)));
+                line_spans.push(Span::styled("• ", Style::default().fg(persona.primary_color)));
                 line_spans.push(Span::styled(format!("{:<18}", t2), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
                 line_spans.push(Span::styled(format!(" ({})", v2), Style::default().fg(Color::Rgb(140, 140, 160))));
             }
@@ -532,19 +646,19 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
     }
 
     br_lines.push(Line::from(""));
-    br_lines.push(Line::from(Span::styled(" ── ⟐ ALLAGAN ARCHIVE TELEMETRY ──────────────────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))));
+    br_lines.push(Line::from(Span::styled(" ── CATALOG SUMMARY ───────────────────────────────────────────────────", Style::default().fg(Color::Rgb(140, 140, 160)))));
     let veto_count = state.tailored_answers.deal_breakers.len() * 16;
     br_lines.push(Line::from(vec![
         Span::styled("  Candidate Pool: ", Style::default().fg(Color::Rgb(140, 140, 160))),
         Span::styled("300 Titles Evaluated in Local Cache", Style::default().fg(Color::White)),
-        Span::styled("  · Vetoes: ", Style::default().fg(Color::Rgb(140, 140, 160))),
+        Span::styled("  · Excluded: ", Style::default().fg(Color::Rgb(140, 140, 160))),
         Span::styled(format!("{} Filtered", veto_count), Style::default().fg(Color::Rgb(255, 120, 120))),
     ]));
     br_lines.push(Line::from(vec![
-        Span::styled("  Top Affinity:   ", Style::default().fg(Color::Rgb(140, 140, 160))),
-        Span::styled("99% Synergy Projected", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
-        Span::styled("  · Cour Format: ", Style::default().fg(Color::Rgb(140, 140, 160))),
-        Span::styled("Concluded 1-Cour TV Series", Style::default().fg(Color::Rgb(190, 190, 210))),
+        Span::styled("  Best Match:     ", Style::default().fg(Color::Rgb(140, 140, 160))),
+        Span::styled("99% Profile Fit Projected", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
+        Span::styled("  · Format: ", Style::default().fg(Color::Rgb(140, 140, 160))),
+        Span::styled("Finished 1-Cour TV Series", Style::default().fg(Color::Rgb(190, 190, 210))),
     ]));
 
     // Suggest Button (Cursor Index 10)
@@ -573,7 +687,7 @@ pub fn render_taste_dashboard(frame: &mut Frame, state: &AppState) {
         Style::default().fg(if is_suggest_cursor { persona.primary_color } else { Color::Rgb(70, 70, 95) }),
     )));
     br_lines.push(Line::from(Span::styled(
-        "       ✦ Attunes 15 tailored recommendations with poster art & storytelling",
+        "       Generates up to 30 tailored anime picks with posters & synopses",
         Style::default().fg(Color::Rgb(130, 130, 150)),
     )));
 
@@ -615,7 +729,7 @@ fn render_quick_edit_overlay(frame: &mut Frame, state: &AppState, step_idx: usiz
         .border_type(BorderType::Double)
         .border_style(Style::default().fg(persona.accent_color))
         .title(Span::styled(
-            format!(" 󰏫 ATTUNE ATTRIBUTE: {} 󰏫 ", q.title.to_uppercase()),
+            format!(" 󰏫 EDIT PREFERENCE: {} ", q.title.to_uppercase()),
             Style::default().fg(Color::Black).bg(persona.accent_color).add_modifier(Modifier::BOLD),
         ));
 
@@ -687,7 +801,7 @@ fn render_quick_edit_overlay(frame: &mut Frame, state: &AppState, step_idx: usiz
     frame.render_widget(Paragraph::new(footer), chunks[2]);
 }
 
-/// Render the Tailored Anime Results shelf with cover artwork and rich storytelling synopsis.
+/// Render the Tailored Anime Results shelf with cover artwork, rich synopsis, and Live Vibe Tuner.
 pub fn render_tailored_results(frame: &mut Frame, state: &mut AppState) {
     let area = frame.area();
     frame.render_widget(Clear, area);
@@ -699,553 +813,445 @@ pub fn render_tailored_results(frame: &mut Frame, state: &mut AppState) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(persona.primary_color))
         .title(Span::styled(
-            format!(" ❖ SOLUS TAILORED SHELF • {} MATCHES ❖ ", state.tailored_results.len()),
+            format!(" 󰋽 TAILORED RECOMMENDATIONS • {} MATCHES ", state.tailored_results.len()),
             Style::default().fg(Color::Black).bg(persona.primary_color).add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Persona banner
-            Constraint::Min(0),    // Two columns: Left (Ranked list), Right (Selected preview)
-            Constraint::Length(3), // Footer hints
-        ])
-        .split(inner);
-
-    // Persona header banner
-    let banner_text = Line::from(vec![
-        Span::styled(" Attuned Persona: ", Style::default().fg(Color::Rgb(160, 160, 180))),
-        Span::styled(format!(" {} ", persona.title), Style::default().fg(Color::Black).bg(persona.primary_color).add_modifier(Modifier::BOLD)),
-        Span::styled(" · ", Style::default().fg(Color::Rgb(80, 80, 100))),
-        Span::styled(persona.epithet, Style::default().fg(Color::Rgb(200, 200, 220))),
-    ]);
-    frame.render_widget(Paragraph::new(banner_text), chunks[0]);
-
-    if state.tailored_results.is_empty() {
-        let msg = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled("No candidates strictly matched all selected filters and deal-breakers.", Style::default().fg(Color::Rgb(255, 100, 100)))),
-            Line::from(Span::styled("Press [r] to adjust your deal-breakers or broaden your episode count.", Style::default().fg(Color::Rgb(180, 180, 200)))),
-        ]).alignment(Alignment::Center);
-        frame.render_widget(msg, chunks[1]);
-        return;
-    }
-
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(44), // Left: Recommendation list
-            Constraint::Percentage(56), // Right: Show synopsis, artwork & details
-        ])
-        .split(chunks[1]);
-
-    // ── LEFT COLUMN: Ranked Recommendation List ────────────────────────────────
-    let left_block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::Rgb(60, 60, 80)));
-    let left_inner = left_block.inner(cols[0]);
-    frame.render_widget(left_block, cols[0]);
-
-    let mut list_lines = Vec::new();
-    let visible_count = (left_inner.height as usize / 3).max(1);
-    let offset = if state.tailored_results_cursor >= visible_count {
-        state.tailored_results_cursor - visible_count + 1
+    let has_active_tuner = state.tuner_config.has_active_modifiers();
+    let tuner_height = if state.tuner_open {
+        5
+    } else if has_active_tuner {
+        1
     } else {
         0
     };
 
-    for (idx, m) in state.tailored_results.iter().enumerate().skip(offset).take(visible_count) {
-        let is_focused = idx == state.tailored_results_cursor;
-        let match_badge = format!(" [{}% MATCH] ", m.match_percentage);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),            // Persona banner
+            Constraint::Length(tuner_height), // Live Vibe Tuner dock (when open or active)
+            Constraint::Min(0),               // Two columns: Left (Ranked list), Right (Selected preview)
+            Constraint::Length(2),            // Footer hints
+        ])
+        .split(inner);
 
-        let row_style = if is_focused {
-            Style::default().fg(Color::Black).bg(persona.accent_color).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-        };
+    // Profile header banner
+    let mut banner_spans = vec![
+        Span::styled(" Taste Profile: ", Style::default().fg(Color::Rgb(160, 160, 180))),
+        Span::styled(format!(" {} ", persona.title), Style::default().fg(Color::Black).bg(persona.primary_color).add_modifier(Modifier::BOLD)),
+        Span::styled(" · ", Style::default().fg(Color::Rgb(80, 80, 100))),
+        Span::styled(persona.epithet, Style::default().fg(Color::Rgb(200, 200, 220))),
+    ];
+    if let Some((_, ref anchor_title, _)) = state.tuner_config.anchor_anime {
+        banner_spans.push(Span::styled("   ", Style::default()));
+        banner_spans.push(Span::styled(
+            format!(" 󰄬 Similar to: {} ", anchor_title),
+            Style::default().fg(Color::Black).bg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(banner_spans)), chunks[0]);
 
-        let badge_style = if m.match_percentage >= 90 {
-            Style::default().fg(Color::Black).bg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Black).bg(persona.primary_color).add_modifier(Modifier::BOLD)
-        };
-
-        list_lines.push(Line::from(vec![
-            Span::styled(format!(" {:>2}. ", idx + 1), Style::default().fg(Color::Rgb(140, 140, 160))),
-            Span::styled(match_badge, badge_style),
-            Span::styled(format!(" {} ", m.anime.short_title()), row_style),
-        ]));
-
-        let mut reason_spans = vec![Span::styled("       ", Style::default())];
-        for r in &m.reason_tags {
-            reason_spans.push(Span::styled(format!(" {} ", r), Style::default().fg(persona.primary_color).bg(Color::Rgb(30, 28, 42))));
-            reason_spans.push(Span::styled(" ", Style::default()));
-        }
-        list_lines.push(Line::from(reason_spans));
-        list_lines.push(Line::from(""));
+    // ── LIVE VIBE TUNER DOCK ───────────────────────────────────────────────────
+    if state.tuner_open {
+        render_live_tuner_dock(frame, state, chunks[1], &persona);
+    } else if has_active_tuner {
+        render_active_tuner_summary(frame, state, chunks[1], &persona);
     }
 
-    frame.render_widget(Paragraph::new(list_lines), left_inner);
-
-    // ── RIGHT COLUMN: Selected Anime Details, Artwork & Storytelling ───────────
-    if let Some(focused) = state.tailored_results.get(state.tailored_results_cursor) {
-        let anime = focused.anime.clone();
-        let right_inner = cols[1];
-
-        let right_sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(16), // Top: Cover Thumbnail + Specs & Resonance
-                Constraint::Min(0),     // Bottom: Narrative Chronicle & Enhanced Synopsis
-            ])
-            .split(right_inner);
-
-        // Top section split: Poster art + Metadata
-        let top_cols = Layout::default()
+    if state.tailored_results.is_empty() {
+        let msg = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled("No candidates matched all active Live Tuner pills & filters.", Style::default().fg(Color::Rgb(255, 110, 110)).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(Span::styled("Press [c] to Reset Live Tuner filters, [f] to open the Live Tuner, or [r] to adjust your Taste Profile.", Style::default().fg(Color::Rgb(180, 180, 200)))),
+        ]).alignment(Alignment::Center);
+        frame.render_widget(msg, chunks[2]);
+    } else {
+        let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(20), // Moderately large poster (20 cols x 16 rows, inner 18x14)
-                Constraint::Length(1),  // Spacer
-                Constraint::Min(0),     // Metadata & Alignment details
+                Constraint::Percentage(44), // Left: Recommendation list
+                Constraint::Percentage(56), // Right: Show synopsis, artwork & details
             ])
-            .split(right_sections[0]);
+            .split(chunks[2]);
 
-        // Cover box with stylish rounded border
-        let cover_block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(persona.primary_color));
-        let cover_inner = cover_block.inner(top_cols[0]);
-        frame.render_widget(cover_block, top_cols[0]);
+        // ── LEFT COLUMN: Ranked Recommendation List ────────────────────────────
+        let left_block = Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(Style::default().fg(Color::Rgb(60, 60, 80)));
+        let left_inner = left_block.inner(cols[0]);
+        frame.render_widget(left_block, cols[0]);
 
-        if state.has_image_support() {
-            if let Some(cover) = state.detail_cache.get_mut(&anime.id)
-                .or_else(|| state.banner_cache.get_mut(&anime.id))
-                .or_else(|| state.cover_cache.get_mut(&anime.id))
-            {
-                let image_widget = ratatui_image::StatefulImage::new(None)
-                    .resize(ratatui_image::Resize::Fit(None));
-                frame.render_stateful_widget(image_widget, cover_inner, cover);
-            } else {
-                let loading_label = if state.cover_failed_anime_id == Some(anime.id) {
-                    "Poster\nUnavailable"
-                } else {
-                    "⬡ Loading\nAstral Poster..."
-                };
-                let loading = Paragraph::new(loading_label)
-                    .style(Style::default().fg(persona.primary_color))
-                    .alignment(Alignment::Center);
-                frame.render_widget(loading, cover_inner);
-            }
+        let mut list_lines = Vec::new();
+        let visible_count = (left_inner.height as usize / 3).max(1);
+        let offset = if state.tailored_results_cursor >= visible_count {
+            state.tailored_results_cursor - visible_count + 1
         } else {
-            frame.render_widget(
-                crate::ui::components::cover::HalfblockCover { anime_id: anime.id, title: anime.display_title() },
-                cover_inner,
-            );
-        }
-
-        // Right side of top section: Metadata
-        let title = anime.display_title();
-        let subtitle = if anime.title_romaji != title && !anime.title_romaji.is_empty() {
-            Some(anime.title_romaji.clone())
-        } else {
-            anime.title_native.clone()
+            0
         };
-        let score_str = anime.score.map(|s| format!(" {:.1}", s as f32 / 10.0)).unwrap_or_else(|| " ?".to_string());
-        let eps_str = anime.episodes.map(|e| format!("{} eps", e)).unwrap_or_else(|| "? eps".to_string());
-        let status_str = anime.status.as_deref().unwrap_or("UNKNOWN");
-        let format_str = anime.format.as_deref().unwrap_or("TV");
 
-        let mut meta_lines = vec![
-            Line::from(vec![
-                Span::styled(format!("❖ {} ", title), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            ]),
-        ];
-        if let Some(sub) = subtitle {
-            meta_lines.push(Line::from(Span::styled(format!("  ◈ {}", sub), Style::default().fg(Color::Rgb(140, 140, 160)))));
-        }
+        for (idx, m) in state.tailored_results.iter().enumerate().skip(offset).take(visible_count) {
+            let is_focused = idx == state.tailored_results_cursor;
+            let match_badge = format!(" [{}% MATCH] ", m.match_percentage);
 
-        let match_badge = format!(" [{}% AETHERIC RESONANCE] ", focused.match_percentage);
-        meta_lines.push(Line::from(""));
-        meta_lines.push(Line::from(vec![
-            Span::styled(match_badge, Style::default().fg(Color::Black).bg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
-            Span::styled(" ", Style::default()),
-            Span::styled(format!(" {} ", score_str), Style::default().fg(Color::Black).bg(persona.accent_color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  {} · {} · {}", eps_str, format_str, status_str), Style::default().fg(Color::Rgb(200, 200, 220))),
-        ]));
+            let row_style = if is_focused {
+                Style::default().fg(Color::Black).bg(persona.accent_color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            };
 
-        meta_lines.push(Line::from(""));
-        let mut genre_spans = vec![Span::styled("Genres: ", Style::default().fg(Color::Rgb(140, 140, 160)))];
-        for (g_idx, g) in anime.genre_list().iter().take(4).enumerate() {
-            if g_idx > 0 {
-                genre_spans.push(Span::styled(" · ", Style::default().fg(Color::Rgb(80, 80, 100))));
+            let badge_style = if m.match_percentage >= 90 {
+                Style::default().fg(Color::Black).bg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Black).bg(persona.primary_color).add_modifier(Modifier::BOLD)
+            };
+
+            list_lines.push(Line::from(vec![
+                Span::styled(format!(" {:>2}. ", idx + 1), Style::default().fg(Color::Rgb(140, 140, 160))),
+                Span::styled(match_badge, badge_style),
+                Span::styled(format!(" {} ", m.anime.short_title()), row_style),
+            ]));
+
+            let mut reason_spans = vec![Span::styled("       ", Style::default())];
+            for r in &m.reason_tags {
+                reason_spans.push(Span::styled(format!(" {} ", r), Style::default().fg(persona.primary_color).bg(Color::Rgb(30, 28, 42))));
+                reason_spans.push(Span::styled(" ", Style::default()));
             }
-            genre_spans.push(Span::styled(format!("[{}]", g), Style::default().fg(persona.primary_color)));
+            list_lines.push(Line::from(reason_spans));
+            list_lines.push(Line::from(""));
         }
-        meta_lines.push(Line::from(genre_spans));
 
-        meta_lines.push(Line::from(""));
-        meta_lines.push(Line::from(vec![
-            Span::styled("✦ Soul Synergy: ", Style::default().fg(persona.accent_color).add_modifier(Modifier::BOLD)),
-            Span::styled("Directly tuned to your preference matrix.", Style::default().fg(Color::Rgb(180, 180, 200))),
-        ]));
-        meta_lines.push(Line::from(vec![
-            Span::styled("✦ Deal-Breakers: ", Style::default().fg(Color::Rgb(80, 250, 123))),
-            Span::styled("100% Compliant (0 violations)", Style::default().fg(Color::Rgb(160, 160, 180))),
-        ]));
+        frame.render_widget(Paragraph::new(list_lines), left_inner);
 
-        frame.render_widget(Paragraph::new(meta_lines), top_cols[2]);
+        // ── RIGHT COLUMN: Selected Anime Details, Artwork & Storytelling ───────
+        if let Some(focused) = state.tailored_results.get(state.tailored_results_cursor) {
+            let anime = focused.anime.clone();
+            let right_inner = cols[1];
 
-        // ── BOTTOM SECTION: Narrative Chronicle & Storytelling Synopsis ────────
-        let bottom_block = Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::Rgb(65, 65, 85)))
-            .title(Span::styled(
-                " ── ❖ NARRATIVE CHRONICLE & AETHERIC LORE ── ",
-                Style::default().fg(persona.primary_color).add_modifier(Modifier::BOLD),
-            ));
-        let bottom_inner = bottom_block.inner(right_sections[1]);
-        frame.render_widget(bottom_block, right_sections[1]);
+            let right_sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(16), // Top: Cover Thumbnail + Specs & Resonance
+                    Constraint::Min(0),     // Bottom: Narrative Chronicle & Enhanced Synopsis
+                ])
+                .split(right_inner);
 
-        let hook = get_thematic_hook(&anime);
-        let raw_desc = anime.description.as_deref().unwrap_or("No description available.");
-        let cleaned_synopsis = clean_synopsis(raw_desc);
+            // Top section split: Poster art + Metadata
+            let top_cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(20), // Moderately large poster (20 cols x 16 rows, inner 18x14)
+                    Constraint::Length(1),  // Spacer
+                    Constraint::Min(0),     // Metadata & Alignment details
+                ])
+                .split(right_sections[0]);
 
-        let mut story_lines = vec![
-            Line::from(Span::styled(hook, Style::default().fg(persona.accent_color).add_modifier(Modifier::ITALIC))),
-            Line::from(""),
-        ];
+            // Cover box with stylish rounded border
+            let cover_block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(persona.primary_color));
+            let cover_inner = cover_block.inner(top_cols[0]);
+            frame.render_widget(cover_block, top_cols[0]);
 
-        for para in cleaned_synopsis.split("\n\n") {
-            let p_trim = para.trim();
-            if !p_trim.is_empty() {
-                story_lines.push(Line::from(Span::styled(
-                    p_trim.replace('\n', " "),
-                    Style::default().fg(Color::Rgb(215, 215, 230)),
-                )));
-                story_lines.push(Line::from(""));
+            if state.has_image_support() {
+                if let Some(cover) = state.detail_cache.get_mut(&anime.id)
+                    .or_else(|| state.banner_cache.get_mut(&anime.id))
+                    .or_else(|| state.cover_cache.get_mut(&anime.id))
+                {
+                    let image_widget = ratatui_image::StatefulImage::new(None)
+                        .resize(ratatui_image::Resize::Fit(None));
+                    frame.render_stateful_widget(image_widget, cover_inner, cover);
+                } else {
+                    let loading_label = if state.cover_failed_anime_id == Some(anime.id) {
+                        "Poster\nUnavailable"
+                    } else {
+                        "Loading\nPoster..."
+                    };
+                    let loading = Paragraph::new(loading_label)
+                        .style(Style::default().fg(persona.primary_color))
+                        .alignment(Alignment::Center);
+                    frame.render_widget(loading, cover_inner);
+                }
+            } else {
+                frame.render_widget(
+                    crate::ui::components::cover::HalfblockCover { anime_id: anime.id, title: anime.display_title() },
+                    cover_inner,
+                );
             }
-        }
 
-        let synopsis_p = Paragraph::new(story_lines)
-            .wrap(ratatui::widgets::Wrap { trim: true });
-        frame.render_widget(synopsis_p, bottom_inner);
+            // Right side of top section: Metadata
+            let title = anime.display_title();
+            let subtitle = if anime.title_romaji != title && !anime.title_romaji.is_empty() {
+                Some(anime.title_romaji.clone())
+            } else {
+                anime.title_native.clone()
+            };
+            let score_str = anime.score.map(|s| format!(" {:.1}", s as f32 / 10.0)).unwrap_or_else(|| " ?".to_string());
+            let eps_str = anime.episodes.map(|e| format!("{} eps", e)).unwrap_or_else(|| "? eps".to_string());
+            let status_str = anime.status.as_deref().unwrap_or("UNKNOWN");
+            let format_str = anime.format.as_deref().unwrap_or("TV");
+
+            let mut meta_lines = vec![
+                Line::from(vec![
+                    Span::styled(format!("{} ", title), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]),
+            ];
+            if let Some(sub) = subtitle {
+                meta_lines.push(Line::from(Span::styled(format!("  {}", sub), Style::default().fg(Color::Rgb(140, 140, 160)))));
+            }
+
+            let match_badge = format!(" [{}% TASTE MATCH] ", focused.match_percentage);
+            meta_lines.push(Line::from(""));
+            meta_lines.push(Line::from(vec![
+                Span::styled(match_badge, Style::default().fg(Color::Black).bg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
+                Span::styled(" ", Style::default()),
+                Span::styled(format!(" {} ", score_str), Style::default().fg(Color::Black).bg(persona.accent_color).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  {} · {} · {}", eps_str, format_str, status_str), Style::default().fg(Color::Rgb(200, 200, 220))),
+            ]));
+
+            meta_lines.push(Line::from(""));
+            let mut genre_spans = vec![Span::styled("Genres: ", Style::default().fg(Color::Rgb(140, 140, 160)))];
+            for (g_idx, g) in anime.genre_list().iter().take(4).enumerate() {
+                if g_idx > 0 {
+                    genre_spans.push(Span::styled(" · ", Style::default().fg(Color::Rgb(80, 80, 100))));
+                }
+                genre_spans.push(Span::styled(format!("[{}]", g), Style::default().fg(persona.primary_color)));
+            }
+            meta_lines.push(Line::from(genre_spans));
+
+            meta_lines.push(Line::from(""));
+            meta_lines.push(Line::from(vec![
+                Span::styled("󰄬 Profile Fit:  ", Style::default().fg(persona.accent_color).add_modifier(Modifier::BOLD)),
+                Span::styled("Matched cleanly to your Taste Profile & Mood.", Style::default().fg(Color::Rgb(180, 180, 200))),
+            ]));
+            let guard_note = if state.tuner_config.hide_sequels {
+                "Standalone / Season 1 Entry (Sequels hidden)"
+            } else {
+                "All Seasons & Sequels Included"
+            };
+            meta_lines.push(Line::from(vec![
+                Span::styled("󰄬 Sequel Guard: ", Style::default().fg(Color::Rgb(80, 250, 123))),
+                Span::styled(guard_note, Style::default().fg(Color::Rgb(160, 160, 180))),
+            ]));
+
+            frame.render_widget(Paragraph::new(meta_lines), top_cols[2]);
+
+            // ── BOTTOM SECTION: Story Synopsis & Overview ─────────────────────
+            let bottom_block = Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::Rgb(65, 65, 85)))
+                .title(Span::styled(
+                    " ── STORY SYNOPSIS & OVERVIEW ── ",
+                    Style::default().fg(persona.primary_color).add_modifier(Modifier::BOLD),
+                ));
+            let bottom_inner = bottom_block.inner(right_sections[1]);
+            frame.render_widget(bottom_block, right_sections[1]);
+
+            let hook = get_thematic_hook(&anime);
+            let raw_desc = anime.description.as_deref().unwrap_or("No description available.");
+            let cleaned_synopsis = clean_synopsis(raw_desc);
+
+            let mut story_lines = vec![
+                Line::from(Span::styled(hook, Style::default().fg(persona.accent_color).add_modifier(Modifier::ITALIC))),
+                Line::from(""),
+            ];
+
+            for para in cleaned_synopsis.split("\n\n") {
+                let p_trim = para.trim();
+                if !p_trim.is_empty() {
+                    story_lines.push(Line::from(Span::styled(
+                        p_trim.replace('\n', " "),
+                        Style::default().fg(Color::Rgb(215, 215, 230)),
+                    )));
+                    story_lines.push(Line::from(""));
+                }
+            }
+
+            let synopsis_p = Paragraph::new(story_lines)
+                .wrap(ratatui::widgets::Wrap { trim: true });
+            frame.render_widget(synopsis_p, bottom_inner);
+        }
     }
 
-    // Footer actions
-    let footer_text = Line::from(vec![
-        Span::styled(" [f] ", Style::default().fg(Color::Black).bg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
-        Span::styled(" ✦ Attune / Refine Results  ", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
-        Span::styled(" [Enter] ", Style::default().fg(Color::Black).bg(persona.accent_color).add_modifier(Modifier::BOLD)),
-        Span::styled(" Play Now  ", Style::default().fg(Color::Rgb(200, 200, 210))),
-        Span::styled(" [d] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(" Open Detail  ", Style::default().fg(Color::Rgb(200, 200, 210))),
-        Span::styled(" [+] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(" Add to Watchlist  ", Style::default().fg(Color::Rgb(200, 200, 210))),
-        Span::styled(" [r] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(" Re-tune Diagram  ", Style::default().fg(Color::Rgb(200, 200, 210))),
-        Span::styled(" [Esc] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-        Span::styled(" Back to Home", Style::default().fg(Color::Rgb(140, 140, 160))),
-    ]);
+    // Footer actions (context-aware: tuner hints when dock is open, browse hints otherwise)
+    let footer_text = if state.tuner_open {
+        Line::from(vec![
+            Span::styled(" [h/l] ", Style::default().fg(Color::Black).bg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
+            Span::styled(" Select Pill  ", Style::default().fg(Color::Rgb(200, 200, 210))),
+            Span::styled(" [j/k] ", Style::default().fg(Color::Black).bg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD)),
+            Span::styled(" Switch Row  ", Style::default().fg(Color::Rgb(200, 200, 210))),
+            Span::styled(" [Space/Enter] ", Style::default().fg(Color::Black).bg(persona.accent_color).add_modifier(Modifier::BOLD)),
+            Span::styled(" Toggle (+Boost / -Hide)  ", Style::default().fg(Color::Rgb(200, 200, 210))),
+            Span::styled(" [c] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" Reset  ", Style::default().fg(Color::Rgb(200, 200, 210))),
+            Span::styled(" [f/Esc] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" Close Tuner", Style::default().fg(Color::Rgb(140, 140, 160))),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" [f] ", Style::default().fg(Color::Black).bg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
+            Span::styled(" Live Tuner  ", Style::default().fg(Color::Rgb(80, 250, 123)).add_modifier(Modifier::BOLD)),
+            Span::styled(" [m] ", Style::default().fg(Color::Black).bg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD)),
+            Span::styled(" More Like This  ", Style::default().fg(Color::Rgb(139, 233, 253)).add_modifier(Modifier::BOLD)),
+            Span::styled(" [x] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" Dismiss  ", Style::default().fg(Color::Rgb(200, 200, 210))),
+            Span::styled(" [Enter] ", Style::default().fg(Color::Black).bg(persona.accent_color).add_modifier(Modifier::BOLD)),
+            Span::styled(" Play  ", Style::default().fg(Color::Rgb(200, 200, 210))),
+            Span::styled(" [d] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" Details  ", Style::default().fg(Color::Rgb(200, 200, 210))),
+            Span::styled(" [+] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" Watchlist  ", Style::default().fg(Color::Rgb(200, 200, 210))),
+            Span::styled(" [r] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" Profile  ", Style::default().fg(Color::Rgb(200, 200, 210))),
+            Span::styled(" [Esc] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" Home", Style::default().fg(Color::Rgb(140, 140, 160))),
+        ])
+    };
 
     let footer_block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(Color::Rgb(60, 60, 80)));
-    frame.render_widget(Paragraph::new(footer_text).block(footer_block), chunks[2]);
-
-    if state.is_refining_tailored {
-        render_refine_modal(frame, state);
-    }
+    frame.render_widget(Paragraph::new(footer_text).block(footer_block), chunks[3]);
 }
 
-/// Render the 6-question Crucible adaptive refinement modal.
-pub fn render_refine_modal(frame: &mut Frame, state: &AppState) {
-    let area = centered_rect(76, 76, frame.area());
-    frame.render_widget(Clear, area);
-
-    let refine_questions = crate::services::tailored::get_refinement_questions(state.tailored_answers.choices[0]);
-    let step = state.tailored_refine_step.min(5);
-
+/// Render the expanded zero-question interactive Live Vibe Tuner bar above the results list.
+fn render_live_tuner_dock(
+    frame: &mut Frame,
+    state: &AppState,
+    area: Rect,
+    persona: &crate::services::tailored::Persona,
+) {
     let emerald = Color::Rgb(80, 250, 123);
     let cyan = Color::Rgb(139, 233, 253);
+    let red = Color::Rgb(255, 110, 110);
 
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(Style::default().fg(emerald))
         .title(Span::styled(
-            format!(" ❖ AETHERIC CRUCIBLE • STEP {} OF 6 ❖ ", step + 1),
-            Style::default().fg(Color::Black).bg(emerald).add_modifier(Modifier::BOLD),
+            " 󰒓 LIVE VIBE TUNER (h/l select, j/k row, Space toggle, f/Esc close) ",
+            Style::default().fg(emerald).add_modifier(Modifier::BOLD),
         ));
-
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4), // Header + progress
-            Constraint::Min(0),    // Body (options or anchor search)
-            Constraint::Length(3), // Footer hints
-        ])
-        .split(inner);
+    // Row 0: Discovery Tiers & Quick Toggles (7 interactive pills: 0..=6)
+    let mut row0_spans = vec![Span::styled(" Discovery: ", Style::default().fg(Color::Rgb(150, 150, 175)))];
+    let row0_items = [
+        (0usize, "All Picks", state.tuner_config.discovery_tier == 0),
+        (1usize, "Hidden Gems", state.tuner_config.discovery_tier == 1),
+        (2usize, "Acclaimed 82%+", state.tuner_config.discovery_tier == 2),
+        (3usize, "Modern 2022+", state.tuner_config.discovery_tier == 3),
+        (4usize, "Hide Sequels", state.tuner_config.hide_sequels),
+        (5usize, "Finished Only", state.tuner_config.finished_only),
+        (6usize, "Reset", false),
+    ];
 
-    // Progress track (6 steps)
-    let mut progress_spans = Vec::new();
-    for i in 0..6 {
-        if i == step {
-            progress_spans.push(Span::styled("◆ ", Style::default().fg(emerald).add_modifier(Modifier::BOLD)));
-        } else if i < step {
-            progress_spans.push(Span::styled("◈ ", Style::default().fg(cyan)));
+    for (col_idx, label, is_on) in row0_items {
+        let focused = state.tuner_row == 0 && state.tuner_col == col_idx;
+        let prefix = if col_idx == 6 {
+            "󰑐 "
+        } else if is_on {
+            "● "
         } else {
-            progress_spans.push(Span::styled("◇ ", Style::default().fg(Color::Rgb(70, 70, 90))));
-        }
+            "○ "
+        };
+        let pill_text = format!(" {}{} ", prefix, label);
+        let style = if focused {
+            Style::default().fg(Color::Black).bg(cyan).add_modifier(Modifier::BOLD)
+        } else if is_on {
+            Style::default().fg(Color::Black).bg(emerald).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(185, 185, 205)).bg(Color::Rgb(34, 32, 48))
+        };
+        row0_spans.push(Span::styled(pill_text, style));
+        row0_spans.push(Span::raw(" "));
     }
 
-    if step < 5 {
-        // Steps 1 to 5: Multi-select questions
-        let q = &refine_questions[step];
-        let selected_count = state.refine_selections[step].len();
-
-        let header_lines = vec![
-            Line::from(vec![
-                Span::styled(format!(" {} ", q.symbol), Style::default().fg(cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(q.title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled(
-                    format!("[ {} selected ]", selected_count),
-                    Style::default().fg(if selected_count > 0 { emerald } else { Color::Rgb(140, 140, 160) }),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("   ", Style::default()),
-                Span::styled(q.subtitle, Style::default().fg(Color::Rgb(170, 170, 190))),
-            ]),
-            Line::from(progress_spans),
-        ];
-        frame.render_widget(Paragraph::new(header_lines), chunks[0]);
-
-        // Options list with checkboxes
-        let mut option_lines = Vec::new();
-        for (idx, opt) in q.options.iter().enumerate() {
-            let is_focused = idx == state.tailored_refine_cursor;
-            let is_checked = state.refine_selections[step].contains(&idx);
-
-            let check_badge = if is_checked { "[x]" } else { "[ ]" };
-            let check_style = if is_checked {
-                Style::default().fg(emerald).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Rgb(110, 110, 130))
-            };
-
-            let pointer = if is_focused { " ▶ " } else { "   " };
-            let num_badge = format!(" [{}] ", idx + 1);
-            let badge_style = if is_focused {
-                Style::default().fg(Color::Black).bg(emerald).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Rgb(140, 140, 160))
-            };
-
-            let label_style = if is_focused {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-            } else if is_checked {
-                Style::default().fg(Color::Rgb(220, 240, 225))
-            } else {
-                Style::default().fg(Color::Rgb(180, 180, 200))
-            };
-
-            let detail_style = if is_focused {
-                Style::default().fg(cyan)
-            } else {
-                Style::default().fg(Color::Rgb(120, 120, 140))
-            };
-
-            option_lines.push(Line::from(vec![
-                Span::styled(pointer, Style::default().fg(emerald).add_modifier(Modifier::BOLD)),
-                Span::styled(check_badge, check_style),
-                Span::styled(num_badge, badge_style),
-                Span::styled(format!("{} ", opt.symbol), Style::default().fg(cyan)),
-                Span::styled(opt.label, label_style),
-            ]));
-            option_lines.push(Line::from(vec![
-                Span::styled("           ", Style::default()),
-                Span::styled(opt.detail, detail_style),
-            ]));
-            option_lines.push(Line::from(""));
-        }
-
-        let options_p = Paragraph::new(option_lines)
-            .wrap(ratatui::widgets::Wrap { trim: true });
-        frame.render_widget(options_p, chunks[1]);
-
-        // Footer
-        let footer_text = Line::from(vec![
-            Span::styled(" [Space] / [1-5] ", Style::default().fg(Color::Black).bg(emerald).add_modifier(Modifier::BOLD)),
-            Span::styled(" Toggle [x]  ", Style::default().fg(Color::Rgb(200, 200, 210))),
-            Span::styled(" [Enter] ", Style::default().fg(Color::Black).bg(cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(" Confirm & Next  ", Style::default().fg(Color::Rgb(200, 200, 210))),
-            Span::styled(" [b] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled(" Back  ", Style::default().fg(Color::Rgb(180, 180, 200))),
-            Span::styled(" [Esc] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled(" Cancel", Style::default().fg(Color::Rgb(140, 140, 160))),
-        ]);
-        let footer_block = Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::Rgb(60, 60, 80)));
-        frame.render_widget(Paragraph::new(footer_text).block(footer_block), chunks[2]);
+    // Row 1: Dynamic Tag Boost (`+`) / Hide (`-`) Chips
+    let mut row1_spans = vec![Span::styled(" Tune Tags: ", Style::default().fg(Color::Rgb(150, 150, 175)))];
+    if state.tuner_available_tags.is_empty() {
+        row1_spans.push(Span::styled("No tag chips extracted yet.", Style::default().fg(Color::Rgb(120, 120, 140))));
     } else {
-        // Step 6 (index 5): Keystone Anchor Anime Search
-        let header_lines = vec![
-            Line::from(vec![
-                Span::styled(" ❖ ", Style::default().fg(cyan).add_modifier(Modifier::BOLD)),
-                Span::styled("Keystone Benchmark Anchor", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled("[ Discovery Keystone ]", Style::default().fg(emerald)),
-            ]),
-            Line::from(vec![
-                Span::styled("   ", Style::default()),
-                Span::styled("Enter a benchmark anime you love (e.g. Death Note, Monster, Steins;Gate) to attune direct peer DNA.", Style::default().fg(Color::Rgb(170, 170, 190))),
-            ]),
-            Line::from(progress_spans),
-        ];
-        frame.render_widget(Paragraph::new(header_lines), chunks[0]);
+        for (col_idx, tag) in state.tuner_available_tags.iter().enumerate() {
+            let focused = state.tuner_row == 1 && state.tuner_col == col_idx;
+            let is_boosted = state.tuner_config.boosted_tags.contains(tag);
+            let is_muted = state.tuner_config.muted_tags.contains(tag);
 
-        // Anchor input and search candidate area
-        let body_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3), // Search input bar
-                Constraint::Min(0),    // Candidates list
-                Constraint::Length(3), // Selected preview badge
-            ])
-            .split(chunks[1]);
-
-        let input_text = if state.refine_anchor_query.is_empty() {
-            "Type anime title (e.g. Death Note, Vinland Saga, Monster)..."
-        } else {
-            &state.refine_anchor_query
-        };
-        let input_style = if state.refine_anchor_query.is_empty() {
-            Style::default().fg(Color::Rgb(120, 120, 140))
-        } else {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-        };
-        let input_p = Paragraph::new(Line::from(vec![
-            Span::styled("    ", Style::default().fg(cyan)),
-            Span::styled(input_text, input_style),
-            Span::styled("▎", Style::default().fg(emerald)),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(cyan))
-                .title(" Anchor Anime Search "),
-        );
-        frame.render_widget(input_p, body_chunks[0]);
-
-        // Candidates
-        let mut candidate_lines = Vec::new();
-        if state.is_searching_anchor {
-            candidate_lines.push(Line::from(Span::styled(
-                "  Searching AniList archives for keystone anchor...",
-                Style::default().fg(Color::Rgb(150, 150, 180)),
-            )));
-        } else if state.refine_anchor_results.is_empty() {
-            if state.refine_anchor_query.is_empty() {
-                candidate_lines.push(Line::from(Span::styled(
-                    "  Start typing to search AniList for your favorite anchor anime.",
-                    Style::default().fg(Color::Rgb(130, 130, 150)),
-                )));
-                candidate_lines.push(Line::from(""));
-                candidate_lines.push(Line::from(Span::styled(
-                    "  ✦ Selecting an anchor pulls verified community peer recommendations (+35 pts).",
-                    Style::default().fg(Color::Rgb(120, 120, 145)),
-                )));
-                candidate_lines.push(Line::from(Span::styled(
-                    "  ✦ Press [s] to skip anchor attunement and run purely on questionnaire criteria.",
-                    Style::default().fg(Color::Rgb(120, 120, 145)),
-                )));
+            let (prefix, base_style) = if is_boosted {
+                ("+ ", Style::default().fg(Color::Black).bg(emerald).add_modifier(Modifier::BOLD))
+            } else if is_muted {
+                ("- ", Style::default().fg(Color::Black).bg(red).add_modifier(Modifier::BOLD))
             } else {
-                candidate_lines.push(Line::from(Span::styled(
-                    "  No anime found matching your query on AniList.",
-                    Style::default().fg(Color::Rgb(220, 100, 100)),
-                )));
-            }
-        } else {
-            for (idx, a) in state.refine_anchor_results.iter().take(6).enumerate() {
-                let is_focused = idx == state.refine_anchor_cursor;
-                let pointer = if is_focused { " ▶ " } else { "   " };
-                let num_badge = format!(" [{}] ", idx + 1);
-                let badge_style = if is_focused {
-                    Style::default().fg(Color::Black).bg(emerald).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Rgb(140, 140, 160))
-                };
-                let title_style = if is_focused {
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Rgb(190, 190, 210))
-                };
-                let meta = format!(
-                    "{} · Score: {}% · {}",
-                    a.season_year.map(|y| y.to_string()).unwrap_or_else(|| "Unknown".to_string()),
-                    a.score.unwrap_or(0),
-                    a.format.as_deref().unwrap_or("TV"),
-                );
-                candidate_lines.push(Line::from(vec![
-                    Span::styled(pointer, Style::default().fg(emerald).add_modifier(Modifier::BOLD)),
-                    Span::styled(num_badge, badge_style),
-                    Span::styled(a.display_title(), title_style),
-                    Span::raw("  "),
-                    Span::styled(format!("({})", meta), Style::default().fg(Color::Rgb(130, 130, 150))),
-                ]));
-            }
+                ("○ ", Style::default().fg(Color::Rgb(185, 185, 205)).bg(Color::Rgb(34, 32, 48)))
+            };
+
+            let style = if focused {
+                Style::default().fg(Color::Black).bg(persona.accent_color).add_modifier(Modifier::BOLD)
+            } else {
+                base_style
+            };
+            row1_spans.push(Span::styled(format!(" {}{} ", prefix, tag), style));
+            row1_spans.push(Span::raw(" "));
         }
-        frame.render_widget(Paragraph::new(candidate_lines), body_chunks[1]);
-
-        // Selected preview
-        let preview_line = if let Some(ref sel) = state.refine_anchor_selected {
-            Line::from(vec![
-                Span::styled(" ✦ Anchor Locked: ", Style::default().fg(emerald).add_modifier(Modifier::BOLD)),
-                Span::styled(sel.display_title(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                Span::styled(" · Community Peer Vector Attuned", Style::default().fg(cyan)),
-            ])
-        } else if let Some(focused) = state.refine_anchor_results.get(state.refine_anchor_cursor) {
-            Line::from(vec![
-                Span::styled(" ◈ Highlighted Anchor: ", Style::default().fg(cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(focused.display_title(), Style::default().fg(Color::White)),
-                Span::styled(" · Press Enter to Lock & Attune", Style::default().fg(Color::Rgb(140, 140, 160))),
-            ])
-        } else {
-            Line::from(Span::styled(
-                " ✧ Optional: Type anime title above or press [s] to skip anchor attunement",
-                Style::default().fg(Color::Rgb(130, 130, 150)),
-            ))
-        };
-        frame.render_widget(Paragraph::new(preview_line), body_chunks[2]);
-
-        // Footer for Step 6
-        let footer_text = Line::from(vec![
-            Span::styled(" [Type] ", Style::default().fg(Color::Black).bg(cyan).add_modifier(Modifier::BOLD)),
-            Span::styled(" Query  ", Style::default().fg(Color::Rgb(200, 200, 210))),
-            Span::styled(" [↑/↓] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled(" Select  ", Style::default().fg(Color::Rgb(200, 200, 210))),
-            Span::styled(" [Enter] ", Style::default().fg(Color::Black).bg(emerald).add_modifier(Modifier::BOLD)),
-            Span::styled(" Attune & Finalize  ", Style::default().fg(Color::Rgb(200, 200, 210))),
-            Span::styled(" [s] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled(" Skip Anchor  ", Style::default().fg(Color::Rgb(180, 180, 200))),
-            Span::styled(" [b] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled(" Back  ", Style::default().fg(Color::Rgb(180, 180, 200))),
-            Span::styled(" [Esc] ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled(" Cancel", Style::default().fg(Color::Rgb(140, 140, 160))),
-        ]);
-        let footer_block = Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::Rgb(60, 60, 80)));
-        frame.render_widget(Paragraph::new(footer_text).block(footer_block), chunks[2]);
     }
+
+    let hint_line = Line::from(Span::styled(
+        " Tip: [Space] cycles tags (Neutral -> +Boost -> -Hide). Press [m] on any anime for Similar Picks.",
+        Style::default().fg(Color::Rgb(130, 130, 155)),
+    ));
+
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(row0_spans), Line::from(row1_spans), hint_line]),
+        inner,
+    );
+}
+
+/// Compact 1-line strip shown when the Live Vibe Tuner drawer is closed, summarizing active modifiers.
+fn render_active_tuner_summary(
+    frame: &mut Frame,
+    state: &AppState,
+    area: Rect,
+    persona: &crate::services::tailored::Persona,
+) {
+    let emerald = Color::Rgb(80, 250, 123);
+    let red = Color::Rgb(255, 110, 110);
+    let mut spans = vec![Span::styled(" Active Tuners: ", Style::default().fg(Color::Rgb(140, 140, 165)))];
+
+    match state.tuner_config.discovery_tier {
+        1 => spans.push(Span::styled(" Hidden Gems ", Style::default().fg(Color::Black).bg(emerald).add_modifier(Modifier::BOLD))),
+        2 => spans.push(Span::styled(" Acclaimed 82%+ ", Style::default().fg(Color::Black).bg(emerald).add_modifier(Modifier::BOLD))),
+        3 => spans.push(Span::styled(" Modern 2022+ ", Style::default().fg(Color::Black).bg(emerald).add_modifier(Modifier::BOLD))),
+        _ => {}
+    }
+    if state.tuner_config.finished_only {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(" Finished Only ", Style::default().fg(Color::Black).bg(persona.primary_color).add_modifier(Modifier::BOLD)));
+    }
+    if !state.tuner_config.hide_sequels {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(" Sequels Allowed ", Style::default().fg(Color::Black).bg(persona.accent_color).add_modifier(Modifier::BOLD)));
+    }
+    for t in &state.tuner_config.boosted_tags {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!(" +{} ", t), Style::default().fg(Color::Black).bg(emerald).add_modifier(Modifier::BOLD)));
+    }
+    for t in &state.tuner_config.muted_tags {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!(" -{} ", t), Style::default().fg(Color::Black).bg(red).add_modifier(Modifier::BOLD)));
+    }
+    if !state.tuner_config.dismissed_ids.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" {} Hidden ", state.tuner_config.dismissed_ids.len()),
+            Style::default().fg(Color::Rgb(180, 180, 200)).bg(Color::Rgb(40, 38, 55)),
+        ));
+    }
+    spans.push(Span::styled("  ([c] Reset · [f] Tune)", Style::default().fg(Color::Rgb(120, 120, 145))));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

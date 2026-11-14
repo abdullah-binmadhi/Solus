@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod calendar;
 pub mod cast;
 pub mod components;
 pub mod detail;
