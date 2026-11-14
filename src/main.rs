@@ -798,7 +798,34 @@ async fn main() -> anyhow::Result<()> {
                     state.anime_mal_ids.insert(anime_id, mal_id);
                 }
                 AppMessage::AnalyticsDataReady(analytics) => {
+                    let show_count = analytics.top_shows.len();
+                    if show_count > 0 {
+                        state.analytics_podium_idx = state.analytics_podium_idx.min(show_count - 1);
+                    } else {
+                        state.analytics_podium_idx = 0;
+                    }
+                    let cover_ids: Vec<i64> = analytics
+                        .top_shows
+                        .iter()
+                        .take(6)
+                        .map(|s| s.id)
+                        .filter(|id| !state.detail_cache.contains_key(id) && state.loading_covers.insert(*id))
+                        .collect();
                     state.analytics_data = Some(analytics);
+                    for id in cover_ids {
+                        let pool_c = pool.clone();
+                        let tx_c = tx.clone();
+                        tokio::spawn(async move {
+                            if let Ok(Some(anime)) = db::cache::get_anime(&pool_c, id).await {
+                                match download_cover_image(&anime, &pool_c).await {
+                                    Some(img) => { let _ = tx_c.send(AppMessage::CoverReady(id, img)).await; }
+                                    None => { let _ = tx_c.send(AppMessage::CoverFailed(id)).await; }
+                                }
+                            } else {
+                                let _ = tx_c.send(AppMessage::CoverFailed(id)).await;
+                            }
+                        });
+                    }
                 }
                 AppMessage::UpdateCheckResult(update_opt) => {
                     let was_checking = state.is_checking_update;
@@ -1030,7 +1057,7 @@ async fn main() -> anyhow::Result<()> {
                         ui::tailored::render_tailored_results(frame, &mut state);
                     }
                     Screen::TasteAnalytics => {
-                        ui::analytics::render(frame, &state);
+                        ui::analytics::render(frame, &mut state);
                     }
                     Screen::RemoteModal => {
                         render_base_screen(frame, &mut state, &home_data, &base_screen);
@@ -3666,6 +3693,43 @@ async fn handle_analytics(
             state.go_back();
             if state.screen == Screen::TasteAnalytics {
                 state.screen = Screen::Home;
+            }
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if let Some(ref data) = state.analytics_data {
+                if !data.top_shows.is_empty() {
+                    let len = data.top_shows.len();
+                    state.analytics_podium_idx = (state.analytics_podium_idx + len - 1) % len;
+                }
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            if let Some(ref data) = state.analytics_data {
+                if !data.top_shows.is_empty() {
+                    state.analytics_podium_idx = (state.analytics_podium_idx + 1) % data.top_shows.len();
+                }
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.analytics_list_scroll = state.analytics_list_scroll.saturating_add(1);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.analytics_list_scroll = state.analytics_list_scroll.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            let target_id = state
+                .analytics_data
+                .as_ref()
+                .and_then(|d| {
+                    d.top_shows
+                        .get(state.analytics_podium_idx)
+                        .or_else(|| d.top_shows.first())
+                })
+                .map(|s| s.id);
+            if let Some(id) = target_id {
+                if let Ok(Some(anime)) = db::cache::get_anime(pool, id).await {
+                    open_detail_from_anime(state, anime, pool, tx).await;
+                }
             }
         }
         KeyCode::Char('r') | KeyCode::Char('R') => {

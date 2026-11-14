@@ -432,6 +432,12 @@ pub struct AppState {
     /// Personal Anime Wrapped & viewing telemetry data
     pub analytics_data: Option<crate::db::user::UserAnalytics>,
 
+    /// Spotlight podium index inside Analytics (#0 = Crowned #1 show, cycled via Left/Right)
+    pub analytics_podium_idx: usize,
+
+    /// Scroll offset inside Analytics watchlist/recent log feed
+    pub analytics_list_scroll: usize,
+
     /// Metadata for an available application update if one was detected
     pub available_update: Option<crate::services::updater::UpdateInfo>,
 
@@ -596,6 +602,8 @@ impl AppState {
             ambilight_enabled: true,
             anime4k_mode:     crate::config::Anime4KMode::Off,
             analytics_data:   None,
+            analytics_podium_idx: 0,
+            analytics_list_scroll: 0,
             available_update: None,
             is_checking_update: false,
             is_updating:      false,
@@ -650,6 +658,7 @@ impl AppState {
             self.overlay_base = self.current_base_screen();
             self.screen = Screen::TasteAnalytics;
         }
+        self.analytics_list_scroll = 0;
     }
 
     /// Show a toast notification (auto-dismissed after 4 seconds).
