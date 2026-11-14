@@ -1382,16 +1382,11 @@ async fn handle_mouse(
                     // Smart Bento Tiers & Cards
                     if my >= rows_start && my < term_h.saturating_sub(ui::home::FOOTER_HEIGHT) {
                         let rel_y = my - rows_start;
-                        let row_h = ui::home::ROW_HEIGHT;
-                        let clicked_tier_idx = (rel_y / row_h) as usize;
                         let card_pitch = ui::home::CARD_WIDTH + ui::home::CARD_GAP;
                         let tiers = ui::home::build_shelf_tiers(home_data, term_w);
 
                         if !tiers.is_empty() {
                             let avail_h = term_h.saturating_sub(rows_start + ui::home::FOOTER_HEIGHT);
-                            let max_rows_that_fit = (avail_h / row_h).max(1) as usize;
-                            let visible_rows = tiers.len().min(max_rows_that_fit);
-
                             let active_tier_idx = tiers
                                 .iter()
                                 .position(|tier| match tier {
@@ -1402,9 +1397,17 @@ async fn handle_mouse(
                                     ui::home::ShelfTier::Single(r) => *r == state.active_row,
                                 })
                                 .unwrap_or(0);
-                            let start_idx = active_tier_idx.saturating_sub(visible_rows.saturating_sub(1));
+                            let (start_idx, heights) =
+                                ui::home::compute_shelf_layout(&tiers, avail_h, active_tier_idx);
 
-                            if clicked_tier_idx < visible_rows {
+                            let mut acc_y = 0u16;
+                            let clicked_tier_idx = heights.iter().position(|&h| {
+                                let in_band = rel_y >= acc_y && rel_y < acc_y + h;
+                                acc_y += h;
+                                in_band
+                            });
+
+                            if let Some(clicked_tier_idx) = clicked_tier_idx {
                                 let actual_tier_idx = start_idx + clicked_tier_idx;
                                 if let Some(tier) = tiers.get(actual_tier_idx) {
                                     match tier {

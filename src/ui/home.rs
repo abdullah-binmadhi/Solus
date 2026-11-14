@@ -27,7 +27,8 @@ pub const CARD_GAP: u16 = 2;
 pub const TOP_BAR_HEIGHT: u16 = 1;
 /// Height of the widescreen hero stage
 pub const HERO_HEIGHT: u16 = 10;
-/// Height of each shelf tier
+/// Default height of each shelf tier
+#[allow(dead_code)]
 pub const ROW_HEIGHT: u16 = 12;
 /// Height of the 2-row bottom command dock (1 top divider + 2 balanced rows)
 pub const FOOTER_HEIGHT: u16 = 3;
@@ -108,6 +109,68 @@ pub fn build_shelf_tiers(data: &HomeData, width: u16) -> Vec<ShelfTier> {
     }
 
     tiers
+}
+
+/// Compute `(start_idx, row_heights)` so visible tiers pack cleanly into `avail_h`
+/// without dropping an extra shelf to small 1–3 row boundary differences.
+pub fn compute_shelf_layout(
+    tiers: &[ShelfTier],
+    avail_h: u16,
+    active_tier_idx: usize,
+) -> (usize, Vec<u16>) {
+    if tiers.is_empty() || avail_h == 0 {
+        return (0, Vec::new());
+    }
+
+    let min_tier_h: u16 = 10;
+    let max_fit = (avail_h / min_tier_h).max(1) as usize;
+    let visible_rows = tiers.len().min(max_fit);
+    let start_idx = active_tier_idx.saturating_sub(visible_rows.saturating_sub(1));
+
+    let visible_slice: Vec<&ShelfTier> = tiers.iter().skip(start_idx).take(visible_rows).collect();
+    if visible_slice.len() == 1 {
+        let cap = match visible_slice[0] {
+            ShelfTier::BentoSplit => 12,
+            ShelfTier::Single(_) => 12,
+        };
+        return (start_idx, vec![avail_h.min(cap)]);
+    }
+
+    let mut heights = vec![min_tier_h; visible_slice.len()];
+    let mut rem = avail_h.saturating_sub(min_tier_h * visible_slice.len() as u16);
+
+    // 1. Ensure BentoSplit gets +2 rows (12 total) first for full 10-row bordered cards
+    for (idx, tier) in visible_slice.iter().enumerate() {
+        if matches!(tier, ShelfTier::BentoSplit) {
+            let add = rem.min(12u16.saturating_sub(heights[idx]));
+            heights[idx] += add;
+            rem -= add;
+        }
+    }
+
+    // 2. Bring every Single shelf up to 11 rows (1 header + 10-row card, zero dead padding)
+    for (idx, tier) in visible_slice.iter().enumerate() {
+        if rem == 0 {
+            break;
+        }
+        if matches!(tier, ShelfTier::Single(_)) && heights[idx] < 11 {
+            heights[idx] += 1;
+            rem -= 1;
+        }
+    }
+
+    // 3. Distribute any remaining breathing rows (up to 12 per tier) evenly
+    for h in &mut heights {
+        if rem == 0 {
+            break;
+        }
+        if *h < 12 {
+            *h += 1;
+            rem -= 1;
+        }
+    }
+
+    (start_idx, heights)
 }
 
 /// Compute the starting index for a row viewport so scrolling to the end never leaves blank slots.
@@ -1168,17 +1231,6 @@ fn render_rows(frame: &mut Frame, area: Rect, state: &mut AppState, data: &HomeD
         return;
     }
 
-    let max_rows_that_fit = (area.height / ROW_HEIGHT).max(1) as usize;
-    let visible_rows = tiers.len().min(max_rows_that_fit);
-    let constraints: Vec<Constraint> = (0..visible_rows)
-        .map(|_| Constraint::Length(ROW_HEIGHT))
-        .collect();
-
-    let tier_areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
-
     let active_tier_idx = tiers
         .iter()
         .position(|tier| match tier {
@@ -1189,9 +1241,15 @@ fn render_rows(frame: &mut Frame, area: Rect, state: &mut AppState, data: &HomeD
         })
         .unwrap_or(0);
 
-    let start_idx = active_tier_idx.saturating_sub(visible_rows.saturating_sub(1));
+    let (start_idx, heights) = compute_shelf_layout(&tiers, area.height, active_tier_idx);
+    let constraints: Vec<Constraint> = heights.iter().map(|&h| Constraint::Length(h)).collect();
 
-    for (i, tier) in tiers.iter().skip(start_idx).take(visible_rows).enumerate() {
+    let tier_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    for (i, tier) in tiers.iter().skip(start_idx).take(heights.len()).enumerate() {
         if i >= tier_areas.len() {
             break;
         }
@@ -1700,5 +1758,37 @@ mod tests {
             assert!(rendered.contains("Quit"), "missing full Quit label at w={}", width);
             assert!(rendered.contains("Settings"), "missing Settings at w={}", width);
         }
+    }
+
+    #[test]
+    fn test_three_shelves_fit_on_48_row_terminal_without_empty_gap() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut data = HomeData::empty();
+        data.continue_watching.push(Anime::default());
+        data.watchlist.push(Anime::default());
+        data.trending.push(Anime::default());
+        data.popular.push(Anime::default());
+        data.top_rated.push(Anime::default());
+        data.featured = Some(Anime::default());
+
+        let mut state = AppState::new();
+        let backend = TestBackend::new(148, 48);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render(f, &mut state, &data))
+            .expect("home screen should render 3 tiers at 148x48");
+
+        let buf = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..48 {
+            for x in 0..148 {
+                rendered.push_str(buf[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(rendered.contains("Continue Watching"), "missing row 1");
+        assert!(rendered.contains("Trending Now"), "missing row 2");
+        assert!(rendered.contains("Popular Picks"), "third shelf disappeared at 48 rows!");
+        assert!(rendered.contains("ACTIONS"), "missing bottom command dock");
     }
 }
