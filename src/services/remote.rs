@@ -262,31 +262,49 @@ pub async fn send_mpv_json_command(preferred_sock: &str, cmd_value: serde_json::
     let payload = format!("{}\n", cmd_value);
     let mut guard = CACHED_IPC.lock().await;
 
-    // 1. Zero-I/O Fast Path: try reusing existing open stream without scanning /tmp
+    // Reuse the cached stream, but never let a dead mpv connection block all
+    // later remote actions indefinitely.
     if let Some((_, ref mut stream)) = *guard {
-        if stream.write_all(payload.as_bytes()).await.is_ok()
-            && stream.flush().await.is_ok()
+        if tokio::time::timeout(
+            tokio::time::Duration::from_millis(750),
+            async {
+                stream.write_all(payload.as_bytes()).await?;
+                stream.flush().await
+            },
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
         {
             return true;
         }
+        *guard = None;
     }
+    drop(guard);
 
-    // 2. Fallback: resolve active socket on disk and connect fresh stream
+    // Resolve the socket only after the fast path fails, avoiding a /tmp scan
+    // on every healthy command.
     let target_sock = match resolve_active_socket(preferred_sock).await {
         Some(s) => s,
-        None => {
-            *guard = None;
-            return false;
-        }
+        None => return false,
     };
 
     if let Some(mut stream) = connect_remote_ipc(&target_sock).await {
-        let ok = stream.write_all(payload.as_bytes()).await.is_ok() && stream.flush().await.is_ok();
-        *guard = Some((target_sock, stream));
+        let ok = tokio::time::timeout(
+            tokio::time::Duration::from_millis(750),
+            async {
+                stream.write_all(payload.as_bytes()).await?;
+                stream.flush().await
+            },
+        )
+        .await
+        .is_ok_and(|result| result.is_ok());
+        if ok {
+            let mut guard = CACHED_IPC.lock().await;
+            *guard = Some((target_sock, stream));
+        }
         return ok;
     }
 
-    *guard = None;
     false
 }
 
@@ -295,8 +313,14 @@ pub async fn send_mpv_json_command(preferred_sock: &str, cmd_value: serde_json::
 pub async fn quit_active_player() {
     let mut guard = CACHED_IPC.lock().await;
     if let Some((_, ref mut stream)) = *guard {
-        let _ = stream.write_all(b"{\"command\": [\"quit\"]}\n").await;
-        let _ = stream.flush().await;
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_millis(750),
+            async {
+                stream.write_all(b"{\"command\": [\"quit\"]}\n").await?;
+                stream.flush().await
+            },
+        )
+        .await;
     } else {
         drop(guard);
         #[cfg(unix)]
@@ -1306,6 +1330,8 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     let lastEpisodesKey = '';
     let lastSeekSent = 0;
     let lastVolSent = 0;
+    let wsGeneration = 0;
+    let reconnectTimer = null;
 
     const scrubber = document.getElementById('scrubber');
     const playBtn = document.getElementById('play-btn');
@@ -1454,7 +1480,7 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
       }
 
       // Only rebuild Episodes List if episode catalog or current episode changed
-      const epKey = `${data.episode}:${(data.episodes || []).length}`;
+      const epKey = JSON.stringify([data.episode, data.episodes || []]);
       if (epKey !== lastEpisodesKey) {
         lastEpisodesKey = epKey;
         renderEpisodesList(data.episodes, data.episode);
@@ -1578,6 +1604,11 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
     function connectWs() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const url = `${proto}//${location.host}/ws`;
+      const generation = ++wsGeneration;
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
 
       try {
         ws = new WebSocket(url);
@@ -1594,16 +1625,19 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
         };
 
         ws.onclose = () => {
+          if (generation !== wsGeneration) return;
           document.getElementById('conn-badge').className = 'status-badge standby';
           document.getElementById('conn-text').innerText = 'RECONNECTING';
-          setTimeout(connectWs, 1200);
+          reconnectTimer = setTimeout(connectWs, 1200);
         };
 
         ws.onerror = () => {
-          if (ws) ws.close();
+          if (generation === wsGeneration && ws) ws.close();
         };
       } catch (e) {
-        setTimeout(connectWs, 2000);
+        if (generation === wsGeneration) {
+          reconnectTimer = setTimeout(connectWs, 2000);
+        }
       }
     }
 
@@ -1616,8 +1650,12 @@ const REMOTE_HTML: &str = r#"<!DOCTYPE html>
 
       // Sub-millisecond WebSocket frame if connected
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(body));
-        return;
+        try {
+          ws.send(JSON.stringify(body));
+          return;
+        } catch (e) {
+          // The socket can close between readyState and send; use HTTP below.
+        }
       }
 
       // HTTP fallback
