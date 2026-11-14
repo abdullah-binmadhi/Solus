@@ -2,8 +2,14 @@ name: release
 
 on:
   push:
+    branches:
+      - "main"
     tags:
       - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -83,15 +89,56 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
+      - name: prepare release metadata
+        id: meta
+        shell: bash
+        run: |
+          commit_ts=$(git show -s --format=%ct "${{ github.sha }}" || echo "0")
+          short_sha="${GITHUB_SHA::7}"
+          pkg_ver=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          commit_msg=$(git log -1 --pretty=%s "${{ github.sha }}" || echo "Latest main build")
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+            release_name="Solus ${release_tag}"
+          else
+            release_tag="v${pkg_ver}-rolling"
+            release_name="Solus v${pkg_ver} (${short_sha})"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -f "$release_tag" "${{ github.sha }}"
+            git push -f origin "refs/tags/$release_tag"
+          fi
+
+          {
+            echo "tag=$release_tag"
+            echo "name=$release_name"
+            echo "commit_ts=$commit_ts"
+            echo "short_sha=$short_sha"
+            echo "commit_msg=$commit_msg"
+          } >> "$GITHUB_OUTPUT"
+
       - name: create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          body: |
+            <!-- solus-sha:${{ github.sha }} -->
+            <!-- solus-ts:${{ steps.meta.outputs.commit_ts }} -->
+            Automated build for commit `${{ steps.meta.outputs.short_sha }}`: ${{ steps.meta.outputs.commit_msg }}
           files: artifacts/*
           draft: false
+          make_latest: true
           generate_release_notes: true

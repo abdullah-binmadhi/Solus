@@ -44,6 +44,26 @@ enum AppMessage {
     CoverReady(i64, image::DynamicImage),
     /// Cover image could not be downloaded or decoded (anime_id)
     CoverFailed(i64),
+    /// Off-thread pre-scaled & pre-encoded Home card/banner protocols ready for instant rendering
+    PreloadCoverReady {
+        gen: Option<u64>,
+        anime_id: i64,
+        card_proto: Box<dyn ratatui_image::protocol::StatefulProtocol>,
+        banner_proto: Box<dyn ratatui_image::protocol::StatefulProtocol>,
+    },
+    /// Home preload item failed to download or decode
+    PreloadCoverFailed {
+        gen: Option<u64>,
+        anime_id: i64,
+    },
+    /// Non-blocking startup dependency detection finished
+    DependenciesReady {
+        ani_cli: bool,
+        mpv: bool,
+        iina: bool,
+        vlc: bool,
+        prompt_setup: bool,
+    },
     /// Watchlist changed — send fresh list to update home row immediately
     WatchlistUpdated(Vec<db::cache::Anime>),
     /// Continue Watching changed — send fresh list to update home row immediately
@@ -225,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Message channel (background tasks → UI loop) ──────────────────────────
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<AppMessage>(64);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AppMessage>(256);
 
     // Clean up any leftover update artifacts from previous update sessions
     services::updater::cleanup_legacy_update_files();
@@ -242,14 +262,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| ui::home::HomeData::empty());
     let has_cached = !cached_home.is_empty();
     let mut home_data = cached_home;
-    if has_cached {
-        state.is_loading = false;
-        refresh_home_cover(&mut state, &home_data, &pool, &tx);
-    }
-    refresh_dependency_status(&mut state);
-    if !state.has_any_player() {
-        state.open_setup();
-    }
+    // Detect runtime dependencies (ani-cli / mpv / vlc / iina) asynchronously so Windows PATH scans never block boot.
+    spawn_dependency_check(&tx, true);
 
     // ── Local LAN Mobile Remote Companion ─────────────────────────────────────
     let remote_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -292,6 +306,9 @@ async fn main() -> anyhow::Result<()> {
         picker.protocol_type = ratatui_image::picker::ProtocolType::Iterm2;
     }
     state.picker = Some(picker);
+    if has_cached {
+        start_home_preload(&home_data, &mut state, &pool, &tx);
+    }
 
     // ── Startup: kick off background sync ─────────────────────────────────────
     {
@@ -319,46 +336,12 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Startup: non-blocking background auto-update check ────────────────────
     if cfg.update.check_on_startup {
-        let tx_update = tx.clone();
-        let pool_update = pool.clone();
-        let auto_install = cfg.update.auto_install;
-        let check_interval = cfg.update.check_interval;
-        tokio::spawn(async move {
-            let now = unix_now();
-            let should_check = match db::sync::last_synced(&pool_update, "update_check").await {
-                Ok(Some(last)) => (now - last) >= check_interval as i64,
-                _ => true,
-            };
-
-            if should_check {
-                let client = reqwest::Client::new();
-                let current_ver = env!("CARGO_PKG_VERSION");
-                if let Ok(update_opt) = services::updater::check_for_updates(&client, current_ver).await {
-                    let _ = db::sync::mark_synced(&pool_update, "update_check", now).await;
-                    if let Some(ref info) = update_opt {
-                        if auto_install && !info.is_homebrew {
-                            let download_url = info.download_url.clone();
-                            let target_ver = info.latest_version.clone();
-                            let tx_dl = tx_update.clone();
-                            tokio::spawn(async move {
-                                let _ = services::updater::download_and_install_update(
-                                    &client,
-                                    &download_url,
-                                    &target_ver,
-                                    tx_dl,
-                                )
-                                .await;
-                            });
-                        }
-                    }
-                    let _ = tx_update.send(AppMessage::UpdateCheckResult(update_opt)).await;
-                }
-            }
-        });
+        spawn_update_check(&pool, &tx, cfg.update.auto_install, cfg.update.check_interval, true);
     }
 
     let mut needs_redraw = true;
     let mut last_screen = state.screen.clone();
+    let mut last_update_poll = std::time::Instant::now();
 
     // ── Main event loop ───────────────────────────────────────────────────────
     loop {
@@ -367,10 +350,14 @@ async fn main() -> anyhow::Result<()> {
             needs_redraw = true;
             match msg {
                 AppMessage::HomeData(data) => {
+                    let had_home_data = !home_data.is_empty();
                     home_data        = *data;
-                    state.is_loading = false;
-                    refresh_home_cover(&mut state, &home_data, &pool, &tx);
-                    prefetch_all_home_covers(&home_data, &mut state, &pool, &tx);
+                    if state.is_loading || !had_home_data {
+                        start_home_preload(&home_data, &mut state, &pool, &tx);
+                    } else {
+                        refresh_home_cover(&mut state, &home_data, &pool, &tx);
+                        prefetch_all_home_covers(&home_data, &mut state, &pool, &tx);
+                    }
                 }
                 AppMessage::PlaybackLog(line) => {
                     state.push_log(line);
@@ -417,7 +404,6 @@ async fn main() -> anyhow::Result<()> {
                     let font_size = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
                     let card_img = prepare_card_cover_with_font(img.clone(), font_size);
                     let portrait_img = prepare_portrait_cover_with_font(img.clone(), font_size);
-                    let thumb_img = prepare_16_9_thumbnail_cover(img, font_size);
                     if state.picker.is_some() {
                         insert_cover_protocols_if_absent(&mut state, anime_id, card_img.clone(), portrait_img);
                     }
@@ -425,7 +411,7 @@ async fn main() -> anyhow::Result<()> {
                         let base_theme = ui::theme::get_theme(state.theme_index);
                         state.ambilight_theme = Some(ui::theme::extract_ambilight_palette(&card_img, base_theme));
                         if state.current_card_img.is_none() {
-                            state.current_card_img = Some(thumb_img);
+                            state.current_card_img = Some(prepare_16_9_thumbnail_cover(img, font_size));
                             state.episode_fallback_thumbnails.clear();
                         }
                     }
@@ -442,6 +428,33 @@ async fn main() -> anyhow::Result<()> {
                         && matches!(state.screen, Screen::Detail | Screen::Home)
                     {
                         state.show_toast("Cover image unavailable", unix_now());
+                    }
+                }
+                AppMessage::PreloadCoverReady { gen, anime_id, card_proto, banner_proto } => {
+                    state.loading_covers.remove(&anime_id);
+                    state.cover_cache.entry(anime_id).or_insert(card_proto);
+                    state.banner_cache.entry(anime_id).or_insert(banner_proto);
+                    if state.cover_anime_id == Some(anime_id) {
+                        state.cover_failed_anime_id = None;
+                    }
+                    if let Some(g) = gen {
+                        if state.advance_preload(g) {
+                            refresh_home_cover(&mut state, &home_data, &pool, &tx);
+                        }
+                    }
+                }
+                AppMessage::PreloadCoverFailed { gen, anime_id } => {
+                    state.loading_covers.remove(&anime_id);
+                    if let Some(g) = gen {
+                        if state.advance_preload(g) {
+                            refresh_home_cover(&mut state, &home_data, &pool, &tx);
+                        }
+                    }
+                }
+                AppMessage::DependenciesReady { ani_cli, mpv, iina, vlc, prompt_setup } => {
+                    state.set_dependencies(ani_cli, mpv, iina, vlc);
+                    if prompt_setup && !state.has_any_player() && state.screen != Screen::Setup {
+                        state.open_setup();
                     }
                 }
                 AppMessage::WatchlistUpdated(list) => {
@@ -796,6 +809,10 @@ async fn main() -> anyhow::Result<()> {
                         if is_brew {
                             state.available_update = Some(info);
                             state.show_toast(format!("❖ Solus {} available: brew upgrade solus", new_ver), unix_now());
+                        } else if cfg.update.auto_install && !was_checking {
+                            state.is_updating = true;
+                            state.available_update = Some(info);
+                            state.show_toast(format!("❖ Updating Solus to {} in background...", new_ver), unix_now());
                         } else if state.screen != Screen::Playback {
                             // Automatically open the update modal popup so user doesn't miss it!
                             state.open_update_modal(info);
@@ -810,10 +827,12 @@ async fn main() -> anyhow::Result<()> {
                 AppMessage::UpdateProgress(pct, spd) => {
                     state.is_updating = true;
                     state.update_progress = Some((pct, spd.clone()));
-                    state.update_modal_phase = Some(state::UpdateModalPhase::Downloading {
-                        progress_pct: pct,
-                        speed: spd,
-                    });
+                    if matches!(state.update_modal_phase, Some(state::UpdateModalPhase::Downloading { .. })) {
+                        state.update_modal_phase = Some(state::UpdateModalPhase::Downloading {
+                            progress_pct: pct,
+                            speed: spd,
+                        });
+                    }
                 }
                 AppMessage::UpdateSuccess(version) => {
                     state.is_updating = false;
@@ -822,6 +841,10 @@ async fn main() -> anyhow::Result<()> {
                     state.update_modal_phase = Some(state::UpdateModalPhase::RestartRequired {
                         new_version: version.clone(),
                     });
+                    if state.screen != Screen::UpdateModal && state.screen != Screen::Playback {
+                        state.overlay_base = state.current_base_screen();
+                        state.screen = Screen::UpdateModal;
+                    }
                     state.show_toast(format!("󰄬 Solus updated to {}! Press Enter to exit.", version), unix_now());
                 }
                 AppMessage::UpdateFailed(err) => {
@@ -961,7 +984,7 @@ async fn main() -> anyhow::Result<()> {
                 match state.screen {
                     Screen::Home => {
                         if state.is_loading {
-                            render_loading(frame);
+                            render_loading(frame, &state);
                         } else {
                             ui::home::render(frame, &mut state, &home_data);
                         }
@@ -1066,6 +1089,17 @@ async fn main() -> anyhow::Result<()> {
         if state.should_quit {
             break;
         }
+
+        if cfg.update.check_on_startup
+            && !state.is_updating
+            && !state.is_loading
+            && state.available_update.is_none()
+            && !matches!(state.update_modal_phase, Some(state::UpdateModalPhase::RestartRequired { .. }))
+            && last_update_poll.elapsed() >= Duration::from_secs(180)
+        {
+            last_update_poll = std::time::Instant::now();
+            spawn_update_check(&pool, &tx, cfg.update.auto_install, cfg.update.check_interval, false);
+        }
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
@@ -1093,6 +1127,20 @@ async fn handle_key(
     // Ctrl+C works everywhere
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         state.should_quit = true;
+        return;
+    }
+
+    if state.is_loading && state.screen == Screen::Home {
+        match key.code {
+            KeyCode::Esc => {
+                state.skip_preload();
+                refresh_home_cover(state, home_data, pool, tx);
+            }
+            KeyCode::Char('q') => {
+                state.should_quit = true;
+            }
+            _ => {}
+        }
         return;
     }
 
@@ -1970,17 +2018,21 @@ async fn open_detail_from_anime(
     let title_english = anime.title_english.clone();
     let should_check_airing = anime.status.as_deref() == Some("RELEASING") || anime.next_airing_episode.is_none();
     state.open_detail(anime);
-    if let Some(blob) = state.selected_anime.as_ref().and_then(|a| a.cover_blob.as_ref()) {
-        if let Ok(dyn_img) = image::load_from_memory(blob) {
+    let cached_blob = match state.selected_anime.as_ref().and_then(|a| a.cover_blob.clone()) {
+        Some(b) => Some(b),
+        None => db::cache::get_cover_blob(pool, anime_id).await.ok().flatten(),
+    };
+    if let Some(blob) = cached_blob {
+        if let Ok(dyn_img) = image::load_from_memory(&blob) {
             let font_size = state.picker.as_ref().map(|p| p.font_size).unwrap_or((12, 24));
             let card_img = prepare_card_cover_with_font(dyn_img.clone(), font_size);
             let portrait_img = prepare_portrait_cover_with_font(dyn_img.clone(), font_size);
             let thumb_img = prepare_16_9_thumbnail_cover(dyn_img, font_size);
-            if let Some(ref mut picker) = state.picker {
+            if let Some(picker) = state.picker {
                 state
                     .detail_cache
                     .entry(anime_id)
-                    .or_insert_with(|| picker.new_resize_protocol(portrait_img));
+                    .or_insert_with(|| build_stateful_protocol(picker, portrait_img));
             }
             let base_theme = ui::theme::get_theme(state.theme_index);
             state.ambilight_theme = Some(ui::theme::extract_ambilight_palette(&card_img, base_theme));
@@ -2127,11 +2179,65 @@ fn trigger_stream_detection(
 }
 
 /// Ensure the Home banner cover follows the currently highlighted anime.
+/// Shared HTTP/2 connection-pooled client for concurrent cover downloads.
+fn cover_http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(12)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+/// Bounded concurrency semaphore so startup preloading saturates keep-alive connections without socket/API spikes.
+fn cover_download_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| tokio::sync::Semaphore::new(12))
+}
+
+/// Build a `StatefulProtocol` safely across UI and background worker threads without Kitty ID collisions.
+fn build_stateful_protocol(
+    mut picker: ratatui_image::picker::Picker,
+    img: image::DynamicImage,
+) -> Box<dyn ratatui_image::protocol::StatefulProtocol> {
+    static NEXT_KITTY_IMAGE_ID: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(100_000);
+    if picker.protocol_type == ratatui_image::picker::ProtocolType::Kitty {
+        let id = NEXT_KITTY_IMAGE_ID
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .max(1);
+        let source = ratatui_image::protocol::ImageSource::new(img, picker.font_size);
+        Box::new(ratatui_image::protocol::kitty::StatefulKitty::new(
+            source,
+            id,
+            picker.is_tmux,
+        ))
+    } else {
+        picker.new_resize_protocol(img)
+    }
+}
+
+/// Standard inner image cell dimensions (`20 x 6`) for pre-encoding card & hero covers off-thread.
+fn home_card_preencode_area() -> ratatui::layout::Rect {
+    ratatui::layout::Rect::new(
+        0,
+        0,
+        ui::home::CARD_WIDTH.saturating_sub(2),
+        ui::home::CARD_HEIGHT.saturating_sub(4),
+    )
+}
+
+/// Return true when Home card and banner protocols are cached for `anime_id`.
+fn has_home_cached_covers(state: &AppState, anime_id: i64) -> bool {
+    state.cover_cache.contains_key(&anime_id) && state.banner_cache.contains_key(&anime_id)
+}
+
 /// Return true when card, banner, and detail image protocols are already cached for `anime_id`.
 fn has_all_cached_covers(state: &AppState, anime_id: i64) -> bool {
-    state.cover_cache.contains_key(&anime_id)
-        && state.banner_cache.contains_key(&anime_id)
-        && state.detail_cache.contains_key(&anime_id)
+    has_home_cached_covers(state, anime_id) && state.detail_cache.contains_key(&anime_id)
 }
 
 /// Insert card, banner, and detail protocols only when absent so active Kitty image IDs stay stable.
@@ -2141,21 +2247,21 @@ fn insert_cover_protocols_if_absent(
     card_img: image::DynamicImage,
     portrait_img: image::DynamicImage,
 ) {
-    let Some(ref mut picker) = state.picker else {
+    let Some(picker) = state.picker else {
         return;
     };
     state
         .cover_cache
         .entry(anime_id)
-        .or_insert_with(|| picker.new_resize_protocol(card_img.clone()));
+        .or_insert_with(|| build_stateful_protocol(picker, card_img.clone()));
     state
         .banner_cache
         .entry(anime_id)
-        .or_insert_with(|| picker.new_resize_protocol(card_img));
+        .or_insert_with(|| build_stateful_protocol(picker, card_img));
     state
         .detail_cache
         .entry(anime_id)
-        .or_insert_with(|| picker.new_resize_protocol(portrait_img));
+        .or_insert_with(|| build_stateful_protocol(picker, portrait_img));
 }
 
 /// Fetch cover artwork only when missing from caches and not already in flight.
@@ -2167,6 +2273,63 @@ fn ensure_cover_fetch(
 ) {
     if !has_all_cached_covers(state, anime.id) && state.loading_covers.insert(anime.id) {
         trigger_cover_download(anime.clone(), pool.clone(), tx.clone());
+    }
+}
+
+/// Collect every unique anime across all Home shelves in visual top-to-bottom priority order.
+fn collect_unique_home_anime(data: &ui::home::HomeData) -> Vec<db::cache::Anime> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered = Vec::new();
+
+    if let Some(ref featured) = data.featured {
+        if seen.insert(featured.id) {
+            ordered.push(featured.clone());
+        }
+    }
+
+    for shelf in [
+        &data.continue_watching,
+        &data.watchlist,
+        &data.trending,
+        &data.popular,
+        &data.top_rated,
+        &data.seasonal,
+    ] {
+        for anime in shelf {
+            if seen.insert(anime.id) {
+                ordered.push(anime.clone());
+            }
+        }
+    }
+
+    ordered
+}
+
+/// Spawn parallel preloading for every uncached Home cover while gating behind the loading screen.
+fn start_home_preload(
+    data: &ui::home::HomeData,
+    state: &mut AppState,
+    pool: &sqlx::SqlitePool,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let Some(picker) = state.picker else {
+        state.is_loading = false;
+        return;
+    };
+
+    let pending: Vec<db::cache::Anime> = collect_unique_home_anime(data)
+        .into_iter()
+        .filter(|anime| !has_home_cached_covers(state, anime.id) && state.loading_covers.insert(anime.id))
+        .collect();
+
+    let gen = state.begin_preload(pending.len());
+    if pending.is_empty() {
+        refresh_home_cover(state, data, pool, tx);
+        return;
+    }
+
+    for anime in pending {
+        trigger_home_cover_preload(anime, pool.clone(), tx.clone(), picker, Some(gen));
     }
 }
 
@@ -2192,7 +2355,13 @@ fn refresh_home_cover(
     state.cover_state    = None;
     state.cover_failed_anime_id = None;
     state.banner_progress = None;
-    ensure_cover_fetch(state, &anime, pool, tx);
+    if !has_home_cached_covers(state, anime_id) && state.loading_covers.insert(anime_id) {
+        if let Some(picker) = state.picker {
+            trigger_home_cover_preload(anime, pool.clone(), tx.clone(), picker, None);
+        } else {
+            trigger_cover_download(anime, pool.clone(), tx.clone());
+        }
+    }
     trigger_banner_progress(anime_id, pool.clone(), tx.clone());
 }
 
@@ -2202,18 +2371,90 @@ fn prefetch_all_home_covers(
     pool: &sqlx::SqlitePool,
     tx: &tokio::sync::mpsc::Sender<AppMessage>,
 ) {
-    let mut items: Vec<db::cache::Anime> = Vec::new();
-    // Prioritize visible viewport cards first to prevent network & thread starvation on startup
-    items.extend(data.continue_watching.iter().take(6).cloned());
-    items.extend(data.trending.iter().take(6).cloned());
-    items.extend(data.popular.iter().take(6).cloned());
-    items.extend(data.seasonal.iter().take(6).cloned());
-    items.extend(data.watchlist.iter().take(6).cloned());
-    items.extend(data.top_rated.iter().take(6).cloned());
-
-    for anime in items {
-        ensure_cover_fetch(state, &anime, pool, tx);
+    for anime in collect_unique_home_anime(data) {
+        if !has_home_cached_covers(state, anime.id) && state.loading_covers.insert(anime.id) {
+            if let Some(picker) = state.picker {
+                trigger_home_cover_preload(anime, pool.clone(), tx.clone(), picker, None);
+            } else {
+                trigger_cover_download(anime, pool.clone(), tx.clone());
+            }
+        }
     }
+}
+
+/// Spawn a non-blocking background update check (and auto-install when enabled).
+fn spawn_update_check(
+    pool: &sqlx::SqlitePool,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+    auto_install: bool,
+    check_interval: u64,
+    respect_interval: bool,
+) {
+    let tx_update = tx.clone();
+    let pool_update = pool.clone();
+    tokio::spawn(async move {
+        let now = unix_now();
+        let should_check = if respect_interval && check_interval > 0 {
+            match db::sync::last_synced(&pool_update, "update_check").await {
+                Ok(Some(last)) => (now - last) >= check_interval as i64,
+                _ => true,
+            }
+        } else {
+            true
+        };
+
+        if !should_check {
+            return;
+        }
+
+        let client = reqwest::Client::new();
+        let current_ver = env!("CARGO_PKG_VERSION");
+        if let Ok(update_opt) = services::updater::check_for_updates(&client, current_ver).await {
+            let _ = db::sync::mark_synced(&pool_update, "update_check", now).await;
+            if let Some(ref info) = update_opt {
+                if auto_install && !info.is_homebrew {
+                    let download_url = info.download_url.clone();
+                    let target_ver = info.latest_version.clone();
+                    let tx_dl = tx_update.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = services::updater::download_and_install_update(
+                            &client,
+                            &download_url,
+                            &target_ver,
+                            tx_dl.clone(),
+                        )
+                        .await
+                        {
+                            let _ = tx_dl.send(AppMessage::UpdateFailed(e.to_string())).await;
+                        }
+                    });
+                }
+            }
+            let _ = tx_update.send(AppMessage::UpdateCheckResult(update_opt)).await;
+        }
+    });
+}
+
+/// Detect runtime player & CLI dependencies in a blocking worker without slowing startup UI render.
+fn spawn_dependency_check(
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+    prompt_setup: bool,
+) {
+    let tx_dep = tx.clone();
+    tokio::spawn(async move {
+        let deps = tokio::task::spawn_blocking(api::player::detect_dependencies)
+            .await
+            .unwrap_or((false, false, false, false));
+        let _ = tx_dep
+            .send(AppMessage::DependenciesReady {
+                ani_cli: deps.0,
+                mpv: deps.1,
+                iina: deps.2,
+                vlc: deps.3,
+                prompt_setup,
+            })
+            .await;
+    });
 }
 
 fn trigger_banner_progress(
@@ -4758,6 +4999,75 @@ fn preload_nearby_episode_thumbnails(
     }
 }
 
+/// Fetch raw cover image bytes from memory, SQLite `cover_blob`, or the shared pooled HTTP client.
+async fn fetch_cover_bytes(
+    anime: &db::cache::Anime,
+    pool: &sqlx::SqlitePool,
+) -> Option<Vec<u8>> {
+    if let Some(ref blob) = anime.cover_blob {
+        return Some(blob.clone());
+    }
+    if let Ok(Some(blob)) = db::cache::get_cover_blob(pool, anime.id).await {
+        return Some(blob);
+    }
+    let url = anime.cover_url.as_ref()?;
+    let _permit = cover_download_semaphore().acquire().await.ok()?;
+    let resp = cover_http_client().get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?.to_vec();
+    let _ = db::cache::store_cover_blob(pool, anime.id, &bytes).await;
+    Some(bytes)
+}
+
+/// Spawn a worker task that fetches, full-quality scales, and pre-encodes Home card/banner protocols off the UI thread.
+fn trigger_home_cover_preload(
+    anime: db::cache::Anime,
+    pool: sqlx::SqlitePool,
+    tx: tokio::sync::mpsc::Sender<AppMessage>,
+    picker: ratatui_image::picker::Picker,
+    gen: Option<u64>,
+) {
+    let anime_id = anime.id;
+    tokio::spawn(async move {
+        let Some(bytes) = fetch_cover_bytes(&anime, &pool).await else {
+            let _ = tx.send(AppMessage::PreloadCoverFailed { gen, anime_id }).await;
+            return;
+        };
+
+        let encoded = tokio::task::spawn_blocking(move || {
+            let img = image::load_from_memory(&bytes).ok()?;
+            let card_img = prepare_card_cover_with_font(img, picker.font_size);
+            let card_area = home_card_preencode_area();
+            let mut card_proto = build_stateful_protocol(picker, card_img.clone());
+            let mut banner_proto = build_stateful_protocol(picker, card_img);
+            card_proto.resize_encode(&ratatui_image::Resize::Fit(None), picker.background_color, card_area);
+            banner_proto.resize_encode(&ratatui_image::Resize::Fit(None), picker.background_color, card_area);
+            Some((card_proto, banner_proto))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        match encoded {
+            Some((card_proto, banner_proto)) => {
+                let _ = tx
+                    .send(AppMessage::PreloadCoverReady {
+                        gen,
+                        anime_id,
+                        card_proto,
+                        banner_proto,
+                    })
+                    .await;
+            }
+            None => {
+                let _ = tx.send(AppMessage::PreloadCoverFailed { gen, anime_id }).await;
+            }
+        }
+    });
+}
+
 /// Spawn a background task to fetch (or decode a cached) cover and send CoverReady.
 fn trigger_cover_download(
     anime: db::cache::Anime,
@@ -4772,20 +5082,16 @@ fn trigger_cover_download(
     });
 }
 
-/// Decode blob from DB or fetch from URL, cache the blob on success.
+/// Decode blob from DB or fetch via shared HTTP pool, caching the blob on success.
 async fn download_cover_image(
     anime: &db::cache::Anime,
     pool:  &sqlx::SqlitePool,
 ) -> Option<image::DynamicImage> {
-    if let Some(ref blob) = anime.cover_blob {
-        return image::load_from_memory(blob).ok();
-    }
-    let url   = anime.cover_url.as_ref()?;
-    let resp  = reqwest::get(url).await.ok()?;
-    let bytes = resp.bytes().await.ok()?;
-    let img   = image::load_from_memory(&bytes).ok()?;
-    let _     = db::cache::store_cover_blob(pool, anime.id, &bytes).await;
-    Some(img)
+    let bytes = fetch_cover_bytes(anime, pool).await?;
+    tokio::task::spawn_blocking(move || image::load_from_memory(&bytes).ok())
+        .await
+        .ok()
+        .flatten()
 }
 
 fn trigger_episode_metadata_fetch(
@@ -4937,7 +5243,7 @@ async fn download_episode_thumbnail(
 
 // ─── Loading screen ───────────────────────────────────────────────────────────
 
-fn render_loading(frame: &mut ratatui::Frame) {
+fn render_loading(frame: &mut ratatui::Frame, state: &AppState) {
     use ratatui::{
         layout::{Alignment, Constraint, Direction, Layout},
         style::{Color, Modifier, Style},
@@ -4946,28 +5252,68 @@ fn render_loading(frame: &mut ratatui::Frame) {
     };
 
     let area = frame.area();
+    let has_progress = state.preload_total > 0;
+    let block_h = if has_progress { 6 } else { 3 };
     let vert = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
-            Constraint::Length(3),
+            Constraint::Length(block_h),
             Constraint::Min(0),
         ])
         .split(area);
 
-    let msg = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "SOLUS",
-            Style::default()
-                .fg(Color::Rgb(180, 0, 255))
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "Fetching content...",
-            Style::default().fg(Color::Rgb(120, 120, 140)),
-        )),
-    ])
-    .alignment(Alignment::Center);
+    let mut lines = vec![Line::from(Span::styled(
+        "SOLUS",
+        Style::default()
+            .fg(Color::Rgb(180, 0, 255))
+            .add_modifier(Modifier::BOLD),
+    ))];
+
+    if has_progress {
+        let total = state.preload_total.max(1);
+        let done = state.preload_done.min(total);
+        let pct = (done * 100) / total;
+        let bar_w: usize = (area.width.saturating_sub(16) as usize).clamp(16, 36);
+        let filled = ((done * bar_w) + (total / 2)) / total;
+        let filled = filled.min(bar_w);
+        let empty = bar_w.saturating_sub(filled);
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("Loading library artwork  {} / {} ", done, total),
+                Style::default().fg(Color::Rgb(210, 210, 230)),
+            ),
+            Span::styled(
+                format!("({}%)", pct),
+                Style::default()
+                    .fg(Color::Rgb(180, 0, 255))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "━".repeat(filled),
+                Style::default().fg(Color::Rgb(180, 0, 255)),
+            ),
+            Span::styled(
+                "─".repeat(empty),
+                Style::default().fg(Color::Rgb(65, 65, 85)),
+            ),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Esc skip  •  q quit",
+            Style::default().fg(Color::Rgb(115, 115, 138)),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Fetching catalog...",
+            Style::default().fg(Color::Rgb(140, 140, 165)),
+        )));
+    }
+
+    let msg = Paragraph::new(lines).alignment(Alignment::Center);
 
     frame.render_widget(msg, vert[1]);
 }
@@ -4982,7 +5328,7 @@ fn render_base_screen(
         Screen::Detail if state.selected_anime.is_some() => ui::detail::render(frame, state),
         _ => {
             if state.is_loading {
-                render_loading(frame);
+                render_loading(frame, state);
             } else {
                 ui::home::render(frame, state, home_data);
             }
@@ -5142,5 +5488,99 @@ mod tests {
 
         assert_eq!(state.cover_anime_id, Some(102));
         assert!(!state.loading_covers.contains(&102));
+    }
+
+    #[test]
+    fn test_collect_unique_home_anime_dedups_and_includes_past_six() {
+        let mut data = ui::home::HomeData::empty();
+        for id in 1..=10 {
+            data.trending.push(db::cache::Anime {
+                id,
+                title_romaji: format!("Show {}", id),
+                ..Default::default()
+            });
+        }
+        // Duplicate an ID in watchlist and add a distinct ID beyond Trending's 6th card.
+        data.watchlist.push(data.trending[0].clone());
+        data.watchlist.push(db::cache::Anime {
+            id: 99,
+            title_romaji: "Unique Watchlist".to_string(),
+            ..Default::default()
+        });
+        data.featured = Some(data.trending[0].clone());
+
+        let collected = collect_unique_home_anime(&data);
+        let ids: Vec<i64> = collected.iter().map(|a| a.id).collect();
+        assert_eq!(ids.len(), 11);
+        assert!(ids.contains(&10));
+        assert!(ids.contains(&99));
+        assert_eq!(ids.iter().filter(|&&id| id == 1).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_start_home_preload_preencodes_all_cached_blobs_and_unlocks_home() {
+        let pool = db::init(":memory:").await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AppMessage>(32);
+
+        let mut state = AppState::new();
+        let mut picker = ratatui_image::picker::Picker::new((12, 24));
+        picker.protocol_type = ratatui_image::picker::ProtocolType::Iterm2;
+        state.picker = Some(picker);
+
+        // Encode valid PNG bytes for two cards (one beyond index 6 in trending).
+        let img = image::DynamicImage::new_rgb8(24, 36);
+        let mut png_bytes = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .unwrap();
+
+        let mut data = ui::home::HomeData::empty();
+        for id in 1..=8 {
+            data.trending.push(db::cache::Anime {
+                id,
+                title_romaji: format!("Show {}", id),
+                cover_blob: Some(png_bytes.clone()),
+                ..Default::default()
+            });
+        }
+
+        start_home_preload(&data, &mut state, &pool, &tx);
+        assert!(state.is_loading);
+        assert_eq!(state.preload_total, 8);
+        assert_eq!(state.preload_done, 0);
+
+        for _ in 0..8 {
+            let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out waiting for preload cover")
+                .expect("channel closed");
+            match msg {
+                AppMessage::PreloadCoverReady { gen, anime_id, card_proto, banner_proto } => {
+                    state.loading_covers.remove(&anime_id);
+                    state.cover_cache.entry(anime_id).or_insert(card_proto);
+                    state.banner_cache.entry(anime_id).or_insert(banner_proto);
+                    if let Some(g) = gen {
+                        state.advance_preload(g);
+                    }
+                }
+                other => panic!("unexpected message: {:?}", matches!(other, AppMessage::PreloadCoverFailed { .. })),
+            }
+        }
+
+        assert!(!state.is_loading);
+        assert_eq!(state.preload_done, 8);
+        for id in 1..=8 {
+            assert!(state.cover_cache.contains_key(&id));
+            assert!(state.banner_cache.contains_key(&id));
+            // Pre-encoded Iterm2 protocol needs no additional resize at standard card dimensions.
+            let card_area = home_card_preencode_area();
+            assert!(
+                state
+                    .cover_cache
+                    .get_mut(&id)
+                    .unwrap()
+                    .needs_resize(&ratatui_image::Resize::Fit(None), card_area)
+                    .is_none()
+            );
+        }
     }
 }

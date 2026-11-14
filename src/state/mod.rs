@@ -309,8 +309,14 @@ pub struct AppState {
     /// Toast notification: (message, expiry unix timestamp)
     pub toast:            Option<(String, i64)>,
 
-    /// Whether the app is loading home data (shows spinner)
+    /// Whether the app is loading home data (shows spinner / preload progress)
     pub is_loading:       bool,
+    /// Total cover items scheduled for the active startup preload batch
+    pub preload_total:    usize,
+    /// Completed cover items in the active startup preload batch
+    pub preload_done:     usize,
+    /// Monotonic generation ID to ignore stale preload progress completions
+    pub preload_generation: u64,
 
     /// Whether the app should quit on next tick
     pub should_quit:      bool,
@@ -549,6 +555,9 @@ impl AppState {
             has_vlc:          false,
             toast:            None,
             is_loading:       true,
+            preload_total:    0,
+            preload_done:     0,
+            preload_generation: 0,
             should_quit:      false,
             watched_episodes: HashSet::new(),
             last_played:      None,
@@ -1045,6 +1054,34 @@ impl AppState {
         *entry = entry.saturating_sub(1);
     }
 
+    /// Start a startup cover preloading batch behind the loading screen.
+    pub fn begin_preload(&mut self, total: usize) -> u64 {
+        self.preload_generation = self.preload_generation.wrapping_add(1);
+        self.preload_total = total;
+        self.preload_done = 0;
+        self.is_loading = total > 0;
+        self.preload_generation
+    }
+
+    /// Record completion of one preloaded cover. Returns `true` when this completion unlocks Home.
+    pub fn advance_preload(&mut self, gen: u64) -> bool {
+        if gen != self.preload_generation {
+            return false;
+        }
+        self.preload_done = (self.preload_done + 1).min(self.preload_total);
+        if self.is_loading && self.preload_done >= self.preload_total {
+            self.is_loading = false;
+            return true;
+        }
+        false
+    }
+
+    /// Exit the startup loading screen immediately while allowing background covers to finish caching.
+    pub fn skip_preload(&mut self) {
+        self.preload_generation = self.preload_generation.wrapping_add(1);
+        self.is_loading = false;
+    }
+
     /// Return the base screen that should remain visible under overlays.
     pub fn current_base_screen(&self) -> Screen {
         match self.screen {
@@ -1389,5 +1426,34 @@ mod tests {
         state.close_update_modal();
         assert_eq!(state.screen, Screen::Home);
         assert_eq!(state.update_modal_phase, None);
+    }
+
+    #[test]
+    fn test_preload_state_progress_and_skip() {
+        let mut state = AppState::new();
+        let gen1 = state.begin_preload(2);
+        assert!(state.is_loading);
+        assert_eq!(state.preload_total, 2);
+        assert_eq!(state.preload_done, 0);
+
+        // Stale generation completions do not advance progress.
+        assert!(!state.advance_preload(gen1 + 99));
+        assert_eq!(state.preload_done, 0);
+
+        assert!(!state.advance_preload(gen1));
+        assert!(state.is_loading);
+        assert_eq!(state.preload_done, 1);
+
+        // Final item unlocks Home.
+        assert!(state.advance_preload(gen1));
+        assert!(!state.is_loading);
+        assert_eq!(state.preload_done, 2);
+
+        // Skipping early clears is_loading and invalidates the active generation gate.
+        let gen2 = state.begin_preload(3);
+        assert!(state.is_loading);
+        state.skip_preload();
+        assert!(!state.is_loading);
+        assert!(!state.advance_preload(gen2));
     }
 }

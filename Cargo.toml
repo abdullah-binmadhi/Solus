@@ -1,6 +1,6 @@
 [package]
 name = "solus"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 description = "Solus — A high-definition terminal anime theatre, discovery crucible, and AniList companion powered by Ratatui and ani-cli"
 authors = ["Abdullah Binmadhi", "Logan"]

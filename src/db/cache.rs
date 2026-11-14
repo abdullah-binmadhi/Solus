@@ -231,6 +231,16 @@ pub async fn store_cover_blob(pool: &SqlitePool, anime_id: i64, blob: &[u8]) -> 
     Ok(())
 }
 
+/// Fetch only the cached cover image bytes for an anime ID, avoiding full-row deserialization.
+pub async fn get_cover_blob(pool: &SqlitePool, anime_id: i64) -> Result<Option<Vec<u8>>> {
+    let row: Option<(Option<Vec<u8>>,)> =
+        sqlx::query_as("SELECT cover_blob FROM anime WHERE id = ?")
+            .bind(anime_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.and_then(|(blob,)| blob))
+}
+
 /// Fetch a single anime by AniList ID.
 pub async fn get_anime(pool: &SqlitePool, id: i64) -> Result<Option<Anime>> {
     let row = sqlx::query_as::<_, Anime>("SELECT * FROM anime WHERE id = ?")

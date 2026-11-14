@@ -143,6 +143,9 @@ pub struct Config {
     pub remote:           RemoteConfig,
     #[serde(default)]
     pub cast:             CastConfig,
+    /// Schema revision for one-time default migrations (0 = legacy v1.0.6 defaults)
+    #[serde(default)]
+    pub config_version:   u32,
 }
 
 impl Default for Config {
@@ -160,6 +163,7 @@ impl Default for Config {
             subtitle_style:   crate::services::substyler::SubtitleStyleConfig::default(),
             remote:           RemoteConfig::default(),
             cast:             CastConfig::default(),
+            config_version:   1,
         }
     }
 }
@@ -217,22 +221,22 @@ impl Default for CastConfig {
 pub struct UpdateConfig {
     #[serde(default = "default_true")]
     pub check_on_startup: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub auto_install: bool,
     #[serde(default = "default_update_interval")]
     pub check_interval: u64,
 }
 
 fn default_update_interval() -> u64 {
-    14400 // 4 hours
+    0 // Check on every launch (non-blocking background check)
 }
 
 impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
             check_on_startup: true,
-            auto_install: false,
-            check_interval: 14400,
+            auto_install: true,
+            check_interval: 0,
         }
     }
 }
@@ -313,6 +317,7 @@ impl Config {
     }
 
     /// Load config from disk. Returns default config if file doesn't exist.
+    /// Automatically migrates legacy pre-v1.0.7 update defaults once so friends receive automatic updates.
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
         if !path.exists() {
@@ -320,8 +325,27 @@ impl Config {
         }
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| AppError::Config(format!("Failed to read config: {e}")))?;
-        toml::from_str(&raw)
-            .map_err(|e| AppError::Config(format!("Failed to parse config: {e}")))
+        let mut cfg: Self = toml::from_str(&raw)
+            .map_err(|e| AppError::Config(format!("Failed to parse config: {e}")))?;
+        if cfg.migrate_legacy_defaults() {
+            let _ = cfg.save();
+        }
+        Ok(cfg)
+    }
+
+    /// Upgrade legacy v1.0.6 update settings once cleanly while preserving future user choices.
+    pub fn migrate_legacy_defaults(&mut self) -> bool {
+        if self.config_version >= 1 {
+            return false;
+        }
+        if self.update.check_on_startup && !self.update.auto_install && self.update.check_interval == 14400 {
+            self.update.auto_install = true;
+            self.update.check_interval = 0;
+        } else if self.update.check_interval == 14400 {
+            self.update.check_interval = 0;
+        }
+        self.config_version = 1;
+        true
     }
 
     /// Persist config to disk, creating the directory if needed.
@@ -443,6 +467,7 @@ mod tests {
             subtitle_style:   crate::services::substyler::SubtitleStyleConfig::default(),
             remote:           RemoteConfig::default(),
             cast:             CastConfig::default(),
+            config_version:   1,
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
@@ -473,6 +498,7 @@ mod tests {
             subtitle_style:   crate::services::substyler::SubtitleStyleConfig::default(),
             remote:           RemoteConfig::default(),
             cast:             CastConfig::default(),
+            config_version:   1,
         };
 
         // Save manually (bypassing config_path() which uses XDG dirs)
@@ -501,5 +527,35 @@ mod tests {
     fn test_config_dir_is_some() {
         // Just ensure the platform can resolve a config dir
         assert!(Config::config_dir().is_ok());
+    }
+
+    #[test]
+    fn test_legacy_update_config_migrates_once_to_auto_install() {
+        let legacy_toml = r#"
+quality = "1080p"
+audio_mode = "sub"
+player = "mpv"
+
+[update]
+check_on_startup = true
+auto_install = false
+check_interval = 14400
+
+[cache]
+trending_ttl = 1800
+stable_ttl = 21600
+detail_ttl = 3600
+"#;
+        let mut cfg: Config = toml::from_str(legacy_toml).unwrap();
+        assert_eq!(cfg.config_version, 0);
+        assert!(cfg.migrate_legacy_defaults());
+        assert!(cfg.update.auto_install);
+        assert_eq!(cfg.update.check_interval, 0);
+        assert_eq!(cfg.config_version, 1);
+
+        // User opting back out after migration must not be overridden on subsequent loads.
+        cfg.update.auto_install = false;
+        assert!(!cfg.migrate_legacy_defaults());
+        assert!(!cfg.update.auto_install);
     }
 }

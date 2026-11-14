@@ -97,6 +97,123 @@ pub fn is_homebrew_install() -> bool {
     }
 }
 
+/// Git SHA baked in at compile time (`build.rs`), or `"unknown"` for source tarball builds.
+pub fn current_build_sha() -> &'static str {
+    option_env!("SOLUS_GIT_SHA").unwrap_or("unknown")
+}
+
+/// Commit Unix timestamp baked in at compile time (`build.rs`), preventing accidental downgrades of local dev builds.
+pub fn current_commit_timestamp() -> i64 {
+    option_env!("SOLUS_COMMIT_TS")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Truncate a git SHA to its standard 7-character short prefix for display.
+pub fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
+
+/// Extract the embedded commit SHA (`<!-- solus-sha:<sha> -->`) from a release body.
+pub fn extract_release_sha(body: Option<&str>) -> Option<String> {
+    extract_marker(body, "solus-sha:")
+        .filter(|s| s.len() >= 7 && s.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Extract the embedded commit timestamp (`<!-- solus-ts:<unix_secs> -->`) from a release body.
+pub fn extract_release_timestamp(body: Option<&str>) -> Option<i64> {
+    extract_marker(body, "solus-ts:")?.parse::<i64>().ok()
+}
+
+fn extract_marker(body: Option<&str>, prefix: &str) -> Option<String> {
+    let text = body?;
+    let start = text.find(prefix)? + prefix.len();
+    let rest = &text[start..];
+    let end = rest.find("-->").unwrap_or(rest.len());
+    let val = rest[..end].trim();
+    if val.is_empty() {
+        None
+    } else {
+        Some(val.to_string())
+    }
+}
+
+/// Remove internal HTML metadata comments (`<!-- solus-... -->`) before displaying release notes.
+fn clean_release_notes(body: Option<String>) -> Option<String> {
+    let text = body?;
+    let cleaned: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with("<!-- solus-") && trimmed.ends_with("-->"))
+        })
+        .collect();
+    let joined = cleaned.join("\n").trim().to_string();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+/// Pure update decision logic supporting both tagged semver releases and rolling `main` commit releases.
+pub fn evaluate_release_update(
+    release: GitHubRelease,
+    current_version: &str,
+    local_sha: &str,
+    local_ts: i64,
+) -> Option<UpdateInfo> {
+    let semver_newer = is_newer_version(current_version, &release.tag_name);
+    let is_rolling = release.tag_name.ends_with("-rolling") || release.tag_name == "latest";
+    let remote_sha = extract_release_sha(release.body.as_deref());
+    let remote_ts = extract_release_timestamp(release.body.as_deref()).unwrap_or(0);
+
+    let semver_not_older = !is_newer_version(&release.tag_name, current_version);
+    let rolling_sha_newer = is_rolling
+        && semver_not_older
+        && local_sha != "unknown"
+        && matches!(
+            remote_sha.as_deref(),
+            Some(rsha) if rsha != local_sha && (remote_ts == 0 || local_ts == 0 || remote_ts >= local_ts)
+        );
+
+    if !semver_newer && !rolling_sha_newer {
+        return None;
+    }
+
+    let (display_curr, display_latest) = if !semver_newer && rolling_sha_newer {
+        (
+            format!(
+                "v{} ({})",
+                current_version.trim_start_matches(['v', 'V']),
+                short_sha(local_sha)
+            ),
+            format!(
+                "main@{}",
+                short_sha(remote_sha.as_deref().unwrap_or("latest"))
+            ),
+        )
+    } else {
+        (current_version.to_string(), release.tag_name.clone())
+    };
+
+    let target_name = target_asset_name();
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == target_name)
+        .or_else(|| release.assets.iter().find(|a| a.name.contains("solus")))?;
+
+    Some(UpdateInfo {
+        current_version: display_curr,
+        latest_version: display_latest,
+        download_url: asset.browser_download_url.clone(),
+        asset_name: asset.name.clone(),
+        release_notes: clean_release_notes(release.body),
+        is_homebrew: is_homebrew_install(),
+    })
+}
+
 /// Check GitHub for the latest release in a non-blocking asynchronous call.
 pub async fn check_for_updates(client: &reqwest::Client, current_version: &str) -> Result<Option<UpdateInfo>> {
     let resp = client
@@ -109,38 +226,12 @@ pub async fn check_for_updates(client: &reqwest::Client, current_version: &str) 
         .error_for_status()?;
 
     let release: GitHubRelease = resp.json().await?;
-
-    if !is_newer_version(current_version, &release.tag_name) {
-        return Ok(None);
-    }
-
-    let target_name = target_asset_name();
-    let matching_asset = release.assets.iter().find(|a| a.name == target_name);
-
-    let Some(asset) = matching_asset else {
-        // Fallback: look for an asset containing the target name prefix
-        let fallback_asset = release.assets.iter().find(|a| a.name.contains("solus"));
-        if let Some(fb) = fallback_asset {
-            return Ok(Some(UpdateInfo {
-                current_version: current_version.to_string(),
-                latest_version: release.tag_name,
-                download_url: fb.browser_download_url.clone(),
-                asset_name: fb.name.clone(),
-                release_notes: release.body,
-                is_homebrew: is_homebrew_install(),
-            }));
-        }
-        return Ok(None);
-    };
-
-    Ok(Some(UpdateInfo {
-        current_version: current_version.to_string(),
-        latest_version: release.tag_name,
-        download_url: asset.browser_download_url.clone(),
-        asset_name: asset.name.clone(),
-        release_notes: release.body,
-        is_homebrew: is_homebrew_install(),
-    }))
+    Ok(evaluate_release_update(
+        release,
+        current_version,
+        current_build_sha(),
+        current_commit_timestamp(),
+    ))
 }
 
 /// Download the new binary and atomically replace the current running executable.
@@ -310,5 +401,44 @@ mod tests {
         let name = target_asset_name();
         assert!(!name.is_empty());
         assert!(name.contains("solus"));
+    }
+
+    fn sample_release(tag_name: &str, body: Option<&str>) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag_name.to_string(),
+            name: Some(tag_name.to_string()),
+            body: body.map(|s| s.to_string()),
+            html_url: "https://github.com/abdullah-binmadhi/Solus/releases".to_string(),
+            assets: vec![ReleaseAsset {
+                name: target_asset_name().to_string(),
+                browser_download_url: "https://example.com/solus".to_string(),
+                size: 1024,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_evaluate_release_update_rolling_sha_and_semver() {
+        let body = "<!-- solus-sha:abcdef1234567890abcdef1234567890abcdef12 -->\n<!-- solus-ts:2000 -->\nAutomated build for commit `abcdef1`: Fix flickering";
+
+        // 1. Existing v1.0.6 binary upgrades via semver to v1.0.7-rolling.
+        let r1 = sample_release("v1.0.7-rolling", Some(body));
+        let info1 = evaluate_release_update(r1, "1.0.6", "unknown", 0).unwrap();
+        assert_eq!(info1.latest_version, "v1.0.7-rolling");
+        assert!(!info1.release_notes.as_deref().unwrap().contains("solus-sha"));
+
+        // 2. Same version 1.0.7 with older commit SHA upgrades to newer commit SHA.
+        let r2 = sample_release("v1.0.7-rolling", Some(body));
+        let info2 = evaluate_release_update(r2, "1.0.7", "1111111222222233333334444444555555566666", 1500).unwrap();
+        assert_eq!(info2.latest_version, "main@abcdef1");
+        assert_eq!(info2.current_version, "v1.0.7 (1111111)");
+
+        // 3. Matching commit SHA reports no update needed.
+        let r3 = sample_release("v1.0.7-rolling", Some(body));
+        assert!(evaluate_release_update(r3, "1.0.7", "abcdef1234567890abcdef1234567890abcdef12", 2000).is_none());
+
+        // 4. Local newer dev commit (local_ts > remote_ts) is never downgraded.
+        let r4 = sample_release("v1.0.7-rolling", Some(body));
+        assert!(evaluate_release_update(r4, "1.0.7", "9999999888888877777776666666555555544444", 2500).is_none());
     }
 }
