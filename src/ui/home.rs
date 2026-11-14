@@ -111,6 +111,18 @@ pub fn build_shelf_tiers(data: &HomeData, width: u16) -> Vec<ShelfTier> {
     tiers
 }
 
+/// Compute `(visible_cards, card_width)` for a horizontal strip of `usable_w` columns
+/// so cards expand/pack cleanly edge-to-edge without leaving ~15-20 col voids on the right.
+pub fn compute_row_card_metrics(usable_w: u16) -> (usize, u16) {
+    let min_card_w: u16 = 20;
+    let max_card_w: u16 = 25;
+    let gap = CARD_GAP;
+    let vis_n = ((usable_w + gap) / (min_card_w + gap)).max(1) as usize;
+    let gaps_total = (vis_n.saturating_sub(1)) as u16 * gap;
+    let card_w = (usable_w.saturating_sub(gaps_total) / vis_n as u16).clamp(min_card_w, max_card_w);
+    (vis_n, card_w)
+}
+
 /// Compute `(start_idx, row_heights)` so visible tiers pack cleanly into `avail_h`
 /// without dropping an extra shelf to small 1–3 row boundary differences.
 pub fn compute_shelf_layout(
@@ -919,8 +931,6 @@ fn render_featured(frame: &mut Frame, area: Rect, state: &mut AppState, anime: O
             .anime_banners
             .get_mut(&anime.id)
             .or_else(|| state.banner_cache.get_mut(&anime.id))
-            .or_else(|| state.cover_cache.get_mut(&anime.id))
-            .or_else(|| state.detail_cache.get_mut(&anime.id))
         {
             let image_widget = ratatui_image::StatefulImage::new(None)
                 .resize(ratatui_image::Resize::Fit(None));
@@ -1342,15 +1352,15 @@ fn render_bento_split(frame: &mut Frame, area: Rect, state: &mut AppState, data:
     let wl_inner = wl_block.inner(cols[2]);
     frame.render_widget(wl_block, cols[2]);
 
-    let wl_usable_w = wl_inner.width.saturating_sub(1);
-    let wl_vis_n = ((wl_usable_w + CARD_GAP) / (CARD_WIDTH + CARD_GAP)).max(1) as usize;
+    let wl_usable_w = wl_inner.width.saturating_sub(2);
+    let (wl_vis_n, wl_card_w) = compute_row_card_metrics(wl_usable_w);
     let wl_start = row_view_start(wl_offset, data.watchlist.len(), wl_vis_n);
     for (i, anime) in data.watchlist.iter().skip(wl_start).take(wl_vis_n).enumerate() {
-        let x = wl_inner.x + 1 + i as u16 * (CARD_WIDTH + CARD_GAP);
+        let x = wl_inner.x + 1 + i as u16 * (wl_card_w + CARD_GAP);
         let rect = Rect {
             x,
             y: wl_inner.y,
-            width: CARD_WIDTH,
+            width: wl_card_w,
             height: CARD_HEIGHT.min(wl_inner.height),
         };
         if rect.x + rect.width <= wl_inner.x + wl_inner.width {
@@ -1404,15 +1414,15 @@ fn render_single_row(frame: &mut Frame, area: Rect, state: &mut AppState, row: &
     frame.render_widget(Paragraph::new(title_line), chunks[0]);
 
     let card_area = chunks[1];
-    let visible_n = ((card_area.width + CARD_GAP) / (CARD_WIDTH + CARD_GAP)).max(1) as usize;
+    let (visible_n, card_w) = compute_row_card_metrics(card_area.width);
     let view_start = row_view_start(offset, items.len(), visible_n);
 
     for (i, anime) in items.iter().skip(view_start).take(visible_n).enumerate() {
-        let x = card_area.x + i as u16 * (CARD_WIDTH + CARD_GAP);
+        let x = card_area.x + i as u16 * (card_w + CARD_GAP);
         let rect = Rect {
             x,
             y: card_area.y,
-            width: CARD_WIDTH,
+            width: card_w,
             height: CARD_HEIGHT.min(card_area.height),
         };
         if rect.x + rect.width <= card_area.x + card_area.width {
@@ -1790,5 +1800,20 @@ mod tests {
         assert!(rendered.contains("Trending Now"), "missing row 2");
         assert!(rendered.contains("Popular Picks"), "third shelf disappeared at 48 rows!");
         assert!(rendered.contains("ACTIONS"), "missing bottom command dock");
+    }
+
+    #[test]
+    fn test_bento_watchlist_fills_width_without_dead_right_void() {
+        // Matches Screenshot (168 cols wide -> left_w 26, spacer 1, wl outer 141, inner 139, usable 137)
+        let (vis_n, card_w) = compute_row_card_metrics(137);
+        assert_eq!(vis_n, 6);
+        assert_eq!(card_w, 21);
+        let used = vis_n as u16 * card_w + (vis_n as u16 - 1) * CARD_GAP;
+        assert!(137 - used <= 2, "leftover margin {} too wide", 137 - used);
+
+        // Also check 160-col terminal (wl usable = 129)
+        let (vis_n2, card_w2) = compute_row_card_metrics(129);
+        let used2 = vis_n2 as u16 * card_w2 + (vis_n2 as u16 - 1) * CARD_GAP;
+        assert!(129 - used2 <= 4, "leftover margin {} too wide at 129 usable", 129 - used2);
     }
 }

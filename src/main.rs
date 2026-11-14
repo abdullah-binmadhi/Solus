@@ -10,7 +10,10 @@ use anyhow::Context;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+        EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use state::{AppState, Screen};
@@ -415,13 +418,8 @@ async fn main() -> anyhow::Result<()> {
                     let card_img = prepare_card_cover_with_font(img.clone(), font_size);
                     let portrait_img = prepare_portrait_cover_with_font(img.clone(), font_size);
                     let thumb_img = prepare_16_9_thumbnail_cover(img, font_size);
-                    if let Some(ref mut picker) = state.picker {
-                        let proto1 = picker.new_resize_protocol(card_img.clone());
-                        let proto2 = picker.new_resize_protocol(card_img.clone());
-                        let proto3 = picker.new_resize_protocol(portrait_img);
-                        state.cover_cache.insert(anime_id, proto1);
-                        state.banner_cache.insert(anime_id, proto2);
-                        state.detail_cache.insert(anime_id, proto3);
+                    if state.picker.is_some() {
+                        insert_cover_protocols_if_absent(&mut state, anime_id, card_img.clone(), portrait_img);
                     }
                     if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
                         let base_theme = ui::theme::get_theme(state.theme_index);
@@ -954,8 +952,11 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if needs_redraw {
-            // Draw current screen
-            terminal.draw(|frame| {
+            // Wrap full frame draw in synchronized update (DEC Mode 2026) so Kitty
+            // and compatible terminals swap graphics placeholders atomically without flicker.
+            let _ = execute!(terminal.backend_mut(), BeginSynchronizedUpdate);
+            let draw_res = terminal
+                .draw(|frame| {
                 let base_screen = state.current_base_screen();
                 match state.screen {
                     Screen::Home => {
@@ -1032,7 +1033,10 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(ref msg) = toast_msg {
                     ui::help::render_toast(frame, msg);
                 }
-            })?;
+            })
+            .map(|_| ());
+            let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+            draw_res?;
             needs_redraw = false;
         }
 
@@ -1428,10 +1432,11 @@ async fn handle_mouse(
                                                 }
                                             } else if mx > left_w {
                                                 let right_x = left_w + 1;
-                                                let wl_inner_w = term_w.saturating_sub(right_x + 3);
-                                                let vis_n = ((wl_inner_w + ui::home::CARD_GAP) / card_pitch).max(1) as usize;
+                                                let wl_usable_w = term_w.saturating_sub(right_x + 4);
+                                                let (vis_n, wl_card_w) = ui::home::compute_row_card_metrics(wl_usable_w);
+                                                let wl_pitch = wl_card_w + ui::home::CARD_GAP;
                                                 let inner_x = mx.saturating_sub(right_x + 2);
-                                                let col = (inner_x / card_pitch) as usize;
+                                                let col = (inner_x / wl_pitch) as usize;
                                                 let offset = state.row_offset("watchlist");
                                                 let start = ui::home::row_view_start(offset, home_data.watchlist.len(), vis_n);
                                                 let target_idx = start + col;
@@ -1452,8 +1457,9 @@ async fn handle_mouse(
                                                 state::CategoryRow::TopRated         => ("top_rated", &home_data.top_rated),
                                                 state::CategoryRow::Seasonal         => ("seasonal", &home_data.seasonal),
                                             };
-                                            let vis_n = ((term_w + ui::home::CARD_GAP) / card_pitch).max(1) as usize;
-                                            let col = (mx / card_pitch) as usize;
+                                            let (vis_n, row_card_w) = ui::home::compute_row_card_metrics(term_w);
+                                            let row_pitch = row_card_w + ui::home::CARD_GAP;
+                                            let col = (mx / row_pitch) as usize;
                                             let offset = state.row_offset(key);
                                             let start = ui::home::row_view_start(offset, items.len(), vis_n);
                                             let target_idx = start + col;
@@ -1957,7 +1963,7 @@ async fn open_detail_from_anime(
     state.in_watchlist = in_wl;
     if state.cover_anime_id != Some(anime.id) || state.cover_state.is_none() {
         state.cover_failed_anime_id = None;
-        trigger_cover_download(anime.clone(), pool.clone(), tx.clone());
+        ensure_cover_fetch(state, &anime, pool, tx);
     }
     let anime_id = anime.id;
     let title_romaji = anime.title_romaji.clone();
@@ -1971,8 +1977,10 @@ async fn open_detail_from_anime(
             let portrait_img = prepare_portrait_cover_with_font(dyn_img.clone(), font_size);
             let thumb_img = prepare_16_9_thumbnail_cover(dyn_img, font_size);
             if let Some(ref mut picker) = state.picker {
-                let proto_portrait = picker.new_resize_protocol(portrait_img);
-                state.detail_cache.insert(anime_id, proto_portrait);
+                state
+                    .detail_cache
+                    .entry(anime_id)
+                    .or_insert_with(|| picker.new_resize_protocol(portrait_img));
             }
             let base_theme = ui::theme::get_theme(state.theme_index);
             state.ambilight_theme = Some(ui::theme::extract_ambilight_palette(&card_img, base_theme));
@@ -2119,6 +2127,49 @@ fn trigger_stream_detection(
 }
 
 /// Ensure the Home banner cover follows the currently highlighted anime.
+/// Return true when card, banner, and detail image protocols are already cached for `anime_id`.
+fn has_all_cached_covers(state: &AppState, anime_id: i64) -> bool {
+    state.cover_cache.contains_key(&anime_id)
+        && state.banner_cache.contains_key(&anime_id)
+        && state.detail_cache.contains_key(&anime_id)
+}
+
+/// Insert card, banner, and detail protocols only when absent so active Kitty image IDs stay stable.
+fn insert_cover_protocols_if_absent(
+    state: &mut AppState,
+    anime_id: i64,
+    card_img: image::DynamicImage,
+    portrait_img: image::DynamicImage,
+) {
+    let Some(ref mut picker) = state.picker else {
+        return;
+    };
+    state
+        .cover_cache
+        .entry(anime_id)
+        .or_insert_with(|| picker.new_resize_protocol(card_img.clone()));
+    state
+        .banner_cache
+        .entry(anime_id)
+        .or_insert_with(|| picker.new_resize_protocol(card_img));
+    state
+        .detail_cache
+        .entry(anime_id)
+        .or_insert_with(|| picker.new_resize_protocol(portrait_img));
+}
+
+/// Fetch cover artwork only when missing from caches and not already in flight.
+fn ensure_cover_fetch(
+    state: &mut AppState,
+    anime: &db::cache::Anime,
+    pool: &sqlx::SqlitePool,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    if !has_all_cached_covers(state, anime.id) && state.loading_covers.insert(anime.id) {
+        trigger_cover_download(anime.clone(), pool.clone(), tx.clone());
+    }
+}
+
 fn refresh_home_cover(
     state: &mut AppState,
     data: &ui::home::HomeData,
@@ -2141,7 +2192,7 @@ fn refresh_home_cover(
     state.cover_state    = None;
     state.cover_failed_anime_id = None;
     state.banner_progress = None;
-    trigger_cover_download(anime, pool.clone(), tx.clone());
+    ensure_cover_fetch(state, &anime, pool, tx);
     trigger_banner_progress(anime_id, pool.clone(), tx.clone());
 }
 
@@ -2161,10 +2212,7 @@ fn prefetch_all_home_covers(
     items.extend(data.top_rated.iter().take(6).cloned());
 
     for anime in items {
-        if !state.cover_cache.contains_key(&anime.id) && !state.loading_covers.contains(&anime.id) {
-            state.loading_covers.insert(anime.id);
-            trigger_cover_download(anime, pool.clone(), tx.clone());
-        }
+        ensure_cover_fetch(state, &anime, pool, tx);
     }
 }
 
@@ -2265,7 +2313,7 @@ async fn handle_detail(
                         state.cover_anime_id = Some(anime.id);
                         state.cover_state = None;
                         state.cover_failed_anime_id = None;
-                        trigger_cover_download(anime, pool.clone(), tx.clone());
+                        ensure_cover_fetch(state, &anime, pool, tx);
                     }
                 }
             }
@@ -2893,20 +2941,20 @@ async fn handle_search(
         KeyCode::Down => {
             if state.search_cursor + 1 < state.search_results.len() {
                 state.search_cursor += 1;
-                if let Some(anime) = state.search_results.get(state.search_cursor) {
+                if let Some(anime) = state.search_results.get(state.search_cursor).cloned() {
                     state.cover_anime_id = Some(anime.id);
                     state.cover_state = None;
-                    trigger_cover_download(anime.clone(), pool.clone(), tx.clone());
+                    ensure_cover_fetch(state, &anime, pool, tx);
                 }
             }
         }
         KeyCode::Up => {
             if state.search_cursor > 0 {
                 state.search_cursor -= 1;
-                if let Some(anime) = state.search_results.get(state.search_cursor) {
+                if let Some(anime) = state.search_results.get(state.search_cursor).cloned() {
                     state.cover_anime_id = Some(anime.id);
                     state.cover_state = None;
-                    trigger_cover_download(anime.clone(), pool.clone(), tx.clone());
+                    ensure_cover_fetch(state, &anime, pool, tx);
                 }
             }
         }
@@ -5030,5 +5078,69 @@ mod tests {
         let aspect = prepared.width() as f64 / prepared.height() as f64;
         let expected = 16.0 / 9.0;
         assert!((aspect - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_insert_cover_protocols_if_absent_preserves_existing_protocols() {
+        let mut state = AppState::new();
+        let mut picker = ratatui_image::picker::Picker::new((10, 20));
+        picker.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
+        state.picker = Some(picker);
+
+        let img1 = image::DynamicImage::new_rgb8(40, 40);
+        let img2 = image::DynamicImage::new_rgb8(60, 60);
+
+        insert_cover_protocols_if_absent(&mut state, 42, img1.clone(), img1);
+        assert!(has_all_cached_covers(&state, 42));
+
+        let original_ptr = state
+            .cover_cache
+            .get(&42)
+            .map(|p| &**p as *const dyn ratatui_image::protocol::StatefulProtocol as *const ())
+            .unwrap();
+
+        // A redundant CoverReady arrival must not replace active Kitty StatefulProtocols.
+        insert_cover_protocols_if_absent(&mut state, 42, img2.clone(), img2);
+        let after_ptr = state
+            .cover_cache
+            .get(&42)
+            .map(|p| &**p as *const dyn ratatui_image::protocol::StatefulProtocol as *const ())
+            .unwrap();
+        assert_eq!(original_ptr, after_ptr);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_home_cover_skips_download_when_already_cached() {
+        let pool = db::init(":memory:").await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<AppMessage>(8);
+
+        let mut state = AppState::new();
+        let mut picker = ratatui_image::picker::Picker::new((10, 20));
+        picker.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
+        state.picker = Some(picker);
+
+        let anime1 = db::cache::Anime {
+            id: 101,
+            title_romaji: "Serial Experiments Lain".to_string(),
+            ..Default::default()
+        };
+        let anime2 = db::cache::Anime {
+            id: 102,
+            title_romaji: "Made in Abyss".to_string(),
+            ..Default::default()
+        };
+        let img = image::DynamicImage::new_rgb8(40, 40);
+        insert_cover_protocols_if_absent(&mut state, anime2.id, img.clone(), img);
+
+        let mut data = ui::home::HomeData::empty();
+        data.continue_watching.push(anime1);
+        data.continue_watching.push(anime2);
+        state.active_row = state::CategoryRow::ContinueWatching;
+        state.row_offsets.insert("continue_watching".to_string(), 1);
+
+        refresh_home_cover(&mut state, &data, &pool, &tx);
+
+        assert_eq!(state.cover_anime_id, Some(102));
+        assert!(!state.loading_covers.contains(&102));
     }
 }
