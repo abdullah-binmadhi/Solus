@@ -1207,7 +1207,7 @@ async fn handle_update_modal(
     match phase {
         state::UpdateModalPhase::Available { info } => {
             match key.code {
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char('u') | KeyCode::Char('U') | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if !info.is_homebrew && !state.is_updating {
                         state.is_updating = true;
                         state.update_modal_phase = Some(state::UpdateModalPhase::Downloading {

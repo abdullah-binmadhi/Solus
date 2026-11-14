@@ -35,6 +35,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         UpdateModalPhase::Failed { .. } => " ⚠ Solus Update Failed ⚠ ",
     };
 
+    let modal_bg = Color::Rgb(15, 16, 25);
     let block = Block::default()
         .title(Span::styled(
             title,
@@ -45,7 +46,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(modal_bg));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -119,11 +121,11 @@ fn render_available(
     ];
     if let Some(ref notes) = info.release_notes {
         for line in notes.lines().take(5) {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
+            let cleaned = clean_highlight_line(line);
+            if !cleaned.is_empty() {
                 notes_lines.push(Line::from(vec![
                     Span::styled("  • ", Style::default().fg(accent)),
-                    Span::styled(trimmed.trim_start_matches(['*', '-', ' ']), Style::default().fg(Color::Rgb(210, 210, 220))),
+                    Span::styled(cleaned, Style::default().fg(Color::Rgb(210, 210, 220))),
                 ]));
             }
         }
@@ -140,13 +142,29 @@ fn render_available(
         ])
     } else {
         Line::from(vec![
-            Span::styled("[Enter] ", Style::default().fg(Color::Rgb(0, 255, 136)).add_modifier(Modifier::BOLD)),
-            Span::styled("Update Now (2-4 seconds)      ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " [Enter / u] Update Now ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(0, 255, 136))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  (2-4 seconds)    ", Style::default().fg(Color::Rgb(150, 155, 175))),
             Span::styled("[Esc] ", Style::default().fg(Color::Rgb(180, 180, 180)).add_modifier(Modifier::BOLD)),
             Span::styled("Remind Me Later", Style::default().fg(Color::Rgb(180, 180, 180))),
         ])
     };
     frame.render_widget(Paragraph::new(vec![action_line]).alignment(Alignment::Center), chunks[3]);
+}
+
+/// Strip markdown bold markers, bullets, and inline code ticks for crisp TUI rendering.
+fn clean_highlight_line(line: &str) -> String {
+    line.trim()
+        .trim_start_matches(['*', '-', ' '])
+        .replace("**", "")
+        .replace('`', "")
+        .trim()
+        .to_string()
 }
 
 fn render_downloading(
@@ -317,4 +335,34 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vert[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::updater::UpdateInfo;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn test_update_modal_shows_update_button_and_clean_markdown() {
+        let mut state = AppState::new();
+        state.open_update_modal(UpdateInfo {
+            current_version: "v1.0.7 (4d9ef06)".to_string(),
+            latest_version: "main@87f9ca4".to_string(),
+            download_url: "https://example.com/solus".to_string(),
+            asset_name: "solus-macos-aarch64".to_string(),
+            release_notes: Some("Automated build for commit `87f9ca4`: demo\n**Full Changelog**: https://example.com".to_string()),
+            is_homebrew: false,
+        });
+
+        let backend = TestBackend::new(140, 42);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render_overlay(f, &state)).unwrap();
+
+        let text: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("Update Now"));
+        assert!(text.contains("Full Changelog: https://example.com"));
+        assert!(!text.contains("Full Changelog**"));
+    }
 }

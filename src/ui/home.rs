@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use crate::{
     db::cache::Anime,
     services::tailored::clean_synopsis_single_line,
-    state::{AppState, CategoryRow},
+    state::{AppState, CategoryRow, Screen},
     ui::components::cover::HalfblockCover,
 };
 
@@ -77,6 +77,41 @@ pub fn is_bento_split(data: &HomeData, width: u16) -> bool {
 pub fn bento_left_width(cw_count: usize) -> u16 {
     let count = cw_count.clamp(1, 2) as u16;
     count * CARD_WIDTH + count.saturating_sub(1) * CARD_GAP + 4
+}
+
+/// Compute centered modal bounds matching overlays so underlying Home artwork doesn't bleed through.
+fn active_modal_rect(frame_area: Rect, screen: &Screen) -> Option<Rect> {
+    let (pct_x, pct_y) = match screen {
+        Screen::UpdateModal => (64, 45),
+        Screen::RemoteModal => (64, 76),
+        Screen::CastModal => (68, 55),
+        Screen::Calendar => {
+            if frame_area.width >= 115 && frame_area.height >= 34 {
+                (94, 90)
+            } else {
+                (98, 94)
+            }
+        }
+        _ => return None,
+    };
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(frame_area);
+    Some(
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage((100 - pct_x) / 2),
+                Constraint::Percentage(pct_x),
+                Constraint::Percentage((100 - pct_x) / 2),
+            ])
+            .split(vert[1])[1],
+    )
 }
 
 /// Build the ordered list of visible vertical tiers for the current terminal width.
@@ -926,7 +961,9 @@ fn render_featured(frame: &mut Frame, area: Rect, state: &mut AppState, anime: O
     let cover_inner = cover_block.inner(cols[0]);
     frame.render_widget(cover_block, cols[0]);
 
-    if state.has_image_support() {
+    let cover_occluded = active_modal_rect(frame.area(), &state.screen)
+        .is_some_and(|m| m.intersects(cover_inner));
+    if state.has_image_support() && !cover_occluded {
         if let Some(cover) = state
             .anime_banners
             .get_mut(&anime.id)
@@ -1494,7 +1531,9 @@ fn render_card(
         ])
         .split(inner);
 
-    if state.has_image_support() {
+    let cover_occluded = active_modal_rect(frame.area(), &state.screen)
+        .is_some_and(|m| m.intersects(chunks[0]));
+    if state.has_image_support() && !cover_occluded {
         if let Some(cover) = state.cover_cache.get_mut(&anime.id) {
             let image_widget = ratatui_image::StatefulImage::new(None)
                 .resize(ratatui_image::Resize::Fit(None));

@@ -85,16 +85,23 @@ pub fn target_asset_name() -> &'static str {
     { "solus" }
 }
 
-/// Detect whether the currently running binary is managed by Homebrew.
+/// Resolve the canonical path of the running binary (following symlinks such as `/opt/homebrew/bin/solus -> ~/.cargo/bin/solus`).
+fn resolved_current_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(std::fs::canonicalize(&exe).unwrap_or(exe))
+}
+
+/// Return true only when the canonical binary resides inside Homebrew's Cellar or Caskroom.
+pub fn is_homebrew_binary_path(path: &std::path::Path) -> bool {
+    let norm = path.to_string_lossy().replace('\\', "/");
+    norm.contains("/Cellar/") || norm.contains("/Caskroom/")
+}
+
+/// Detect whether the currently running binary is genuinely managed by Homebrew.
 pub fn is_homebrew_install() -> bool {
-    if let Ok(exe) = std::env::current_exe() {
-        let path_str = exe.to_string_lossy();
-        path_str.contains("/Cellar/")
-            || path_str.contains("/opt/homebrew/")
-            || path_str.contains("/usr/local/Cellar/")
-    } else {
-        false
-    }
+    resolved_current_exe()
+        .map(|p| is_homebrew_binary_path(&p))
+        .unwrap_or(false)
 }
 
 /// Git SHA baked in at compile time (`build.rs`), or `"unknown"` for source tarball builds.
@@ -241,8 +248,8 @@ pub async fn download_and_install_update(
     target_version: &str,
     tx: Sender<AppMessage>,
 ) -> Result<PathBuf> {
-    let current_exe = std::env::current_exe()
-        .map_err(|e| AppError::Player(format!("Failed to resolve current binary path: {e}")))?;
+    let current_exe = resolved_current_exe()
+        .ok_or_else(|| AppError::Player("Failed to resolve current binary path".into()))?;
 
     let current_dir = current_exe
         .parent()
@@ -351,7 +358,7 @@ pub async fn download_and_install_update(
 /// Clean up any leftover update artifacts (e.g., `*.exe.old` or temporary download files)
 /// from previous updates. Called on startup.
 pub fn cleanup_legacy_update_files() {
-    if let Ok(current_exe) = std::env::current_exe() {
+    if let Some(current_exe) = resolved_current_exe() {
         if let Some(parent) = current_exe.parent() {
             #[cfg(windows)]
             {
@@ -440,5 +447,14 @@ mod tests {
         // 4. Local newer dev commit (local_ts > remote_ts) is never downgraded.
         let r4 = sample_release("v1.0.7-rolling", Some(body));
         assert!(evaluate_release_update(r4, "1.0.7", "9999999888888877777776666666555555544444", 2500).is_none());
+    }
+
+    #[test]
+    fn test_is_homebrew_binary_path() {
+        assert!(!is_homebrew_binary_path(std::path::Path::new("/opt/homebrew/bin/solus")));
+        assert!(!is_homebrew_binary_path(std::path::Path::new("/Users/dev/.cargo/bin/solus")));
+        assert!(is_homebrew_binary_path(std::path::Path::new("/opt/homebrew/Cellar/solus/1.0.7/bin/solus")));
+        assert!(is_homebrew_binary_path(std::path::Path::new("/usr/local/Cellar/solus/1.0.7/bin/solus")));
+        assert!(is_homebrew_binary_path(std::path::Path::new("/opt/homebrew/Caskroom/solus/1.0.7/solus")));
     }
 }
