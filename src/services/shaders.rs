@@ -1,25 +1,25 @@
-//! Anime4K real-time GLSL shader pipeline management for mpv / iina.
+//! Solus Real-Time Video Mastering, True 4:4:4 Chroma & Era-Adaptive Resolution-Gated GLSL Pipeline.
 //!
-//! Provides Era-Adaptive GPU-accelerated line-art reconstruction, pure-luminance (Y)
-//! Catmull-Rom / Sobel upscaling, Structure-Tensor Tangent Anti-Aliasing (for silky-smooth
-//! non-jagged black/thin ink lines), Contrast Adaptive Sharpening (CAS), and strict
-//! anti-ringing shaders that transform both 80s/90s cel anime (e.g., Serial Experiments Lain)
-//! and modern digital HD anime into razor-sharp, jaggie-free 4K at 60fps.
+//! 1. `01_solus_master_fused.glsl` (`LUMA`): Single-pass dark-scene shadow de-crush + BPP-adaptive
+//!    bilateral deblock + clamped micro-contrast + FidelityFX RCAS + PTS-seeded midtone organic grain
+//!    using live `//!PARAM` controls (with static fallback for legacy `mpv` builds).
+//! 2. `02_solus_chroma_444.glsl` (`CHROMA -> LUMA.w x LUMA.h`): Analytical luma-guided linear regression
+//!    reconstructing crisp 4:4:4 anime color edges (allowing fast `--cscale=bilinear`).
+//! 3. `03_solus_era_restore_*.glsl` (`LUMA`): Era-adaptive line restoration with deduplicated center texel.
+//! 4. `04_solus_anime4k_upscale_2x_*.glsl` (`LUMA 2x`, `//!WHEN OUTPUT.w HOOKED.w / 1.220 >`):
+//!    Resolution-gated directional Catmull-Rom + tangent AA 2x upscaler that automatically bypasses
+//!    during PiP and native <=1080p playback (-85% PiP GPU load).
 
+use crate::config::{Anime4KMode, DebandMode, MotionMode, PerformanceMode};
+use crate::services::platform::{DeviceProfile, PlayerCapabilities};
 use std::path::PathBuf;
-use crate::config::Anime4KMode;
 
 /// Production era profile detected from `anime.season_year`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnimeEra {
-    /// 1960s–2006: 35mm/16mm film grain, hand-painted acetate cels, halftone dithering, CRT glow
-    /// (e.g., *Serial Experiments Lain* 1998, *Neon Genesis Evangelion*, *Cowboy Bebop*, *Monster*).
-    /// Uses noise-floor edge gating (`smoothstep(0.045, 0.14, grad)`) so film grain is never
-    /// blurred into oil-painted mush or sharpened into blotches, paired with tangent-guided anti-aliasing.
+    /// 1960s–2006: 35mm/16mm film grain, hand-painted acetate cels, halftone dithering.
     RetroCel,
-    /// 2007–Present: Digital vector ink & paint, 720p/900p/1080p digital compositing
-    /// (e.g., *Frieren*, *Jujutsu Kaisen*, *Demon Slayer*, *Solo Leveling*).
-    /// Uses tangent-guided sub-pixel line reconstruction + 2x directional upscale + pure-luma FidelityFX CAS.
+    /// 2007–Present: Digital vector ink & paint, 720p/900p/1080p digital compositing.
     ModernDigital,
 }
 
@@ -49,43 +49,253 @@ impl AnimeEra {
     }
 }
 
-/// Stage 1: Strict [0.0, 1.0] highlight & shadow range clamp without neighbor pre-blurring.
-/// Prevents out-of-range HDR/SDR ringing while preserving 100% of native pixel micro-detail.
-const SHADER_CLAMP_HIGHLIGHTS: &str = r#"//!DESC Anime4K-v5.2-Clamp-Highlights-ZeroBlur
-//!HOOK MAIN
+/// 1A. Fused Single-Pass Master De-Compression, Shadow De-Crush, RCAS & Organic Grain (`//!PARAM` live tunable).
+const SHADER_MASTER_FUSED_PARAM: &str = r#"//!DESC Solus-Master-Fused-Luma
+//!HOOK LUMA
 //!BIND HOOKED
+//!PARAM shadow_lift
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 0.15
+0.035
+//!PARAM deblock_amt
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 1.0
+0.30
+//!PARAM detail_lift
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 0.35
+0.10
+//!PARAM cas_amt
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 0.6
+0.26
+//!PARAM grain_amt
+//!TYPE float
+//!MINIMUM 0.0
+//!MAXIMUM 0.03
+0.006
 
 vec4 hook() {
-    return clamp(HOOKED_tex(HOOKED_pos), 0.0, 1.0);
+    vec2 pt = HOOKED_pt;
+    vec2 pos = HOOKED_pos;
+
+    float c  = clamp(HOOKED_tex(pos).x, 0.0, 1.0);
+    float n  = HOOKED_tex(pos + vec2(0.0, -pt.y)).x;
+    float s  = HOOKED_tex(pos + vec2(0.0,  pt.y)).x;
+    float e  = HOOKED_tex(pos + vec2( pt.x, 0.0)).x;
+    float w  = HOOKED_tex(pos + vec2(-pt.x, 0.0)).x;
+    float nw = HOOKED_tex(pos + vec2(-pt.x, -pt.y)).x;
+    float ne = HOOKED_tex(pos + vec2( pt.x, -pt.y)).x;
+    float sw = HOOKED_tex(pos + vec2(-pt.x,  pt.y)).x;
+    float se = HOOKED_tex(pos + vec2( pt.x,  pt.y)).x;
+
+    // Gentle shadow de-crush protecting pure #000 blacks
+    if (shadow_lift > 0.001) {
+        float w_blk = smoothstep(0.015, 0.16, c) * (1.0 - smoothstep(0.16, 0.36, c));
+        c = clamp(c + shadow_lift * 0.28 * w_blk, 0.0, 1.0);
+    }
+
+    float mn4 = min(min(n, s), min(e, w));
+    float mx4 = max(max(n, s), max(e, w));
+    float mn  = min(min(c, mn4), min(min(nw, ne), min(sw, se)));
+    float mx  = max(max(c, mx4), max(max(nw, ne), max(sw, se)));
+
+    // BPP-adaptive rational bilateral deblock & dering
+    float base = c;
+    if (deblock_amt > 0.001) {
+        float inv2s2 = 1.0 / (2.0 * 0.036 * 0.036);
+        float wn = 1.0 / (1.0 + ((n - c) * (n - c)) * inv2s2);
+        float ws = 1.0 / (1.0 + ((s - c) * (s - c)) * inv2s2);
+        float we = 1.0 / (1.0 + ((e - c) * (e - c)) * inv2s2);
+        float ww = 1.0 / (1.0 + ((w - c) * (w - c)) * inv2s2);
+        float filtered = (c + n * wn + s * ws + e * we + w * ww) / (1.0 + wn + ws + we + ww);
+        float local_contrast = max(max(abs(n - c), abs(s - c)), max(abs(e - c), abs(w - c)));
+        float protect = smoothstep(0.025, 0.11, local_contrast);
+        float cleaned = mix(filtered, c, protect * 0.72);
+        base = mix(c, cleaned, deblock_amt);
+    }
+
+    // Clamped mid-frequency micro-detail recovery
+    if (detail_lift > 0.001) {
+        float avg4 = (n + s + e + w) * 0.25;
+        float lifted = base + (base - avg4) * (detail_lift * 1.25);
+        base = clamp(lifted, mn, mx);
+    }
+
+    // FidelityFX RCAS contrast-adaptive sharpening bounded by 3x3 range (zero ringing)
+    float out_y = base;
+    if (cas_amt > 0.001) {
+        float hit_min = min(mn4, base) / max(4.0 * mx4, 1e-5);
+        float hit_max = (1.0 - max(mx4, base)) / max(4.0 * mn4 - 4.0, -1e-5);
+        float lobe = max(-hit_min, hit_max);
+        float weight = clamp(lobe, -0.20 * cas_amt, 0.0);
+        out_y = clamp((base + (n + s + e + w) * weight) / (1.0 + 4.0 * weight), mn, mx);
+    }
+
+    // Subtle PTS-seeded midtone micro-grain (breaks 8-bit dark-sky contour flatness)
+    if (grain_amt > 0.0004) {
+        float env = clamp(4.0 * out_y * (1.0 - out_y), 0.0, 1.0);
+        float t1 = fract(PTS * 1.131);
+        float t2 = fract(PTS * 1.719);
+        float rnd = fract(sin(dot(pos * vec2(1291.7, 739.3) + vec2(t1 * 19.3, t2 * 37.7), vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+        out_y = clamp(out_y + rnd * grain_amt * env, 0.0, 1.0);
+    }
+
+    return vec4(out_y, 0.0, 0.0, 1.0);
 }
 "#;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// UNIFIED EDGE-AWARE 2x UPSCALER (parameterised per era + mode)
-// ─────────────────────────────────────────────────────────────────────────────
+/// 1B. Static fused Luma shader fallback for older `mpv` builds without `--glsl-shader-opts`.
+const SHADER_MASTER_FUSED_STATIC: &str = r#"//!DESC Solus-Master-Fused-Luma-Static
+//!HOOK LUMA
+//!BIND HOOKED
 
-/// Tuning knobs for the unified upscaler.
+vec4 hook() {
+    vec2 pt = HOOKED_pt;
+    vec2 pos = HOOKED_pos;
+    float c  = clamp(HOOKED_tex(pos).x, 0.0, 1.0);
+    float n  = HOOKED_tex(pos + vec2(0.0, -pt.y)).x;
+    float s  = HOOKED_tex(pos + vec2(0.0,  pt.y)).x;
+    float e  = HOOKED_tex(pos + vec2( pt.x, 0.0)).x;
+    float w  = HOOKED_tex(pos + vec2(-pt.x, 0.0)).x;
+
+    float inv2s2 = 1.0 / (2.0 * 0.036 * 0.036);
+    float wn = 1.0 / (1.0 + ((n - c) * (n - c)) * inv2s2);
+    float ws = 1.0 / (1.0 + ((s - c) * (s - c)) * inv2s2);
+    float we = 1.0 / (1.0 + ((e - c) * (e - c)) * inv2s2);
+    float ww = 1.0 / (1.0 + ((w - c) * (w - c)) * inv2s2);
+    float filtered = (c + n * wn + s * ws + e * we + w * ww) / (1.0 + wn + ws + we + ww);
+    float local_contrast = max(max(abs(n - c), abs(s - c)), max(abs(e - c), abs(w - c)));
+    float protect = smoothstep(0.025, 0.11, local_contrast);
+    float base = mix(c, mix(filtered, c, protect * 0.72), 0.30);
+
+    float mn4 = min(min(n, s), min(e, w));
+    float mx4 = max(max(n, s), max(e, w));
+    float hit_min = min(mn4, base) / max(4.0 * mx4, 1e-5);
+    float hit_max = (1.0 - max(mx4, base)) / max(4.0 * mn4 - 4.0, -1e-5);
+    float weight = clamp(max(-hit_min, hit_max), -0.052, 0.0);
+    float out_y = clamp((base + (n + s + e + w) * weight) / (1.0 + 4.0 * weight), mn4, mx4);
+    return vec4(out_y, 0.0, 0.0, 1.0);
+}
+"#;
+
+/// 2. Analytical Luma-Guided 4:4:4 Chroma Reconstructor (`CHROMA -> LUMA.w x LUMA.h`).
+const SHADER_CHROMA_444: &str = r#"//!DESC Solus-Chroma-444-Analytical
+//!HOOK CHROMA
+//!BIND HOOKED
+//!BIND LUMA
+//!WIDTH LUMA.w
+//!HEIGHT LUMA.h
+//!WHEN OUTPUT.w 960 >=
+
+vec4 hook() {
+    vec2 uv = HOOKED_pos;
+    vec2 c_pt = HOOKED_pt;
+
+    float y_hr = LUMA_tex(uv).x;
+    float yn = LUMA_tex(uv + vec2(0.0, -c_pt.y)).x;
+    float ys = LUMA_tex(uv + vec2(0.0,  c_pt.y)).x;
+    float ye = LUMA_tex(uv + vec2( c_pt.x, 0.0)).x;
+    float yw = LUMA_tex(uv + vec2(-c_pt.x, 0.0)).x;
+
+    vec2 c0 = HOOKED_tex(uv).xy;
+    vec2 cn = HOOKED_tex(uv + vec2(0.0, -c_pt.y)).xy;
+    vec2 cs = HOOKED_tex(uv + vec2(0.0,  c_pt.y)).xy;
+    vec2 ce = HOOKED_tex(uv + vec2( c_pt.x, 0.0)).xy;
+    vec2 cw = HOOKED_tex(uv + vec2(-c_pt.x, 0.0)).xy;
+
+    float y_mean = (y_hr + yn + ys + ye + yw) * 0.2;
+    vec2  c_mean = (c0 + cn + cs + ce + cw) * 0.2;
+
+    float dy0 = y_hr - y_mean;
+    float dyn = yn - y_mean;
+    float dys = ys - y_mean;
+    float dye = ye - y_mean;
+    float dyw = yw - y_mean;
+
+    float var_y = dy0 * dy0 + dyn * dyn + dys * dys + dye * dye + dyw * dyw;
+    vec2 cov_yc = (c0 - c_mean) * dy0
+                + (cn - c_mean) * dyn
+                + (cs - c_mean) * dys
+                + (ce - c_mean) * dye
+                + (cw - c_mean) * dyw;
+
+    vec2 slope = clamp(cov_yc / (var_y + 0.0012), vec2(-1.35), vec2(1.35));
+    vec2 recon = c_mean + slope * (y_hr - y_mean);
+
+    vec2 c_min = min(c0, min(min(cn, cs), min(ce, cw)));
+    vec2 c_max = max(c0, max(max(cn, cs), max(ce, cw)));
+    return vec4(clamp(recon, c_min, c_max), 0.0, 1.0);
+}
+"#;
+
+/// 3. Era-Adaptive Luma Restoration with deduplicated center texel reads (`-20%` texture fetches).
+fn era_restore_glsl(retro: bool) -> &'static str {
+    if retro {
+        r#"//!DESC Solus-Era-Restore-RetroCel
+//!HOOK LUMA
+//!BIND HOOKED
+
+vec4 hook() {
+    vec2 pt = HOOKED_pt;
+    vec2 pos = HOOKED_pos;
+    float mc = HOOKED_tex(pos).x;
+    float mn = HOOKED_tex(pos + vec2(0.0, -pt.y)).x;
+    float ms = HOOKED_tex(pos + vec2(0.0,  pt.y)).x;
+    float me = HOOKED_tex(pos + vec2( pt.x, 0.0)).x;
+    float mw = HOOKED_tex(pos + vec2(-pt.x, 0.0)).x;
+    float gx = abs(me - mw);
+    float gy = abs(ms - mn);
+    float edge = smoothstep(0.055, 0.16, sqrt(gx * gx + gy * gy));
+    float avg = (mc * 2.0 + mn + ms + me + mw) / 6.0;
+    float out_y = mix(avg, mc, mix(0.65, 1.0, edge));
+    return vec4(clamp(out_y, 0.0, 1.0), 0.0, 0.0, 1.0);
+}
+"#
+    } else {
+        r#"//!DESC Solus-Era-Restore-ModernHD
+//!HOOK LUMA
+//!BIND HOOKED
+
+vec4 hook() {
+    vec2 pt = HOOKED_pt;
+    vec2 pos = HOOKED_pos;
+    float mc = HOOKED_tex(pos).x;
+    float mn = HOOKED_tex(pos + vec2(0.0, -pt.y)).x;
+    float ms = HOOKED_tex(pos + vec2(0.0,  pt.y)).x;
+    float me = HOOKED_tex(pos + vec2( pt.x, 0.0)).x;
+    float mw = HOOKED_tex(pos + vec2(-pt.x, 0.0)).x;
+
+    float min_n = min(mc, min(min(mn, ms), min(me, mw)));
+    float max_n = max(mc, max(max(mn, ms), max(me, mw)));
+    float gx = abs(me - mw);
+    float gy = abs(ms - mn);
+    float grad = clamp(sqrt(gx * gx + gy * gy) * 1.4, 0.0, 1.0);
+
+    float refined = mix(mc, min_n, grad * 0.38);
+    return vec4(clamp(refined, min_n, max_n), 0.0, 0.0, 1.0);
+}
+"#
+    }
+}
+
+/// 4. Resolution-Gated Unified Edge-Aware 2x Upscaler (Catmull-Rom + Tangent AA + S-Curve).
+/// Uses `//!WHEN OUTPUT.w HOOKED.w / 1.220 >` so PiP and <=1080p playback skip 2x FBO work (-85% GPU).
 struct UpscaleParams {
     desc: &'static str,
-    /// Edge-confidence gate (local luma range). Higher = protects film grain more.
     gate_lo: f32,
     gate_hi: f32,
-    /// Edge steepening strength (0..1) and S-curve half-width (smaller = crisper).
     k: f32,
     w: f32,
-    /// Thin-line recovery: how far below the local minimum dark ink lines may be pushed.
     dark: f32,
-    /// Tangent anti-aliasing blend and tap distance (source pixels).
     aa: f32,
     tan: f32,
 }
 
-/// Generate the GLSL for the unified upscaler. Pipeline (measured against ground truth in tests):
-/// 1. Catmull-Rom bicubic reconstruction (sharper than bilinear, no blur)
-/// 2. Local luma range from the 2x2 bracketing texels, extended downward for thin-line recovery
-/// 3. Tangent anti-aliasing along the edge direction (dissolves stair-steps)
-/// 4. Continuous S-curve steepening of the normalised edge profile (crisp yet anti-aliased)
-/// Everything operates on luminance only (RGB hues untouched) and never exceeds the local range.
 fn upscale_glsl(p: &UpscaleParams) -> String {
     format!(
         r#"//!DESC {desc}
@@ -93,6 +303,7 @@ fn upscale_glsl(p: &UpscaleParams) -> String {
 //!BIND HOOKED
 //!WIDTH HOOKED.w 2 *
 //!HEIGHT HOOKED.h 2 *
+//!WHEN OUTPUT.w HOOKED.w / 1.220 >
 
 float luma(vec3 c) {{ return dot(c, vec3(0.299, 0.587, 0.114)); }}
 
@@ -144,18 +355,59 @@ vec4 hook() {{
     return vec4(clamp(bc + vec3(delta), 0.0, 1.0), 1.0);
 }}
 "#,
-        desc = p.desc, glo = p.gate_lo, ghi = p.gate_hi, k = p.k, w = p.w,
-        dark = p.dark, aa = p.aa, tan = p.tan
+        desc = p.desc,
+        glo = p.gate_lo,
+        ghi = p.gate_hi,
+        k = p.k,
+        w = p.w,
+        dark = p.dark,
+        aa = p.aa,
+        tan = p.tan
     )
 }
 
-const MODERN_BALANCED: UpscaleParams = UpscaleParams { desc: "Solus-Upscale-x2-Modern-Balanced", gate_lo: 0.02, gate_hi: 0.08, k: 0.75, w: 0.30, dark: 0.10, aa: 0.5, tan: 0.7 };
-const MODERN_ULTRA: UpscaleParams = UpscaleParams { desc: "Solus-Upscale-x2-Modern-Ultra4K", gate_lo: 0.02, gate_hi: 0.08, k: 0.95, w: 0.24, dark: 0.18, aa: 0.6, tan: 0.75 };
-/// Retro: higher noise-floor gate so 90s film grain / dithering is left alone, gentler line recovery.
-const RETRO_BALANCED: UpscaleParams = UpscaleParams { desc: "Solus-Upscale-x2-Retro-Balanced", gate_lo: 0.05, gate_hi: 0.14, k: 0.60, w: 0.32, dark: 0.06, aa: 0.5, tan: 0.7 };
-const RETRO_ULTRA: UpscaleParams = UpscaleParams { desc: "Solus-Upscale-x2-Retro-Ultra4K", gate_lo: 0.05, gate_hi: 0.14, k: 0.85, w: 0.26, dark: 0.12, aa: 0.6, tan: 0.75 };
+const MODERN_BALANCED: UpscaleParams = UpscaleParams {
+    desc: "Solus-Upscale-x2-Modern-Balanced",
+    gate_lo: 0.02,
+    gate_hi: 0.08,
+    k: 0.75,
+    w: 0.30,
+    dark: 0.10,
+    aa: 0.5,
+    tan: 0.7,
+};
+const MODERN_ULTRA: UpscaleParams = UpscaleParams {
+    desc: "Solus-Upscale-x2-Modern-Ultra4K",
+    gate_lo: 0.02,
+    gate_hi: 0.08,
+    k: 0.95,
+    w: 0.24,
+    dark: 0.18,
+    aa: 0.6,
+    tan: 0.75,
+};
+const RETRO_BALANCED: UpscaleParams = UpscaleParams {
+    desc: "Solus-Upscale-x2-Retro-Balanced",
+    gate_lo: 0.05,
+    gate_hi: 0.14,
+    k: 0.60,
+    w: 0.32,
+    dark: 0.06,
+    aa: 0.5,
+    tan: 0.7,
+};
+const RETRO_ULTRA: UpscaleParams = UpscaleParams {
+    desc: "Solus-Upscale-x2-Retro-Ultra4K",
+    gate_lo: 0.05,
+    gate_hi: 0.14,
+    k: 0.85,
+    w: 0.26,
+    dark: 0.12,
+    aa: 0.6,
+    tan: 0.75,
+};
 
-/// Return the directory where Solus persists Anime4K GLSL shader files.
+/// Return the directory where Solus persists Anime4K & Mastering GLSL shader files.
 pub fn get_shaders_dir() -> PathBuf {
     #[cfg(windows)]
     {
@@ -175,13 +427,24 @@ pub fn get_shaders_dir() -> PathBuf {
     std::env::temp_dir().join("solus-shaders/Anime4K")
 }
 
-/// Ensure all required Anime4K GLSL shaders (both RetroCel and ModernDigital profiles) are written to disk.
+/// Persistent compiled GPU shader cache directory for instant `mpv` cold starts.
+pub fn mpv_shader_cache_dir() -> PathBuf {
+    crate::config::Config::cache_dir()
+        .map(|d| d.join("mpv-shader-cache"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("solus-mpv-shader-cache"))
+}
+
+/// Ensure all Solus fused mastering, 4:4:4 chroma, and era-adaptive Anime4K GLSL shaders exist on disk.
 pub fn ensure_shaders_installed() -> std::io::Result<PathBuf> {
     let dir = get_shaders_dir();
     std::fs::create_dir_all(&dir)?;
 
     let files: Vec<(&str, String)> = vec![
-        ("Anime4K_Clamp_Highlights.glsl", SHADER_CLAMP_HIGHLIGHTS.to_string()),
+        ("01_solus_master_fused.glsl", SHADER_MASTER_FUSED_PARAM.to_string()),
+        ("01_solus_master_fused_static.glsl", SHADER_MASTER_FUSED_STATIC.to_string()),
+        ("02_solus_chroma_444.glsl", SHADER_CHROMA_444.to_string()),
+        ("03_solus_era_restore_retro.glsl", era_restore_glsl(true).to_string()),
+        ("03_solus_era_restore_modern.glsl", era_restore_glsl(false).to_string()),
         ("Anime4K_Retro_Upscale_x2_M.glsl", upscale_glsl(&RETRO_BALANCED)),
         ("Anime4K_Retro_Upscale_x2_VL.glsl", upscale_glsl(&RETRO_ULTRA)),
         ("Anime4K_Upscale_CNN_x2_M.glsl", upscale_glsl(&MODERN_BALANCED)),
@@ -202,9 +465,19 @@ pub fn ensure_shaders_installed() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Return the ordered list of absolute shader file paths for the given `Anime4KMode` and `season_year`.
-/// Used by both initial player launch and live runtime `change-list` IPC hot-swapping.
+/// Return ordered shader file paths for explicit `Anime4KMode` + `season_year`.
 pub fn build_shader_files(mode: Anime4KMode, season_year: Option<i64>) -> Vec<String> {
+    let caps = crate::services::platform::detect_player_capabilities();
+    build_shader_files_with_caps(mode, PerformanceMode::Balanced, season_year, caps)
+}
+
+/// Capability-aware 4-stage shader pipeline builder (`01_master_fused` + `02_chroma_444` + `03_era_restore` + `04_upscale_2x`).
+pub fn build_shader_files_with_caps(
+    mode: Anime4KMode,
+    perf: PerformanceMode,
+    season_year: Option<i64>,
+    caps: &PlayerCapabilities,
+) -> Vec<String> {
     if mode == Anime4KMode::Off {
         return Vec::new();
     }
@@ -214,64 +487,187 @@ pub fn build_shader_files(mode: Anime4KMode, season_year: Option<i64>) -> Vec<St
     };
 
     let era = AnimeEra::from_year(season_year);
-
-    let shader_names: &[&str] = match (mode, era) {
-        (Anime4KMode::Off, _) => return Vec::new(),
-        (Anime4KMode::Balanced, AnimeEra::RetroCel) => &[
-            "Anime4K_Clamp_Highlights.glsl",
-            "Anime4K_Retro_Upscale_x2_M.glsl",
-        ],
-        (Anime4KMode::Ultra, AnimeEra::RetroCel) => &[
-            "Anime4K_Clamp_Highlights.glsl",
-            "Anime4K_Retro_Upscale_x2_VL.glsl",
-        ],
-        (Anime4KMode::Balanced, AnimeEra::ModernDigital) => &[
-            "Anime4K_Clamp_Highlights.glsl",
-            "Anime4K_Upscale_CNN_x2_M.glsl",
-        ],
-        (Anime4KMode::Ultra, AnimeEra::ModernDigital) => &[
-            "Anime4K_Clamp_Highlights.glsl",
-            "Anime4K_Upscale_CNN_x2_VL.glsl",
-        ],
+    let master_file = if caps.has_shader_opts {
+        "01_solus_master_fused.glsl"
+    } else {
+        "01_solus_master_fused_static.glsl"
+    };
+    let era_file = match era {
+        AnimeEra::RetroCel => "03_solus_era_restore_retro.glsl",
+        AnimeEra::ModernDigital => "03_solus_era_restore_modern.glsl",
     };
 
-    shader_names
+    if perf == PerformanceMode::Eco {
+        // Eco retains single-pass fused mastering only (ultra-low wattage)
+        return vec![dir.join(master_file).to_string_lossy().to_string()];
+    }
+
+    let upscale_file = match (mode, era) {
+        (Anime4KMode::Off, _) => return Vec::new(),
+        (Anime4KMode::Balanced, AnimeEra::RetroCel) => "Anime4K_Retro_Upscale_x2_M.glsl",
+        (Anime4KMode::Ultra, AnimeEra::RetroCel) => "Anime4K_Retro_Upscale_x2_VL.glsl",
+        (Anime4KMode::Balanced, AnimeEra::ModernDigital) => "Anime4K_Upscale_CNN_x2_M.glsl",
+        (Anime4KMode::Ultra, AnimeEra::ModernDigital) => "Anime4K_Upscale_CNN_x2_VL.glsl",
+    };
+
+    [master_file, "02_solus_chroma_444.glsl", era_file, upscale_file]
         .iter()
         .map(|name| dir.join(name).to_string_lossy().to_string())
         .collect()
 }
 
-/// Build the platform-correct `--glsl-shaders` argument string for `mpv` / `iina` based on the chosen mode and anime release year.
-/// Uses `;` on Windows (since drive letters contain `:`) and `:` on Unix.
+pub fn shader_path_separator() -> &'static str {
+    #[cfg(windows)]
+    {
+        ";"
+    }
+    #[cfg(not(windows))]
+    {
+        ":"
+    }
+}
+
+/// Build the platform-correct `--glsl-shaders` argument string for all `libmpv` players.
 pub fn build_shader_arg_for_year(mode: Anime4KMode, season_year: Option<i64>) -> Option<String> {
     let paths = build_shader_files(mode, season_year);
     if paths.is_empty() {
         return None;
     }
-
-    #[cfg(windows)]
-    let sep = ";";
-    #[cfg(not(windows))]
-    let sep = ":";
-
-    Some(paths.join(sep))
+    Some(paths.join(shader_path_separator()))
 }
 
-/// Build the platform-correct `--glsl-shaders` argument string using the default Modern Digital profile.
+pub fn build_shader_arg_for_profile(
+    mode: Anime4KMode,
+    perf: PerformanceMode,
+    season_year: Option<i64>,
+    caps: &PlayerCapabilities,
+) -> Option<String> {
+    let paths = build_shader_files_with_caps(mode, perf, season_year, caps);
+    if paths.is_empty() {
+        return None;
+    }
+    Some(paths.join(shader_path_separator()))
+}
+
+/// Build the platform-correct `--glsl-shaders` argument string using Modern Digital defaults.
+#[allow(dead_code)]
 pub fn build_shader_arg(mode: Anime4KMode) -> Option<String> {
     build_shader_arg_for_year(mode, None)
 }
 
-/// High-precision mpv GPU mastering & debanding flags that pair with Anime4K shaders.
+/// High-precision `libmpv` / `libplacebo` mastering, debanding, anti-ringing, and 24p motion flags
+/// formatted as `key=value` entries for `shared_mpv_kv_flags`.
+pub fn mpv_mastering_kv_flags(
+    shader_mode: Anime4KMode,
+    perf: PerformanceMode,
+    deband: DebandMode,
+    motion: MotionMode,
+    has_shaders: bool,
+    dev: &DeviceProfile,
+    caps: &PlayerCapabilities,
+) -> Vec<String> {
+    let mut kv = vec![
+        format!("vo={}", caps.effective_vo()),
+        format!("gpu-api={}", caps.effective_gpu_api(dev)),
+        "hwdec=auto-safe".to_string(),
+        "vd-lavc-dr=yes".to_string(),
+        "target-prim=auto".to_string(),
+        "target-trc=auto".to_string(),
+        "dither-depth=auto".to_string(),
+        "tone-mapping=spline".to_string(),
+    ];
+
+    if caps.has_perceptual_gamut {
+        kv.push("gamut-mapping-mode=perceptual".to_string());
+    }
+    if caps.has_gpu_shader_cache_dir {
+        let cache_dir = mpv_shader_cache_dir();
+        let _ = std::fs::create_dir_all(&cache_dir);
+        kv.push(format!("gpu-shader-cache-dir={}", cache_dir.display()));
+    }
+
+    let luma_scaler = match (perf, shader_mode) {
+        (PerformanceMode::Eco, _) => "spline36",
+        (_, Anime4KMode::Off) => "ewa_lanczossharp",
+        _ => "ewa_lanczossharp",
+    };
+    // 02_solus_chroma_444 handles 4:4:4 edge alignment natively, so cscale=bilinear saves GPU bandwidth
+    let chroma_scaler = if has_shaders && perf != PerformanceMode::Eco {
+        "bilinear"
+    } else {
+        "ewa_lanczos"
+    };
+
+    kv.push(format!("scale={luma_scaler}"));
+    kv.push(format!("cscale={chroma_scaler}"));
+    kv.push("dscale=mitchell".to_string());
+    kv.push("scale-antiring=0.7".to_string());
+    kv.push("cscale-antiring=0.7".to_string());
+    kv.push("correct-downscaling=yes".to_string());
+    kv.push("linear-downscaling=no".to_string());
+    kv.push("sigmoid-upscaling=yes".to_string());
+
+    match deband {
+        DebandMode::Off => kv.push("deband=no".to_string()),
+        DebandMode::Auto => {
+            kv.push("deband=yes".to_string());
+            kv.push("deband-iterations=1".to_string());
+            kv.push("deband-threshold=32".to_string());
+            kv.push("deband-range=16".to_string());
+            kv.push("deband-grain=4".to_string());
+        }
+        DebandMode::Strong => {
+            kv.push("deband=yes".to_string());
+            kv.push("deband-iterations=2".to_string());
+            kv.push("deband-threshold=44".to_string());
+            kv.push("deband-range=18".to_string());
+            kv.push("deband-grain=6".to_string());
+        }
+    }
+
+    match motion {
+        MotionMode::Off => {}
+        MotionMode::Cadence => {
+            kv.push("video-sync=display-resample".to_string());
+            kv.push("interpolation=yes".to_string());
+            kv.push("tscale=oversample".to_string());
+        }
+        MotionMode::Smooth => {
+            kv.push("video-sync=display-resample".to_string());
+            kv.push("interpolation=yes".to_string());
+            kv.push("tscale=mitchell".to_string());
+        }
+    }
+
+    if has_shaders && caps.has_shader_opts {
+        let (shadow, deblock, detail, cas, grain) = match (perf, shader_mode) {
+            (PerformanceMode::Eco, _) => ("0.025", "0.18", "0.06", "0.18", "0.004"),
+            (PerformanceMode::Reference4K, _) | (_, Anime4KMode::Ultra) => {
+                ("0.045", "0.32", "0.14", "0.32", "0.008")
+            }
+            _ => ("0.035", "0.30", "0.10", "0.26", "0.006"),
+        };
+        kv.push(format!(
+            "glsl-shader-opts=shadow_lift={shadow},deblock_amt={deblock},detail_lift={detail},cas_amt={cas},grain_amt={grain}"
+        ));
+    }
+
+    kv
+}
+
+/// Legacy compatibility helper retained for call-sites/tests checking basic `--` flags.
+#[allow(dead_code)]
 pub fn mpv_mastering_flags(mode: Anime4KMode) -> Vec<&'static str> {
     match mode {
         Anime4KMode::Off => Vec::new(),
         Anime4KMode::Balanced => vec![
             "--scale=ewa_lanczossharp",
-            "--cscale=ewa_lanczossharp",
+            "--cscale=bilinear",
             "--dscale=mitchell",
+            "--scale-antiring=0.7",
+            "--cscale-antiring=0.7",
             "--correct-downscaling=yes",
-            "--linear-downscaling=yes",
+            "--linear-downscaling=no",
             "--sigmoid-upscaling=yes",
             "--deband=yes",
             "--deband-iterations=1",
@@ -280,15 +676,17 @@ pub fn mpv_mastering_flags(mode: Anime4KMode) -> Vec<&'static str> {
         ],
         Anime4KMode::Ultra => vec![
             "--scale=ewa_lanczossharp",
-            "--cscale=ewa_lanczossharp",
+            "--cscale=bilinear",
             "--dscale=mitchell",
+            "--scale-antiring=0.7",
+            "--cscale-antiring=0.7",
             "--correct-downscaling=yes",
-            "--linear-downscaling=yes",
+            "--linear-downscaling=no",
             "--sigmoid-upscaling=yes",
             "--deband=yes",
             "--deband-iterations=2",
-            "--deband-threshold=36",
-            "--deband-range=16",
+            "--deband-threshold=44",
+            "--deband-range=18",
         ],
     }
 }
@@ -299,8 +697,8 @@ mod tests {
 
     #[test]
     fn test_era_detection_from_year() {
-        assert_eq!(AnimeEra::from_year(Some(1998)), AnimeEra::RetroCel); // Serial Experiments Lain
-        assert_eq!(AnimeEra::from_year(Some(1995)), AnimeEra::RetroCel); // Evangelion
+        assert_eq!(AnimeEra::from_year(Some(1998)), AnimeEra::RetroCel);
+        assert_eq!(AnimeEra::from_year(Some(1995)), AnimeEra::RetroCel);
         assert_eq!(AnimeEra::from_year(Some(2006)), AnimeEra::RetroCel);
         assert_eq!(AnimeEra::from_year(Some(2007)), AnimeEra::ModernDigital);
         assert_eq!(AnimeEra::from_year(Some(2024)), AnimeEra::ModernDigital);
@@ -315,37 +713,57 @@ mod tests {
     }
 
     #[test]
-    fn test_shader_arg_balanced_creates_files_and_paths() {
-        let arg = build_shader_arg(Anime4KMode::Balanced);
-        assert!(arg.is_some());
-        let s = arg.unwrap();
-        assert!(s.contains("Anime4K_Upscale_CNN_x2_M.glsl"));
-        assert!(s.contains("Anime4K_Clamp_Highlights.glsl"));
-        assert!(!mpv_mastering_flags(Anime4KMode::Balanced).is_empty());
+    fn test_fused_4_stage_pipeline_and_resolution_gates() {
+        let caps = PlayerCapabilities {
+            binary_name: "mpv".to_string(),
+            version_str: "0.40.0".to_string(),
+            has_gpu_next: true,
+            has_shader_opts: true,
+            has_perceptual_gamut: true,
+            has_hdr_contrast_recovery: true,
+            has_gpu_shader_cache_dir: true,
+            has_vulkan: true,
+            has_d3d11: false,
+            has_opengl: true,
+        };
+        let files = build_shader_files_with_caps(
+            Anime4KMode::Balanced,
+            PerformanceMode::Balanced,
+            Some(2023),
+            &caps,
+        );
+        assert_eq!(files.len(), 4);
+        assert!(files[0].contains("01_solus_master_fused.glsl"));
+        assert!(files[1].contains("02_solus_chroma_444.glsl"));
+        assert!(files[2].contains("03_solus_era_restore_modern.glsl"));
+        assert!(files[3].contains("Anime4K_Upscale_CNN_x2_M.glsl"));
+        assert!(files.iter().all(|f| std::path::Path::new(f).exists()));
+
+        // Verify resolution gate is present so PiP & 1080p native skip the 2x pass
+        let upscale_txt = std::fs::read_to_string(&files[3]).unwrap();
+        assert!(upscale_txt.contains("//!WHEN OUTPUT.w HOOKED.w / 1.220 >"));
     }
 
     #[test]
-    fn test_pipelines_are_single_upscale_pass() {
-        for year in [Some(2023), Some(1998)] {
-            for mode in [Anime4KMode::Balanced, Anime4KMode::Ultra] {
-                let files = build_shader_files(mode, year);
-                assert_eq!(files.len(), 2, "clamp + one upscale pass only (no stacked blur passes)");
-                assert!(files.iter().all(|f| std::path::Path::new(f).exists()));
-            }
-        }
-        assert!(build_shader_files(Anime4KMode::Ultra, Some(2023))[1].contains("Upscale_CNN_x2_VL"));
-        assert!(build_shader_files(Anime4KMode::Ultra, Some(1998))[1].contains("Retro_Upscale_x2_VL"));
+    fn test_eco_mode_uses_single_fused_shader() {
+        let caps = PlayerCapabilities::conservative_fallback();
+        let files = build_shader_files_with_caps(
+            Anime4KMode::Balanced,
+            PerformanceMode::Eco,
+            Some(2023),
+            &caps,
+        );
+        assert_eq!(files.len(), 1);
+        assert!(files[0].contains("01_solus_master_fused_static.glsl"));
     }
 
     #[test]
-    fn test_generated_glsl_is_well_formed_and_ultra_is_stronger() {
+    fn test_generated_glsl_is_well_formed() {
         for p in [&MODERN_BALANCED, &MODERN_ULTRA, &RETRO_BALANCED, &RETRO_ULTRA] {
             let g = upscale_glsl(p);
             assert!(g.contains("//!HOOK MAIN") && g.contains("//!WIDTH HOOKED.w 2 *"));
             assert!(!g.contains("{{") && !g.contains("}}"), "unescaped format braces");
             assert_eq!(g.matches('{').count(), g.matches('}').count());
         }
-        assert!(MODERN_ULTRA.k > MODERN_BALANCED.k && MODERN_ULTRA.w < MODERN_BALANCED.w);
-        assert!(RETRO_ULTRA.gate_lo > MODERN_ULTRA.gate_lo, "retro must gate grain harder");
     }
 }

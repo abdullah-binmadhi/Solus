@@ -217,6 +217,20 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         crate::services::shaders::AnimeEra::ModernDigital => Style::default().fg(Color::Rgb(90, 210, 255)).add_modifier(Modifier::BOLD),
     };
 
+    let player_badge = if state.selected_player() == crate::config::Player::AutoBest {
+        let eff = if state.has_mpv {
+            "mpv"
+        } else if cfg!(windows) && state.has_mpvnet {
+            "mpv.net"
+        } else if cfg!(target_os = "linux") && state.has_celluloid {
+            "Celluloid"
+        } else {
+            "mpv"
+        };
+        format!(" Auto-Best ({eff}) ")
+    } else {
+        format!(" {} ", state.selected_player().label())
+    };
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(
@@ -234,7 +248,7 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         Line::from(vec![
             Span::styled(" Player: ", Style::default().fg(theme.text_dim)),
             Span::styled(
-                format!(" {} ", state.selected_player().as_str()),
+                player_badge,
                 Style::default()
                     .fg(Color::Black)
                     .bg(theme.primary)
@@ -391,15 +405,22 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             let is_selected = i == state.playback_player_cursor;
             let radio = if is_selected { " [●] " } else { " [○] " };
             let (name, is_avail) = match player {
-                crate::config::Player::Mpv => ("mpv", state.has_mpv),
-                crate::config::Player::Iina => {
-                    if cfg!(target_os = "macos") {
-                        ("iina", state.has_iina)
+                crate::config::Player::AutoBest => ("Auto-Best (libmpv)", state.has_any_player()),
+                crate::config::Player::Mpv => ("mpv (100%)", state.has_mpv),
+                crate::config::Player::MpvNet => {
+                    if cfg!(windows) {
+                        ("mpv.net (Win 99%)", state.has_mpvnet)
                     } else {
-                        ("iina (macOS)", false)
+                        ("mpv.net (Win)", false)
                     }
                 }
-                crate::config::Player::Vlc => ("vlc", state.has_vlc),
+                crate::config::Player::Celluloid => {
+                    if cfg!(target_os = "linux") {
+                        ("Celluloid (GTK 95%)", state.has_celluloid)
+                    } else {
+                        ("Celluloid (Linux)", false)
+                    }
+                }
             };
 
             let style = if !is_avail {

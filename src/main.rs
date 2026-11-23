@@ -71,8 +71,8 @@ enum AppMessage {
     DependenciesReady {
         ani_cli: bool,
         mpv: bool,
-        iina: bool,
-        vlc: bool,
+        mpvnet: bool,
+        celluloid: bool,
         prompt_setup: bool,
     },
     /// Watchlist changed — send fresh grouped list, provenance sources, and statuses to update home row immediately
@@ -421,6 +421,9 @@ async fn main() -> anyhow::Result<()> {
     state.theme_index = (active_profile.theme_index.max(0) as usize) % ui::theme::THEMES.len();
     state.auth = config::AuthConfig::load_for_profile(&active_profile.id);
     state.anime4k_mode = cfg.anime4k_mode;
+    state.performance_mode = cfg.performance_mode;
+    state.deband_mode = cfg.deband_mode;
+    state.motion_mode = cfg.motion_mode;
     state.ambilight_enabled = cfg.ambilight_enabled;
     state.network_mode = cfg.network_mode;
     state.force_ipv4 = cfg.force_ipv4;
@@ -761,8 +764,8 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                AppMessage::DependenciesReady { ani_cli, mpv, iina, vlc, prompt_setup } => {
-                    state.set_dependencies(ani_cli, mpv, iina, vlc);
+                AppMessage::DependenciesReady { ani_cli, mpv, mpvnet, celluloid, prompt_setup } => {
+                    state.set_dependencies(ani_cli, mpv, mpvnet, celluloid);
                     if prompt_setup && !state.has_any_player() && state.screen != Screen::Setup {
                         state.open_setup();
                     }
@@ -3762,13 +3765,13 @@ fn spawn_dependency_check(
     tokio::spawn(async move {
         let deps = tokio::task::spawn_blocking(api::player::detect_dependencies)
             .await
-            .unwrap_or((false, false, false, false));
+            .unwrap_or_default();
         let _ = tx_dep
             .send(AppMessage::DependenciesReady {
-                ani_cli: deps.0,
-                mpv: deps.1,
-                iina: deps.2,
-                vlc: deps.3,
+                ani_cli: deps.has_ani_cli,
+                mpv: deps.has_mpv,
+                mpvnet: deps.has_mpvnet,
+                celluloid: deps.has_celluloid,
                 prompt_setup,
             })
             .await;
@@ -3790,8 +3793,8 @@ fn trigger_banner_progress(
 }
 
 fn refresh_dependency_status(state: &mut AppState) {
-    let (ani_cli, mpv, iina, vlc) = api::player::detect_dependencies();
-    state.set_dependencies(ani_cli, mpv, iina, vlc);
+    let deps = api::player::detect_dependencies();
+    state.set_dependencies(deps.has_ani_cli, deps.has_mpv, deps.has_mpvnet, deps.has_celluloid);
 }
 
 fn quality_label(idx: usize) -> &'static str {
@@ -4569,20 +4572,20 @@ async fn handle_playback_options(
                 }
 
                 let chosen_player = state.selected_player();
-                if chosen_player == config::Player::Iina && !cfg!(target_os = "macos") {
-                    state.show_toast("IINA is only supported on macOS. Please select mpv or vlc.", unix_now());
-                    return;
-                }
-                if chosen_player == config::Player::Iina && !state.has_iina {
-                    state.show_toast("IINA is not installed. Run 'brew install --cask iina' or select mpv.", unix_now());
+                if chosen_player == config::Player::AutoBest && !state.has_any_player() {
+                    state.show_toast("No libmpv player found (mpv / mpv.net / Celluloid). Press ! for setup.", unix_now());
                     return;
                 }
                 if chosen_player == config::Player::Mpv && !state.has_mpv {
-                    state.show_toast("mpv is not installed. Press ! to check setup.", unix_now());
+                    state.show_toast("mpv is not installed. Press ! to check setup or select Auto-Best.", unix_now());
                     return;
                 }
-                if chosen_player == config::Player::Vlc && !state.has_vlc {
-                    state.show_toast("VLC is not installed. Press ! to check setup.", unix_now());
+                if chosen_player == config::Player::MpvNet && (!cfg!(windows) || !state.has_mpvnet) {
+                    state.show_toast("mpv.net requires Windows with mpvnet installed. Select Auto-Best or mpv.", unix_now());
+                    return;
+                }
+                if chosen_player == config::Player::Celluloid && (!cfg!(target_os = "linux") || !state.has_celluloid) {
+                    state.show_toast("Celluloid requires Linux with celluloid installed. Select Auto-Best or mpv.", unix_now());
                     return;
                 }
 
@@ -4654,9 +4657,12 @@ async fn handle_playback_options(
                         }
                     }
                     state::PlaybackOptionsPurpose::LaunchNow => {
-                        let glsl_shaders = services::shaders::build_shader_arg_for_year(
+                        let caps = services::platform::detect_player_capabilities();
+                        let glsl_shaders = services::shaders::build_shader_arg_for_profile(
                             state.anime4k_mode,
+                            cfg.performance_mode,
                             anime.season_year,
+                            caps,
                         );
                         let opts = api::player::PlayOptions {
                             title:   query,
@@ -4678,6 +4684,10 @@ async fn handle_playback_options(
                             force_ipv4: cfg.force_ipv4,
                             auto_fullscreen: cfg.auto_fullscreen,
                             auto_pip: cfg.auto_pip,
+                            shader_mode: state.anime4k_mode,
+                            performance_mode: cfg.performance_mode,
+                            deband_mode: cfg.deband_mode,
+                            motion_mode: cfg.motion_mode,
                         };
                         start_playback(state, opts, title, ep, tx, pool, cfg).await;
                     }
@@ -4982,6 +4992,105 @@ async fn execute_hub_action(
                 "● Mobile LAN Remote: Disabled"
             };
             state.show_toast(msg, unix_now());
+        }
+        PlaybackEngine => {
+            cfg.player = if delta < 0 { cfg.player.prev() } else { cfg.player.next() };
+            if let Some(pos) = state.playback_players.iter().position(|p| *p == cfg.player) {
+                state.playback_player_cursor = pos;
+            }
+            let _ = cfg.save();
+            state.show_toast(
+                format!("❖ Playback Engine: {} ({})", cfg.player.label(), cfg.player.parity_badge()),
+                unix_now(),
+            );
+        }
+        PerformanceMode => {
+            cfg.performance_mode = if delta < 0 {
+                cfg.performance_mode.prev()
+            } else {
+                cfg.performance_mode.next()
+            };
+            state.performance_mode = cfg.performance_mode;
+            let _ = cfg.save();
+            if let Some(sock) = services::ipc::get_active_socket_path() {
+                let (shadow, deblock, detail, cas, grain) = match cfg.performance_mode {
+                    config::PerformanceMode::Eco => ("0.025", "0.18", "0.06", "0.18", "0.004"),
+                    config::PerformanceMode::Reference4K => ("0.045", "0.32", "0.14", "0.32", "0.008"),
+                    config::PerformanceMode::Balanced | config::PerformanceMode::Auto => {
+                        ("0.035", "0.30", "0.10", "0.26", "0.006")
+                    }
+                };
+                let val = format!(
+                    "shadow_lift={shadow},deblock_amt={deblock},detail_lift={detail},cas_amt={cas},grain_amt={grain}"
+                );
+                let label = format!("❖ Perf Tier: {}", cfg.performance_mode.as_str());
+                tokio::spawn(async move {
+                    let _ = services::remote::send_mpv_command(
+                        &sock,
+                        &["set_property", "glsl-shader-opts", &val],
+                    )
+                    .await;
+                    let _ = services::remote::send_mpv_command(&sock, &["show-text", &label, "2000"]).await;
+                });
+            }
+            state.show_toast(format!("❖ Mastering Tier: {}", cfg.performance_mode.as_str()), unix_now());
+        }
+        DebandMode => {
+            cfg.deband_mode = cfg.deband_mode.next();
+            state.deband_mode = cfg.deband_mode;
+            let _ = cfg.save();
+            if let Some(sock) = services::ipc::get_active_socket_path() {
+                let mode = cfg.deband_mode;
+                tokio::spawn(async move {
+                    match mode {
+                        config::DebandMode::Off => {
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "deband", "no"]).await;
+                        }
+                        config::DebandMode::Auto => {
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "deband", "yes"]).await;
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "deband-iterations", "1"]).await;
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "deband-threshold", "32"]).await;
+                        }
+                        config::DebandMode::Strong => {
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "deband", "yes"]).await;
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "deband-iterations", "2"]).await;
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "deband-threshold", "44"]).await;
+                        }
+                    }
+                    let msg = format!("❖ Debanding: {}", mode.as_str());
+                    let _ = services::remote::send_mpv_command(&sock, &["show-text", &msg, "2000"]).await;
+                });
+            }
+            state.show_toast(format!("❖ Deband: {}", cfg.deband_mode.as_str()), unix_now());
+        }
+        MotionMode => {
+            cfg.motion_mode = cfg.motion_mode.next();
+            state.motion_mode = cfg.motion_mode;
+            let _ = cfg.save();
+            if let Some(sock) = services::ipc::get_active_socket_path() {
+                let mode = cfg.motion_mode;
+                tokio::spawn(async move {
+                    match mode {
+                        config::MotionMode::Off => {
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "interpolation", "no"]).await;
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "video-sync", "audio"]).await;
+                        }
+                        config::MotionMode::Cadence => {
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "video-sync", "display-resample"]).await;
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "tscale", "oversample"]).await;
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "interpolation", "yes"]).await;
+                        }
+                        config::MotionMode::Smooth => {
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "video-sync", "display-resample"]).await;
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "tscale", "mitchell"]).await;
+                            let _ = services::remote::send_mpv_command(&sock, &["set_property", "interpolation", "yes"]).await;
+                        }
+                    }
+                    let msg = format!("❖ Motion Cadence: {}", mode.as_str());
+                    let _ = services::remote::send_mpv_command(&sock, &["show-text", &msg, "2000"]).await;
+                });
+            }
+            state.show_toast(format!("❖ Motion: {}", cfg.motion_mode.as_str()), unix_now());
         }
         Anime4kMode => {
             let modes = [
@@ -7257,6 +7366,10 @@ async fn play_queue_item(
             force_ipv4: cfg.force_ipv4,
             auto_fullscreen: cfg.auto_fullscreen,
             auto_pip: cfg.auto_pip,
+            shader_mode: state.anime4k_mode,
+            performance_mode: cfg.performance_mode,
+            deband_mode: cfg.deband_mode,
+            motion_mode: cfg.motion_mode,
         });
 
     opts.ipc_socket = None;
@@ -7265,11 +7378,20 @@ async fn play_queue_item(
     opts.force_ipv4 = cfg.force_ipv4;
     opts.auto_fullscreen = cfg.auto_fullscreen;
     opts.auto_pip = cfg.auto_pip;
+    opts.shader_mode = state.anime4k_mode;
+    opts.performance_mode = cfg.performance_mode;
+    opts.deband_mode = cfg.deband_mode;
+    opts.motion_mode = cfg.motion_mode;
     opts.sub_style = Some(cfg.subtitle_style.clone());
     opts.sub_delay_ms = state.subtitle_delay_ms;
     if state.anime4k_mode != config::Anime4KMode::Off {
-        opts.glsl_shaders =
-            services::shaders::build_shader_arg_for_year(state.anime4k_mode, item.season_year);
+        let caps = services::platform::detect_player_capabilities();
+        opts.glsl_shaders = services::shaders::build_shader_arg_for_profile(
+            state.anime4k_mode,
+            cfg.performance_mode,
+            item.season_year,
+            caps,
+        );
     }
 
     state.queue.active_item = Some(services::queue::ActiveNowItem {
@@ -7971,11 +8093,7 @@ async fn handle_queue_modal(
                 };
                 open_detail_from_anime(state, target_anime.clone(), pool, tx).await;
                 state.selected_episode = Some(item.episode);
-                let player = match item.player.to_lowercase().as_str() {
-                    "iina" => config::Player::Iina,
-                    "vlc" => config::Player::Vlc,
-                    _ => config::Player::Mpv,
-                };
+                let player = config::Player::from_str_lossy(&item.player);
                 state.open_playback_options(item.query.clone(), 0, item.dub, player);
                 state.playback_options_purpose =
                     state::PlaybackOptionsPurpose::EditQueueItem { uid: item.uid };
@@ -9355,9 +9473,12 @@ async fn launch_remote_stream_switch(
             .filter(|u| !u.is_empty())
     };
 
-    let glsl_shaders = services::shaders::build_shader_arg_for_year(
+    let caps = services::platform::detect_player_capabilities();
+    let glsl_shaders = services::shaders::build_shader_arg_for_profile(
         state.anime4k_mode,
+        cfg.performance_mode,
         season_year,
+        caps,
     );
 
     let opts = api::player::PlayOptions {
@@ -9380,6 +9501,10 @@ async fn launch_remote_stream_switch(
         force_ipv4: cfg.force_ipv4,
         auto_fullscreen: cfg.auto_fullscreen,
         auto_pip: cfg.auto_pip,
+        shader_mode: state.anime4k_mode,
+        performance_mode: cfg.performance_mode,
+        deband_mode: cfg.deband_mode,
+        motion_mode: cfg.motion_mode,
     };
     start_playback(state, opts, title, ep, tx, pool, cfg).await;
 }
@@ -9407,20 +9532,24 @@ async fn start_playback(
     state.screen      = Screen::Detail;
     state.pending_playback_query = None;
 
-    let (has_ani_cli, has_mpv, has_iina, has_vlc) = api::player::detect_dependencies();
-    state.set_dependencies(has_ani_cli, has_mpv, has_iina, has_vlc);
-    if opts.stream_url.is_none() && !has_ani_cli {
+    let deps = api::player::detect_dependencies();
+    state.set_dependencies(deps.has_ani_cli, deps.has_mpv, deps.has_mpvnet, deps.has_celluloid);
+    if opts.stream_url.is_none() && !deps.has_ani_cli {
         state.show_toast("ani-cli is required for Pahe/Gogo streams. Open ! for setup help.", unix_now());
         return;
     }
-    if !(has_mpv || has_iina || has_vlc) {
-        state.show_toast("No supported player found (mpv/vlc). Open ! for setup help.", unix_now());
+    if !deps.has_any_player() {
+        state.show_toast("No supported libmpv engine found (mpv / mpv.net / Celluloid). Open ! for setup.", unix_now());
         return;
     }
 
     let mut opts = opts;
     opts.auto_fullscreen = cfg.auto_fullscreen;
     opts.auto_pip = cfg.auto_pip;
+    opts.shader_mode = state.anime4k_mode;
+    opts.performance_mode = cfg.performance_mode;
+    opts.deband_mode = cfg.deband_mode;
+    opts.motion_mode = cfg.motion_mode;
     state.last_play_options = Some(opts.clone());
     let anime_id = state.selected_anime.as_ref().map(|a| a.id).unwrap_or(0);
     let season_year = state.selected_anime.as_ref().and_then(|a| a.season_year);
@@ -9467,9 +9596,15 @@ async fn start_playback(
     }
     let era = services::shaders::AnimeEra::from_year(season_year);
 
-    // Ensure shaders are Era-Adaptive if Anime4K is enabled
+    // Ensure shaders are Era-Adaptive & capability-aware if Anime4K is enabled
     if state.anime4k_mode != config::Anime4KMode::Off {
-        opts.glsl_shaders = services::shaders::build_shader_arg_for_year(state.anime4k_mode, season_year);
+        let caps = services::platform::detect_player_capabilities();
+        opts.glsl_shaders = services::shaders::build_shader_arg_for_profile(
+            state.anime4k_mode,
+            cfg.performance_mode,
+            season_year,
+            caps,
+        );
     }
 
     // 1. Instant 0ms launch if episode was downloaded offline
@@ -9720,15 +9855,12 @@ async fn start_playback(
         }
     }
 
-    // 5. Generate rotating Y2K loading screen for mpv and spawn player immediately;
+    // 5. Generate rotating Y2K loading screen for direct libmpv engines (mpv / mpv.net)
     // AniSkip intervals are resolved concurrently by the IPC monitor.
     let mal_id_opt = state.anime_mal_ids.get(&anime_id).copied();
+    let (resolved_engine, _) = api::player::resolve_engine_executable(&opts.player);
 
-    if opts.stream_url.is_some()
-        && api::player::resolve_player(&opts.player)
-            .to_lowercase()
-            .contains("mpv")
-    {
+    if opts.stream_url.is_some() && resolved_engine != config::Player::Celluloid {
         let variant = services::loading_art::next_loading_variant_index();
         opts.loading_image =
             services::loading_art::generate_y2k_loading_screen(&title, episode, variant)
@@ -9745,7 +9877,10 @@ async fn start_playback(
         }
     };
 
-    state.show_toast(format!("Launching Episode {} in external player", episode), unix_now());
+    state.show_toast(
+        format!("Launching Episode {} in {}", episode, resolved_engine.label()),
+        unix_now(),
+    );
 
     // 6. Record in continue watching (without marking as completed history yet)
     if let Some(ref anime) = state.selected_anime {
@@ -9757,11 +9892,8 @@ async fn start_playback(
         });
     }
 
-    // 7. Spawn mpv IPC monitor for live tracking, auto-scrobble, auto-skip, and EOF classification
-    let has_mpv_ipc = opts.stream_url.is_some()
-        && api::player::resolve_player(&opts.player)
-            .to_lowercase()
-            .contains("mpv");
+    // 7. Spawn libmpv IPC monitor (100% parity across Auto-Best / mpv / mpv.net / Celluloid)
+    let has_mpv_ipc = opts.stream_url.is_some();
     let playback_exit_kind = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
         services::ipc::PLAYBACK_EXIT_UNKNOWN,
     ));

@@ -998,6 +998,10 @@ pub async fn resolve_item_prefetch(
         force_ipv4,
         auto_fullscreen: false,
         auto_pip: false,
+        shader_mode: anime4k_mode,
+        performance_mode: crate::config::PerformanceMode::Balanced,
+        deband_mode: crate::config::DebandMode::Auto,
+        motion_mode: crate::config::MotionMode::Off,
     };
 
     Some(ResolvedPrefetch {
@@ -1053,6 +1057,10 @@ mod tests {
                 force_ipv4: false,
                 auto_fullscreen: false,
                 auto_pip: false,
+                shader_mode: Anime4KMode::Off,
+                performance_mode: crate::config::PerformanceMode::Balanced,
+                deband_mode: crate::config::DebandMode::Auto,
+                motion_mode: crate::config::MotionMode::Off,
             },
             resolved_at,
             sub_synced: false,

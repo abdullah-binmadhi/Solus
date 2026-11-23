@@ -156,15 +156,12 @@ async fn download_single_episode(
     }
 
     // 2. Drive yt-dlp if available
-    let has_ytdlp = crate::api::player::resolve_player("yt-dlp") == "yt-dlp"
-        || Path::new("/opt/homebrew/bin/yt-dlp").exists()
-        || Path::new("/usr/local/bin/yt-dlp").exists();
+    let yt_bin = crate::api::player::find_binary("yt-dlp");
+    let has_ytdlp = yt_bin.is_some();
 
-    let yt_cmd = if Path::new("/opt/homebrew/bin/yt-dlp").exists() {
-        "/opt/homebrew/bin/yt-dlp"
-    } else {
-        "yt-dlp"
-    };
+    let yt_cmd = yt_bin
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "yt-dlp".to_string());
 
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

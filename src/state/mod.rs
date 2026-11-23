@@ -446,8 +446,8 @@ pub struct AppState {
     /// Runtime dependency status
     pub has_ani_cli: bool,
     pub has_mpv: bool,
-    pub has_iina: bool,
-    pub has_vlc: bool,
+    pub has_mpvnet: bool,
+    pub has_celluloid: bool,
 
     /// Toast notification: (message, expiry unix timestamp)
     pub toast:            Option<(String, i64)>,
@@ -602,6 +602,12 @@ pub struct AppState {
 
     /// Real-time Anime4K GLSL shader mode (Off, Balanced 2x, Ultra 4K)
     pub anime4k_mode: crate::config::Anime4KMode,
+    /// GPU mastering & thermal efficiency profile
+    pub performance_mode: crate::config::PerformanceMode,
+    /// Hardware debanding tier (Auto 1-pass, Off, Strong 2-pass)
+    pub deband_mode: crate::config::DebandMode,
+    /// 24fps anime camera panning cadence mode
+    pub motion_mode: crate::config::MotionMode,
 
     /// Personal Anime Wrapped & viewing telemetry data
     pub analytics_data: Option<crate::db::user::UserAnalytics>,
@@ -890,11 +896,7 @@ impl AppState {
             playback_sub_languages: vec![crate::api::subtitles::SubtitleOption::default_english()],
             playback_audio_tracks: Vec::new(),
             playback_sub_cursor: 0,
-            playback_players: if cfg!(target_os = "macos") {
-                vec![crate::config::Player::Mpv, crate::config::Player::Iina, crate::config::Player::Vlc]
-            } else {
-                vec![crate::config::Player::Mpv, crate::config::Player::Vlc]
-            },
+            playback_players: Self::host_players(),
             playback_player_cursor: 0,
             playback_providers: crate::api::subtitles::default_providers(),
             dub_available: None,
@@ -931,8 +933,8 @@ impl AppState {
             detail_history:     Vec::new(),
             has_ani_cli:      false,
             has_mpv:          false,
-            has_iina:         false,
-            has_vlc:          false,
+            has_mpvnet:       false,
+            has_celluloid:    false,
             toast:            None,
             is_loading:       true,
             preload_total:    0,
@@ -986,6 +988,9 @@ impl AppState {
             ambilight_theme:  None,
             ambilight_enabled: false,
             anime4k_mode:     crate::config::Anime4KMode::Off,
+            performance_mode: crate::config::PerformanceMode::Balanced,
+            deband_mode:      crate::config::DebandMode::Auto,
+            motion_mode:      crate::config::MotionMode::Off,
             analytics_data:   None,
             analytics_podium_idx: 0,
             analytics_list_scroll: 0,
@@ -1603,6 +1608,33 @@ impl AppState {
         self.screen = Screen::PlaybackQuery;
     }
 
+    /// Returns the unified `libmpv` players available on the current operating system.
+    pub fn host_players() -> Vec<crate::config::Player> {
+        #[cfg(windows)]
+        {
+            vec![
+                crate::config::Player::AutoBest,
+                crate::config::Player::Mpv,
+                crate::config::Player::MpvNet,
+            ]
+        }
+        #[cfg(target_os = "linux")]
+        {
+            vec![
+                crate::config::Player::AutoBest,
+                crate::config::Player::Mpv,
+                crate::config::Player::Celluloid,
+            ]
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            vec![
+                crate::config::Player::AutoBest,
+                crate::config::Player::Mpv,
+            ]
+        }
+    }
+
     /// Open the playback options overlay after a query has been chosen.
     pub fn open_playback_options(&mut self, query: String, quality_idx: usize, dub: bool, player: crate::config::Player) {
         self.bump_playback_request_generation();
@@ -1612,11 +1644,7 @@ impl AppState {
         self.playback_quality_cursor = quality_idx;
         self.pending_dub = dub;
         self.playback_sub_cursor = 0;
-        self.playback_players = if cfg!(target_os = "macos") {
-            vec![crate::config::Player::Mpv, crate::config::Player::Iina, crate::config::Player::Vlc]
-        } else {
-            vec![crate::config::Player::Mpv, crate::config::Player::Vlc]
-        };
+        self.playback_players = Self::host_players();
         self.playback_player_cursor = self.playback_players.iter().position(|p| *p == player).unwrap_or(0);
         self.playback_providers = crate::api::subtitles::default_providers();
         self.dub_available = None;
@@ -1820,16 +1848,16 @@ impl AppState {
     }
 
     /// Update the cached dependency status.
-    pub fn set_dependencies(&mut self, ani_cli: bool, mpv: bool, iina: bool, vlc: bool) {
+    pub fn set_dependencies(&mut self, ani_cli: bool, mpv: bool, mpvnet: bool, celluloid: bool) {
         self.has_ani_cli = ani_cli;
         self.has_mpv = mpv;
-        self.has_iina = iina;
-        self.has_vlc = vlc;
+        self.has_mpvnet = mpvnet;
+        self.has_celluloid = celluloid;
     }
 
-    /// True when playback can run with the currently installed tools.
+    /// True when at least one `libmpv`-compatible engine is installed.
     pub fn has_any_player(&self) -> bool {
-        self.has_mpv || self.has_iina || self.has_vlc
+        self.has_mpv || self.has_mpvnet || self.has_celluloid
     }
 
     /// Save the current detail screen so a related drill-down can return to it.
@@ -2106,15 +2134,18 @@ mod tests {
     #[test]
     fn test_playback_player_selection() {
         let mut state = AppState::new();
+        assert_eq!(state.selected_player(), crate::config::Player::AutoBest);
+        state.playback_player_cursor = 1;
         assert_eq!(state.selected_player(), crate::config::Player::Mpv);
-        if cfg!(target_os = "macos") {
-            state.playback_player_cursor = 1;
-            assert_eq!(state.selected_player(), crate::config::Player::Iina);
+        #[cfg(windows)]
+        {
             state.playback_player_cursor = 2;
-            assert_eq!(state.selected_player(), crate::config::Player::Vlc);
-        } else {
-            state.playback_player_cursor = 1;
-            assert_eq!(state.selected_player(), crate::config::Player::Vlc);
+            assert_eq!(state.selected_player(), crate::config::Player::MpvNet);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            state.playback_player_cursor = 2;
+            assert_eq!(state.selected_player(), crate::config::Player::Celluloid);
         }
     }
 

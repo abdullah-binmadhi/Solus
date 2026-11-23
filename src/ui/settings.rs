@@ -50,7 +50,11 @@ pub enum HubActionId {
     RemoteToggleServer,
     RemoteTheme,
     RemoteArtMode,
+    PlaybackEngine,
+    PerformanceMode,
     Anime4kMode,
+    DebandMode,
+    MotionMode,
     AutoFullscreen,
     PipMode,
     PipCorner,
@@ -123,6 +127,22 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
         config::Anime4KMode::Balanced => 1,
         config::Anime4KMode::Ultra    => 2,
     };
+    let engine_idx = config::Player::ALL
+        .iter()
+        .position(|&p| p == cfg.player)
+        .unwrap_or(0);
+    let perf_idx = config::PerformanceMode::ALL
+        .iter()
+        .position(|&m| m == cfg.performance_mode)
+        .unwrap_or(2);
+    let deband_idx = config::DebandMode::ALL
+        .iter()
+        .position(|&m| m == cfg.deband_mode)
+        .unwrap_or(0);
+    let motion_idx = config::MotionMode::ALL
+        .iter()
+        .position(|&m| m == cfg.motion_mode)
+        .unwrap_or(0);
     let update_idx = if !cfg.update.check_on_startup {
         2
     } else if cfg.update.auto_install {
@@ -188,13 +208,65 @@ pub fn get_hub_items(cfg: &config::Config, state: &AppState) -> Vec<HubItem> {
 
         // ── 2. VISUAL & PLAYBACK ENGINE ───────────────────────────────────────
         HubItem {
+            id: HubActionId::PlaybackEngine,
+            cat_idx: 2,
+            category: "❖ VISUAL & PLAYBACK ENGINE",
+            label: "Playback Engine (libmpv)",
+            keywords: "player engine mpv mpvnet celluloid auto-best libmpv wrapper",
+            badge: format!("[ {} ▾ ]", cfg.player.label()),
+            description: "Unified libmpv engine family (Auto-Best -> mpv -> Win mpv.net / Linux Celluloid). Every GLSL shader, Lua HUD, PiP window, and IPC feature runs identically across all engines.",
+            kind: HubActionKind::Cycle {
+                options: vec!["Auto-Best", "mpv", "mpv.net", "Celluloid"],
+                current: engine_idx,
+            },
+        },
+        HubItem {
+            id: HubActionId::PerformanceMode,
+            cat_idx: 2,
+            category: "❖ VISUAL & PLAYBACK ENGINE",
+            label: "Performance & Mastering Tier",
+            keywords: "performance eco balanced reference 4k thermal gpu wattage battery",
+            badge: format!("[ {} ▾ ]", cfg.performance_mode.as_str()),
+            description: "Controls GPU shader workload & thermal ceiling: Auto reacts to battery/heat, Eco keeps single-pass fused Luma only, Balanced enables 4:4:4 + 2x gating, Reference 4K pushes maximum detail.",
+            kind: HubActionKind::Cycle {
+                options: vec!["Auto", "Eco", "Balanced", "Reference 4K"],
+                current: perf_idx,
+            },
+        },
+        HubItem {
+            id: HubActionId::DebandMode,
+            cat_idx: 2,
+            category: "❖ VISUAL & PLAYBACK ENGINE",
+            label: "GPU Hardware Debanding",
+            keywords: "deband banding dark sky 8bit contours filter",
+            badge: format!("[ {} ▾ ]", cfg.deband_mode.as_str()),
+            description: "Hardware 1-pass or 2-pass gradient debanding inside libplacebo that removes dark-scene compression contours cleanly at <0.4ms GPU cost.",
+            kind: HubActionKind::Cycle {
+                options: vec!["Auto (1-Pass)", "Off", "Strong (2-Pass)"],
+                current: deband_idx,
+            },
+        },
+        HubItem {
+            id: HubActionId::MotionMode,
+            cat_idx: 2,
+            category: "❖ VISUAL & PLAYBACK ENGINE",
+            label: "24p Motion Cadence",
+            keywords: "motion cadence 24fps panning interpolation oversample 60hz 120hz",
+            badge: format!("[ {} ▾ ]", cfg.motion_mode.as_str()),
+            description: "Smooths slow 24fps anime camera pans on 60Hz/120Hz panels via display-resample oversampling without introducing soap-opera artifacts.",
+            kind: HubActionKind::Cycle {
+                options: vec!["Off", "Cadence 24->60", "Smooth 120Hz"],
+                current: motion_idx,
+            },
+        },
+        HubItem {
             id: HubActionId::AutoFullscreen,
             cat_idx: 2,
             category: "❖ VISUAL & PLAYBACK ENGINE",
             label: "Auto-Fullscreen on Launch",
-            keywords: "fullscreen fs cinema launch window maximize player mpv iina vlc",
+            keywords: "fullscreen fs cinema launch window maximize player mpv mpvnet celluloid",
             badge: if cfg.auto_fullscreen { "[✓] Enabled".into() } else { "[ ] Disabled".into() },
-            description: "Automatically enter fullscreen mode when launching mpv, IINA, or VLC, and toggle any currently open mpv window live via IPC.",
+            description: "Automatically enter fullscreen mode when launching any libmpv engine (mpv, mpv.net, Celluloid), and sync live via IPC.",
             kind: HubActionKind::Toggle(cfg.auto_fullscreen),
         },
         HubItem {
@@ -1149,9 +1221,10 @@ fn render_inspector_card(
                 Span::styled("Player Flag: ", Style::default().fg(theme.text_dim)),
                 Span::styled(
                     match cfg.player {
-                        config::Player::Mpv => "--fullscreen=yes (live IPC synced)",
-                        config::Player::Iina => "--mpv-fullscreen=yes",
-                        config::Player::Vlc => "--fullscreen",
+                        config::Player::Celluloid => "--mpv-fullscreen=yes (GTK libmpv)",
+                        config::Player::AutoBest | config::Player::Mpv | config::Player::MpvNet => {
+                            "--fullscreen=yes (live IPC synced)"
+                        }
                     },
                     Style::default().fg(Color::White),
                 ),
@@ -1161,6 +1234,39 @@ fn render_inspector_card(
                 Span::styled(
                     "Press [f] inside the player anytime to toggle fullscreen",
                     Style::default().fg(theme.accent),
+                ),
+            ]));
+        }
+        HubActionId::PlaybackEngine
+        | HubActionId::PerformanceMode
+        | HubActionId::Anime4kMode
+        | HubActionId::DebandMode
+        | HubActionId::MotionMode => {
+            let dev = crate::services::platform::detect_device_profile();
+            let caps = crate::services::platform::detect_player_capabilities();
+            lines.push(Line::from(vec![
+                Span::styled("Host Silicon: ", Style::default().fg(theme.text_dim)),
+                Span::styled(dev.inspector_header(), Style::default().fg(Color::White)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("HW & Video  : ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    format!("{} · {}", dev.recommended_hwdec, caps.inspector_summary()),
+                    Style::default().fg(theme.accent),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Engine Parity: ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    format!("{} ({}) · Bounded RAM: 72 MiB", cfg.player.label(), cfg.player.parity_badge()),
+                    Style::default().fg(theme.secondary),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("In-Player Keys: ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    "[a] Shaders  [d] Deband  [m] Motion  [g] Perf  [i/I] HUD  [p/P] PiP",
+                    Style::default().fg(Color::Rgb(120, 235, 175)),
                 ),
             ]));
         }
@@ -1199,17 +1305,26 @@ fn render_inspector_card(
             ]));
         }
         HubActionId::HealthDoctor => {
+            let dev = crate::services::platform::detect_device_profile();
+            let caps = crate::services::platform::detect_player_capabilities();
             lines.push(Line::from(vec![
-                Span::styled("Binaries: ", Style::default().fg(theme.text_dim)),
+                Span::styled("Engines : ", Style::default().fg(theme.text_dim)),
                 Span::styled(
                     format!(
-                        "ani-cli={} · mpv={} · iina={} · vlc={}",
+                        "ani-cli={} · mpv={} · mpv.net={} · celluloid={}",
                         if state.has_ani_cli { "OK" } else { "NO" },
                         if state.has_mpv { "OK" } else { "NO" },
-                        if state.has_iina { "OK" } else { "NO" },
-                        if state.has_vlc { "OK" } else { "NO" },
+                        if state.has_mpvnet { "OK" } else { "NO" },
+                        if state.has_celluloid { "OK" } else { "NO" },
                     ),
                     Style::default().fg(theme.text),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Pipeline: ", Style::default().fg(theme.text_dim)),
+                Span::styled(
+                    format!("{} · {}", dev.recommended_hwdec, caps.effective_vo()),
+                    Style::default().fg(theme.accent),
                 ),
             ]));
         }

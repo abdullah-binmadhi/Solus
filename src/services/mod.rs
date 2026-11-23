@@ -5,6 +5,7 @@ pub mod importer;
 pub mod ipc;
 pub mod loading_art;
 pub mod oauth;
+pub mod platform;
 pub mod queue;
 pub mod remote;
 pub mod scrobble;

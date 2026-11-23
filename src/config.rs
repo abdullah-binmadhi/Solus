@@ -172,14 +172,6 @@ impl NetworkMode {
         }
     }
 
-    pub fn vlc_network_caching_ms(&self) -> u32 {
-        match self {
-            Self::Normal => 3000,
-            Self::CongestedWifi => 8000,
-            Self::UltraSaver => 12000,
-        }
-    }
-
     pub fn prefer_compact_artwork(&self) -> bool {
         !matches!(self, Self::Normal)
     }
@@ -205,23 +197,234 @@ pub enum AudioMode {
     Dub,
 }
 
-/// Video player to use
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
+/// Unified `libmpv` video player engine selector (`Auto-Best`, `mpv`, `mpv.net`, `Celluloid`).
+/// Legacy `"iina"` / `"vlc"` config entries transparently migrate to `Player::AutoBest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Player {
     #[default]
+    AutoBest,
     Mpv,
-    Iina,
-    Vlc,
+    MpvNet,
+    Celluloid,
 }
 
 impl Player {
+    pub const ALL: [Player; 4] = [
+        Player::AutoBest,
+        Player::Mpv,
+        Player::MpvNet,
+        Player::Celluloid,
+    ];
+
+    pub fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "mpv" => Self::Mpv,
+            "mpv.net" | "mpvnet" => Self::MpvNet,
+            "celluloid" => Self::Celluloid,
+            // "auto", "auto-best", "autobest", and legacy "iina" / "vlc"
+            _ => Self::AutoBest,
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
+            Player::AutoBest => "auto-best",
             Player::Mpv => "mpv",
-            Player::Iina => "iina",
-            Player::Vlc => "vlc",
+            Player::MpvNet => "mpv.net",
+            Player::Celluloid => "celluloid",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Player::AutoBest => "Auto-Best",
+            Player::Mpv => "mpv",
+            Player::MpvNet => "mpv.net",
+            Player::Celluloid => "Celluloid",
+        }
+    }
+
+    pub fn parity_badge(&self) -> &'static str {
+        match self {
+            Player::AutoBest => "Auto-Best (libmpv)",
+            Player::Mpv => "100% Universal",
+            Player::MpvNet => "Win 99%",
+            Player::Celluloid => "Linux GTK 95%",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::AutoBest => Self::Mpv,
+            Self::Mpv => Self::MpvNet,
+            Self::MpvNet => Self::Celluloid,
+            Self::Celluloid => Self::AutoBest,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn prev(self) -> Self {
+        match self {
+            Self::AutoBest => Self::Celluloid,
+            Self::Mpv => Self::AutoBest,
+            Self::MpvNet => Self::Mpv,
+            Self::Celluloid => Self::MpvNet,
+        }
+    }
+}
+
+impl Serialize for Player {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Player {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer).unwrap_or_else(|_| "auto-best".to_string());
+        Ok(Self::from_str_lossy(&s))
+    }
+}
+
+/// GPU mastering & thermal efficiency profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceMode {
+    Auto,
+    Eco,
+    #[default]
+    Balanced,
+    Reference4K,
+}
+
+impl PerformanceMode {
+    pub const ALL: [PerformanceMode; 4] = [
+        PerformanceMode::Auto,
+        PerformanceMode::Eco,
+        PerformanceMode::Balanced,
+        PerformanceMode::Reference4K,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (Thermal)",
+            Self::Eco => "Eco",
+            Self::Balanced => "Balanced",
+            Self::Reference4K => "Reference 4K",
+        }
+    }
+
+    pub fn short_tag(self) -> &'static str {
+        match self {
+            Self::Auto => "AUTO",
+            Self::Eco => "ECO",
+            Self::Balanced => "BALANCED",
+            Self::Reference4K => "REF 4K",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Eco,
+            Self::Eco => Self::Balanced,
+            Self::Balanced => Self::Reference4K,
+            Self::Reference4K => Self::Auto,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Auto => Self::Reference4K,
+            Self::Eco => Self::Auto,
+            Self::Balanced => Self::Eco,
+            Self::Reference4K => Self::Balanced,
+        }
+    }
+}
+
+/// Hardware debanding tier eliminating 8-bit dark-scene contour banding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DebandMode {
+    #[default]
+    Auto,
+    Off,
+    Strong,
+}
+
+impl DebandMode {
+    pub const ALL: [DebandMode; 3] = [DebandMode::Auto, DebandMode::Off, DebandMode::Strong];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (1-Pass)",
+            Self::Off => "Off",
+            Self::Strong => "Strong (2-Pass)",
+        }
+    }
+
+    pub fn short_tag(self) -> &'static str {
+        match self {
+            Self::Auto => "1x",
+            Self::Off => "OFF",
+            Self::Strong => "2x",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Strong,
+            Self::Strong => Self::Off,
+            Self::Off => Self::Auto,
+        }
+    }
+}
+
+/// 24fps anime camera panning cadence & temporal interpolation mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionMode {
+    #[default]
+    Off,
+    Cadence,
+    Smooth,
+}
+
+impl MotionMode {
+    pub const ALL: [MotionMode; 3] = [MotionMode::Off, MotionMode::Cadence, MotionMode::Smooth];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "Off (Native 24p)",
+            Self::Cadence => "Cadence (24->60)",
+            Self::Smooth => "Smooth (120Hz)",
+        }
+    }
+
+    pub fn short_tag(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Cadence => "CADENCE",
+            Self::Smooth => "SMOOTH",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Cadence,
+            Self::Cadence => Self::Smooth,
+            Self::Smooth => Self::Off,
         }
     }
 }
@@ -322,18 +525,27 @@ pub struct Config {
     /// Network resilience profile (Normal, CongestedWifi, UltraSaver)
     #[serde(default)]
     pub network_mode:     NetworkMode,
-    /// Force IPv4 socket binding for HTTP / yt-dlp / VLC requests
+    /// Force IPv4 socket binding for HTTP / yt-dlp / libmpv network requests
     #[serde(default)]
     pub force_ipv4:       bool,
     /// Enable automatic HLS ladder downshift on sustained buffering/stalls
     #[serde(default = "default_true")]
     pub auto_abr_downshift: bool,
-    /// Automatically launch the external video player (mpv / IINA / VLC) in fullscreen mode
+    /// Automatically launch the external libmpv player in fullscreen mode
     #[serde(default)]
     pub auto_fullscreen: bool,
-    /// Automatically launch the external video player in borderless Picture-in-Picture (PiP) corner mode
+    /// Automatically launch the external libmpv player in borderless Picture-in-Picture (PiP) corner mode
     #[serde(default)]
     pub auto_pip: bool,
+    /// GPU mastering & thermal efficiency profile
+    #[serde(default)]
+    pub performance_mode: PerformanceMode,
+    /// Hardware debanding tier (Auto = 1-pass GPU, Off, Strong = 2-pass)
+    #[serde(default)]
+    pub deband_mode: DebandMode,
+    /// 24fps anime camera panning cadence & temporal interpolation mode
+    #[serde(default)]
+    pub motion_mode: MotionMode,
 }
 
 impl Default for Config {
@@ -359,6 +571,9 @@ impl Default for Config {
             auto_abr_downshift: true,
             auto_fullscreen:  false,
             auto_pip:         false,
+            performance_mode: PerformanceMode::default(),
+            deband_mode:      DebandMode::default(),
+            motion_mode:      MotionMode::default(),
         }
     }
 }
@@ -1094,7 +1309,10 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.quality, Quality::P1080);
         assert_eq!(cfg.audio_mode, AudioMode::Sub);
-        assert_eq!(cfg.player, Player::Mpv);
+        assert_eq!(cfg.player, Player::AutoBest);
+        assert_eq!(cfg.performance_mode, PerformanceMode::Balanced);
+        assert_eq!(cfg.deband_mode, DebandMode::Auto);
+        assert_eq!(cfg.motion_mode, MotionMode::Off);
         assert_eq!(cfg.cache.trending_ttl, 86_400);
         assert_eq!(cfg.cache.stable_ttl, 604_800);
     }
@@ -1107,10 +1325,17 @@ mod tests {
     }
 
     #[test]
-    fn test_player_as_str() {
+    fn test_player_as_str_and_legacy_migration() {
+        assert_eq!(Player::AutoBest.as_str(), "auto-best");
         assert_eq!(Player::Mpv.as_str(), "mpv");
-        assert_eq!(Player::Iina.as_str(), "iina");
-        assert_eq!(Player::Vlc.as_str(), "vlc");
+        assert_eq!(Player::MpvNet.as_str(), "mpv.net");
+        assert_eq!(Player::Celluloid.as_str(), "celluloid");
+
+        assert_eq!(Player::from_str_lossy("iina"), Player::AutoBest);
+        assert_eq!(Player::from_str_lossy("vlc"), Player::AutoBest);
+        assert_eq!(Player::from_str_lossy("mpvnet"), Player::MpvNet);
+        assert_eq!(Player::from_str_lossy("celluloid"), Player::Celluloid);
+        assert_eq!(Player::from_str_lossy("mpv"), Player::Mpv);
     }
 
     #[test]
@@ -1118,7 +1343,7 @@ mod tests {
         let original = Config {
             quality:          Quality::P720,
             audio_mode:       AudioMode::Dub,
-            player:           Player::Iina,
+            player:           Player::Celluloid,
             default_sub_lang: "Arabic".to_string(),
             auto_skip_intro:  true,
             anime4k_mode:     Anime4KMode::Balanced,
@@ -1136,13 +1361,16 @@ mod tests {
             auto_abr_downshift: false,
             auto_fullscreen:  true,
             auto_pip:         false,
+            performance_mode: PerformanceMode::Reference4K,
+            deband_mode:      DebandMode::Strong,
+            motion_mode:      MotionMode::Cadence,
         };
         let serialized   = toml::to_string_pretty(&original).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
 
         assert_eq!(deserialized.quality,          Quality::P720);
         assert_eq!(deserialized.audio_mode,       AudioMode::Dub);
-        assert_eq!(deserialized.player,           Player::Iina);
+        assert_eq!(deserialized.player,           Player::Celluloid);
         assert_eq!(deserialized.default_sub_lang, "Arabic");
         assert_eq!(deserialized.anime4k_mode,     Anime4KMode::Balanced);
         assert!(deserialized.ambilight_enabled);
@@ -1150,6 +1378,9 @@ mod tests {
         assert!(deserialized.force_ipv4);
         assert!(!deserialized.auto_abr_downshift);
         assert!(deserialized.auto_fullscreen);
+        assert_eq!(deserialized.performance_mode, PerformanceMode::Reference4K);
+        assert_eq!(deserialized.deband_mode,      DebandMode::Strong);
+        assert_eq!(deserialized.motion_mode,      MotionMode::Cadence);
     }
 
     #[test]
@@ -1263,10 +1494,6 @@ detail_ttl = 3600
         assert!(!NetworkMode::Normal.use_disk_cache());
         assert!(NetworkMode::CongestedWifi.use_disk_cache());
         assert!(NetworkMode::UltraSaver.use_disk_cache());
-
-        assert_eq!(NetworkMode::Normal.vlc_network_caching_ms(), 3000);
-        assert_eq!(NetworkMode::CongestedWifi.vlc_network_caching_ms(), 8000);
-        assert_eq!(NetworkMode::UltraSaver.vlc_network_caching_ms(), 12000);
 
         assert_eq!(Quality::P1080.clamped_for_network(NetworkMode::Normal), Quality::P1080);
         assert_eq!(Quality::Best.clamped_for_network(NetworkMode::CongestedWifi), Quality::P720);

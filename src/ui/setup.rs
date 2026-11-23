@@ -35,22 +35,27 @@ pub fn modal_pct(area: Rect) -> (u16, u16) {
 
 /// Video players exposed for interactive selection on the current OS.
 pub fn supported_players() -> &'static [Player] {
-    #[cfg(target_os = "macos")]
+    #[cfg(windows)]
     {
-        &[Player::Mpv, Player::Iina, Player::Vlc]
+        &[Player::AutoBest, Player::Mpv, Player::MpvNet]
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        &[Player::Mpv, Player::Vlc]
+        &[Player::AutoBest, Player::Mpv, Player::Celluloid]
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        &[Player::AutoBest, Player::Mpv]
     }
 }
 
-/// Returns whether a given player binary is detected in `PATH`.
+/// Returns whether a given `libmpv`-compatible engine is detected on this machine.
 pub fn player_installed(player: Player, state: &AppState) -> bool {
     match player {
+        Player::AutoBest => state.has_any_player(),
         Player::Mpv => state.has_mpv,
-        Player::Iina => state.has_iina,
-        Player::Vlc => state.has_vlc,
+        Player::MpvNet => state.has_mpvnet,
+        Player::Celluloid => state.has_celluloid,
     }
 }
 
@@ -267,17 +272,30 @@ fn render_binary_matrix(
         Style::default().fg(theme.divider),
     )));
 
-    for &player in supported_players() {
+    for &player in &Player::ALL {
         let installed = player_installed(player, state);
         let is_selected = cfg.player == player;
         let role = match player {
-            Player::Mpv => "Primary + Anime4K shaders",
-            Player::Iina => "macOS-native player",
-            Player::Vlc => "Universal fallback engine",
+            Player::AutoBest => "Auto-Best (libmpv parity default)",
+            Player::Mpv => "100% Universal + vo=gpu-next + GLSL",
+            Player::MpvNet => {
+                if cfg!(windows) {
+                    "Win 99% native libmpv GUI shell"
+                } else {
+                    "Win 99% libmpv shell (Windows Only)"
+                }
+            }
+            Player::Celluloid => {
+                if cfg!(target_os = "linux") {
+                    "Linux GTK 95% native libmpv shell"
+                } else {
+                    "Linux GTK 95% libmpv shell (Linux Only)"
+                }
+            }
         };
         push_binary_row(
             &mut lines,
-            player.as_str(),
+            player.label(),
             role,
             installed,
             false,
@@ -287,12 +305,14 @@ fn render_binary_matrix(
         );
     }
 
-    if inner.height as usize > lines.len() + 1 {
+    if inner.height as usize > lines.len() + 2 {
+        let dev = crate::services::platform::detect_device_profile();
+        let caps = crate::services::platform::detect_player_capabilities();
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("  ● ", Style::default().fg(theme.accent)),
+            Span::styled("  ❖ ", Style::default().fg(theme.accent)),
             Span::styled(
-                "Active engine syncs with Detail & Quick Play",
+                format!("{} · vo={}", dev.decode_summary(), caps.effective_vo()),
                 Style::default().fg(FG_MUTED),
             ),
         ]));
@@ -444,11 +464,13 @@ fn render_pipeline_controls(
     lines.push(Line::from(shader_spans));
 
     if inner.height >= 8 {
-        let shader_note = if cfg.player == Player::Mpv {
-            format!("     GLSL: {} (active on mpv launch)", state.anime4k_mode.as_str())
-        } else {
-            "     GLSL shaders apply automatically when mpv is selected".to_string()
-        };
+        let shader_note = format!(
+            "     GLSL: {} · Perf {} · Deband {} · Motion {}",
+            state.anime4k_mode.as_str(),
+            cfg.performance_mode.short_tag(),
+            cfg.deband_mode.short_tag(),
+            cfg.motion_mode.short_tag()
+        );
         lines.push(Line::from(Span::styled(
             shader_note,
             Style::default().fg(FG_MUTED),
@@ -530,20 +552,15 @@ fn render_remediation_card(
                     .add_modifier(if core_missing { Modifier::BOLD } else { Modifier::empty() }),
             ),
         ]));
-        if !state.has_iina {
-            lines.push(Line::from(vec![
-                Span::styled(" $ ", Style::default().fg(theme.accent)),
-                Span::styled("brew install --cask iina", Style::default().fg(FG_MUTED)),
-            ]));
-        }
+    } else if cfg!(windows) {
+        lines.push(Line::from(vec![
+            Span::styled(" $ ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("scoop install mpv ani-cli   # or winget install mpv.net", Style::default().fg(FG_PRIMARY)),
+        ]));
     } else {
         lines.push(Line::from(vec![
             Span::styled(" $ ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-            Span::styled("sudo pacman -S ani-cli mpv", Style::default().fg(FG_PRIMARY)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled(" $ ", Style::default().fg(theme.accent)),
-            Span::styled("sudo apt install mpv vlc", Style::default().fg(FG_MUTED)),
+            Span::styled("sudo pacman -S ani-cli mpv celluloid", Style::default().fg(FG_PRIMARY)),
         ]));
     }
 
@@ -654,12 +671,12 @@ mod tests {
             let mut state = AppState::default();
             state.has_ani_cli = true;
             state.has_mpv = true;
-            state.has_iina = true;
-            state.has_vlc = false;
+            state.has_mpvnet = false;
+            state.has_celluloid = false;
             state.anime4k_mode = Anime4KMode::Balanced;
 
             let mut cfg = config::Config::default();
-            cfg.player = Player::Mpv;
+            cfg.player = Player::AutoBest;
 
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).unwrap();
@@ -692,8 +709,8 @@ mod tests {
         let mut state = AppState::default();
         state.has_ani_cli = false;
         state.has_mpv = false;
-        state.has_iina = false;
-        state.has_vlc = false;
+        state.has_mpvnet = false;
+        state.has_celluloid = false;
         let cfg = config::Config::default();
 
         let backend = TestBackend::new(68, 24);

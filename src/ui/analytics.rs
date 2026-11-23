@@ -227,9 +227,10 @@ fn active_pipeline_labels(state: &AppState) -> (&'static str, String) {
         .copied()
         .unwrap_or_default()
     {
+        crate::config::Player::AutoBest => "Auto-Best",
         crate::config::Player::Mpv => "mpv",
-        crate::config::Player::Iina => "iina",
-        crate::config::Player::Vlc => "vlc",
+        crate::config::Player::MpvNet => "mpv.net",
+        crate::config::Player::Celluloid => "Celluloid",
     };
     let shader = if state.anime4k_mode == crate::config::Anime4KMode::Off {
         "Native".to_string()
