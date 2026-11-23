@@ -382,6 +382,10 @@ pub struct ProviderOption {
     pub subtitles: Vec<SubtitleOption>,
     pub supports_sub: bool,
     pub supports_dub: bool,
+    #[serde(default)]
+    pub is_verified: bool,
+    #[serde(default)]
+    pub verified_res: Option<String>,
 }
 
 pub fn default_providers() -> Vec<ProviderOption> {
@@ -400,6 +404,8 @@ pub fn default_providers() -> Vec<ProviderOption> {
             subtitles: vec![SubtitleOption::default_english()],
             supports_sub: true,
             supports_dub: true,
+            is_verified: false,
+            verified_res: None,
         },
         ProviderOption {
             id: "hd1".to_string(),
@@ -414,6 +420,8 @@ pub fn default_providers() -> Vec<ProviderOption> {
             subtitles: vec![SubtitleOption::default_english()],
             supports_sub: true,
             supports_dub: true,
+            is_verified: false,
+            verified_res: None,
         },
         ProviderOption {
             id: "pahe".to_string(),
@@ -428,6 +436,8 @@ pub fn default_providers() -> Vec<ProviderOption> {
             subtitles: vec![SubtitleOption::default_english()],
             supports_sub: true,
             supports_dub: false,
+            is_verified: false,
+            verified_res: None,
         },
         ProviderOption {
             id: "gogo".to_string(),
@@ -443,8 +453,18 @@ pub fn default_providers() -> Vec<ProviderOption> {
             subtitles: vec![SubtitleOption::default_english()],
             supports_sub: true,
             supports_dub: true,
+            is_verified: false,
+            verified_res: None,
         },
     ]
+}
+
+/// Filter out providers that did not verify available playable streams for this episode & audio mode.
+pub fn filter_verified_providers(providers: Vec<ProviderOption>) -> Vec<ProviderOption> {
+    providers
+        .into_iter()
+        .filter(|p| p.is_verified && p.master_url.as_deref().is_some_and(|u| !u.is_empty()))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -461,6 +481,7 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
+    #[allow(dead_code)]
     pub fn fallback() -> Self {
         Self {
             master_url: None,
@@ -896,7 +917,8 @@ pub async fn fetch_stream_info_with_mal(
     .await
 }
 
-/// Network-aware variant of `fetch_stream_info_with_mal` supporting IPv4 forcing and mode timeouts.
+/// Dynamically fetch verified stream info (qualities, subtitles, master URL, and strictly filtered
+/// verified providers) for a specific anime episode.
 pub async fn fetch_stream_info_with_network(
     anilist_id: i64,
     mal_id_hint: Option<i64>,
@@ -908,18 +930,75 @@ pub async fn fetch_stream_info_with_network(
 ) -> StreamInfo {
     let client = build_http_client(force_ipv4, timeout_secs);
 
-    // Run stream resolution and external multi-language subtitle fetching in parallel,
-    // bounding external subtitle scraping to 4s so stream detection never stalls.
-    let (stream_res, ext_subs_res) = tokio::join!(
-        resolve_primary_stream(&client, anilist_id, mal_id_hint, query_title, episode, is_dub),
+    // Run primary MAL/Zoko, HiAnime (HD-1 / Zoko servers), AllAnime GraphQL, and external subtitles in parallel
+    let mal_fut = async {
+        let mal_id = match mal_id_hint {
+            Some(mid) => Some(mid),
+            None => fetch_mal_id(&client, anilist_id).await,
+        };
+        if let Some(mid) = mal_id {
+            let (res, dub_avail) = tokio::join!(
+                fetch_stream_for_mal(&client, mid, episode, is_dub),
+                check_mal_dub_available(&client, mid, episode)
+            );
+            return (res.ok(), dub_avail);
+        }
+        (None, false)
+    };
+
+    let (
+        (zoko_res, zoko_dub),
+        hianime_res,
+        allanime_res,
+        ext_subs_res,
+    ) = tokio::join!(
+        mal_fut,
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            fetch_all_hianime_providers(&client, query_title, episode, is_dub)
+        ),
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            probe_allanime_provider(&client, query_title, episode, is_dub)
+        ),
         tokio::time::timeout(
             Duration::from_secs(4),
             fetch_external_subtitles(&client, anilist_id, query_title, episode),
         )
     );
-    let ext_subs = ext_subs_res.unwrap_or_default();
 
-    let mut info = stream_res.unwrap_or_else(StreamInfo::fallback);
+    let ext_subs = ext_subs_res.unwrap_or_default();
+    let hianime_provs = hianime_res.unwrap_or_default();
+    let allanime_prov = allanime_res.ok().flatten();
+
+    // Assemble base StreamInfo from the strongest verified source
+    let mut info = if let Some(mut z_info) = zoko_res {
+        z_info.dub_available = z_info.dub_available || zoko_dub || is_dub;
+        z_info
+    } else if let Some((best_hi_info, _)) = hianime_provs.first() {
+        best_hi_info.clone()
+    } else if let Some(ref aa) = allanime_prov {
+        StreamInfo {
+            master_url: aa.master_url.clone(),
+            qualities: aa.qualities.clone(),
+            subtitles: vec![SubtitleOption::default_english()],
+            audio_tracks: Vec::new(),
+            providers: Vec::new(),
+            dub_available: is_dub || aa.supports_dub,
+            ladder: None,
+        }
+    } else {
+        StreamInfo {
+            master_url: None,
+            qualities: Vec::new(),
+            subtitles: vec![SubtitleOption::default_english()],
+            audio_tracks: Vec::new(),
+            providers: Vec::new(),
+            dub_available: false,
+            ladder: None,
+        }
+    };
+
     if let Some(ref mut ladder) = info.ladder {
         ladder.anime_id = anilist_id;
         ladder.episode = episode;
@@ -935,65 +1014,62 @@ pub async fn fetch_stream_info_with_network(
         }
     }
 
-    // Prioritize English, Arabic, Russian, and Bahasa Indonesia at the top of the track list,
-    // with "No subtitles" deterministically available as index 0.
     prioritize_subtitles(&mut info.subtitles);
     SubtitleOption::ensure_none_option_first(&mut info.subtitles);
 
-    // Populate provider-specific capabilities dynamically
-    let zoko_qualities = info.qualities.clone();
     let mut all_subtitles = info.subtitles.clone();
     SubtitleOption::ensure_none_option_first(&mut all_subtitles);
-    let dub_avail = info.dub_available;
+    let dub_avail = info.dub_available || !hianime_provs.is_empty() && hianime_provs.iter().any(|(_, p)| p.supports_dub);
 
-    for prov in &mut info.providers {
-        match prov.id.as_str() {
-            "zoko" => {
-                prov.master_url = info.master_url.clone();
-                prov.qualities = zoko_qualities.clone();
-                prov.subtitles = all_subtitles.clone();
-                prov.supports_sub = true;
-                prov.supports_dub = dub_avail;
-                prov.server_label = "ZokoAnime".to_string();
-            }
-            "hd1" => {
-                prov.qualities = vec![
-                    QualityOption::simple("1080p", ""),
-                    QualityOption::simple("720p", ""),
-                    QualityOption::simple("480p", ""),
-                ];
-                prov.subtitles = all_subtitles.clone();
-                prov.supports_sub = true;
-                prov.supports_dub = dub_avail;
-                prov.server_label = "HD-1".to_string();
-            }
-            "pahe" => {
-                prov.qualities = vec![
-                    QualityOption::simple("1080p BD", ""),
-                    QualityOption::simple("720p BD", ""),
-                    QualityOption::simple("480p BD", ""),
-                ];
-                prov.subtitles = all_subtitles.clone();
-                prov.supports_sub = true;
-                prov.supports_dub = false;
-                prov.server_label = "AnimePahe".to_string();
-            }
-            "gogo" => {
-                prov.qualities = vec![
-                    QualityOption::simple("1080p", ""),
-                    QualityOption::simple("720p", ""),
-                    QualityOption::simple("480p", ""),
-                    QualityOption::simple("360p", ""),
-                ];
-                prov.subtitles = all_subtitles.clone();
-                prov.supports_sub = true;
-                prov.supports_dub = dub_avail;
-                prov.server_label = "GogoAnime".to_string();
-            }
-            _ => {}
+    // Build strictly verified provider list — unavailable providers never appear!
+    let mut verified_providers: Vec<ProviderOption> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+
+    if let Some(ref m_url) = info.master_url {
+        if !m_url.is_empty() && !info.qualities.is_empty() {
+            let best_res = info.qualities.first().map(|q| q.label.clone());
+            verified_providers.push(ProviderOption {
+                id: "zoko".to_string(),
+                name: "ZokoAnime".to_string(),
+                server_label: "ZokoAnime Direct".to_string(),
+                master_url: Some(m_url.clone()),
+                qualities: info.qualities.clone(),
+                subtitles: all_subtitles.clone(),
+                supports_sub: true,
+                supports_dub: zoko_dub || dub_avail,
+                is_verified: true,
+                verified_res: best_res,
+            });
+            seen_ids.insert("zoko".to_string());
         }
     }
 
+    for (hi_info, mut hi_prov) in hianime_provs {
+        if hi_prov.master_url.as_deref().is_some_and(|u| !u.is_empty())
+            && seen_ids.insert(hi_prov.id.clone())
+        {
+            if hi_prov.qualities.is_empty() {
+                hi_prov.qualities = hi_info.qualities.clone();
+            }
+            hi_prov.subtitles = all_subtitles.clone();
+            hi_prov.is_verified = true;
+            hi_prov.verified_res = hi_prov.qualities.first().map(|q| q.label.clone());
+            verified_providers.push(hi_prov);
+        }
+    }
+
+    if let Some(mut aa_prov) = allanime_prov {
+        if aa_prov.master_url.as_deref().is_some_and(|u| !u.is_empty())
+            && seen_ids.insert(aa_prov.id.clone())
+        {
+            aa_prov.subtitles = all_subtitles.clone();
+            aa_prov.is_verified = true;
+            verified_providers.push(aa_prov);
+        }
+    }
+
+    info.providers = filter_verified_providers(verified_providers);
+    info.dub_available = dub_avail;
     info
 }
 
@@ -1007,6 +1083,258 @@ async fn check_mal_dub_available(client: &reqwest::Client, mal_id: i64, episode:
     false
 }
 
+/// Probe all working HiAnime server embeds for the exact episode & audio mode (`sub`/`dub`).
+async fn fetch_all_hianime_providers(
+    client: &reqwest::Client,
+    query: &str,
+    episode: u32,
+    is_dub: bool,
+) -> Vec<(StreamInfo, ProviderOption)> {
+    let Ok(search_resp) = client
+        .get(format!("https://hianime.at/search?keyword={}", urlencoding::encode(query)))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(search_html) = search_resp.text().await else {
+        return Vec::new();
+    };
+    let Some(anime_id) = extract_anime_id(&search_html) else {
+        return Vec::new();
+    };
+
+    let Ok(ep_resp) = client
+        .get(format!("https://hianime.at/api/theme/episode/list/{}", anime_id))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(ep_json) = ep_resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    let ep_html = ep_json.get("html").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(ep_id) = extract_episode_id_strict(ep_html, episode) else {
+        return Vec::new();
+    };
+
+    let Ok(srv_resp) = client
+        .get(format!("https://hianime.at/api/theme/episode/servers?episodeId={}", ep_id))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    let Ok(srv_json) = srv_resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    let srv_html = srv_json.get("html").and_then(|v| v.as_str()).unwrap_or("");
+    let has_dub = srv_html.contains("data-type=\"dub\"");
+    let has_sub = srv_html.contains("data-type=\"sub\"");
+
+    let mode_attr = if is_dub { "data-type=\"dub\"" } else { "data-type=\"sub\"" };
+    let mut embeds: Vec<(String, String, String)> = Vec::new();
+    for block in srv_html.split("server-item") {
+        if !block.contains(mode_attr) {
+            continue;
+        }
+        if let Some(hash_idx) = block.find("data-hash=\"") {
+            let after = &block[hash_idx + 11..];
+            if let Some(end_idx) = after.find('"') {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&after[..end_idx]) {
+                    if let Ok(url) = String::from_utf8(bytes) {
+                        if url.starts_with("http://") || url.starts_with("https://") {
+                            let label = if block.contains("ZokoAnime") {
+                                ("zoko", "ZokoAnime")
+                            } else if block.contains("HD-1") {
+                                ("hd1", "HiAnime HD-1")
+                            } else if block.contains("HD-2") {
+                                ("hd2", "HiAnime HD-2")
+                            } else {
+                                ("hianime", "HiAnime")
+                            };
+                            embeds.push((label.0.to_string(), label.1.to_string(), url));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut results = Vec::new();
+    for (pid, pname, embed_url) in embeds {
+        if let Ok(resp) = client.get(&embed_url).timeout(Duration::from_secs(3)).send().await {
+            if let Ok(html) = resp.text().await {
+                if let Ok(mut st_info) = parse_stream_embed(client, &html).await {
+                    if st_info.master_url.as_deref().is_some_and(|u| !u.is_empty())
+                        && !st_info.qualities.is_empty()
+                    {
+                        st_info.dub_available = st_info.dub_available || has_dub;
+                        let best_res = st_info.qualities.first().map(|q| q.label.clone());
+                        let prov = ProviderOption {
+                            id: pid,
+                            name: pname.clone(),
+                            server_label: pname,
+                            master_url: st_info.master_url.clone(),
+                            qualities: st_info.qualities.clone(),
+                            subtitles: st_info.subtitles.clone(),
+                            supports_sub: has_sub,
+                            supports_dub: has_dub,
+                            is_verified: true,
+                            verified_res: best_res,
+                        };
+                        results.push((st_info, prov));
+                    }
+                }
+            }
+        }
+    }
+    results
+}
+
+fn decode_allanime_source_url(raw: &str) -> String {
+    let Some(hex_body) = raw.strip_prefix("--") else {
+        return raw.to_string();
+    };
+    let mut out = String::with_capacity(hex_body.len() / 2);
+    let bytes = hex_body.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if let Ok(pair) = std::str::from_utf8(&bytes[i..i + 2]) {
+            if let Ok(v) = u8::from_str_radix(pair, 16) {
+                out.push((v ^ 56) as char);
+            }
+        }
+        i += 2;
+    }
+    if out.starts_with('/') {
+        format!("https://allanime.day{out}")
+    } else {
+        out
+    }
+}
+
+/// Probe AllAnime GraphQL directly to verify episode availability and resolve direct HLS/MP4 URLs.
+async fn probe_allanime_provider(
+    client: &reqwest::Client,
+    query: &str,
+    episode: u32,
+    is_dub: bool,
+) -> Option<ProviderOption> {
+    let search_gql = r#"query($search: SearchInput) { shows(search: $search, limit: 5, page: 1, translationType: sub, countryOrigin: ALL) { edges { _id name availableEpisodesDetail } } }"#;
+    let body = serde_json::json!({
+        "query": search_gql,
+        "variables": { "search": { "query": query } }
+    });
+    let resp = client
+        .post("https://api.allanime.day/api")
+        .header("Referer", "https://allmanga.to/")
+        .json(&body)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let edges = json.pointer("/data/shows/edges")?.as_array()?;
+    let ep_str = episode.to_string();
+    let mode_key = if is_dub { "dub" } else { "sub" };
+
+    let show = edges.iter().find(|e| {
+        e.pointer(&format!("/availableEpisodesDetail/{mode_key}"))
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| arr.iter().any(|x| x.as_str() == Some(ep_str.as_str())))
+    })?;
+    let show_id = show.get("_id")?.as_str()?;
+    let has_sub = show
+        .pointer("/availableEpisodesDetail/sub")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| arr.iter().any(|x| x.as_str() == Some(ep_str.as_str())));
+    let has_dub = show
+        .pointer("/availableEpisodesDetail/dub")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| arr.iter().any(|x| x.as_str() == Some(ep_str.as_str())));
+
+    let ep_gql = r#"query($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) { episode(showId: $showId, translationType: $translationType, episodeString: $episodeString) { sourceUrls } }"#;
+    let ep_body = serde_json::json!({
+        "query": ep_gql,
+        "variables": {
+            "showId": show_id,
+            "translationType": mode_key,
+            "episodeString": ep_str
+        }
+    });
+    let ep_resp = client
+        .post("https://api.allanime.day/api")
+        .header("Referer", "https://allmanga.to/")
+        .json(&ep_body)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    let ep_json: serde_json::Value = ep_resp.json().await.ok()?;
+    let sources = ep_json.pointer("/data/episode/sourceUrls")?.as_array()?;
+
+    for src in sources {
+        let raw_u = src.get("sourceUrl").and_then(|v| v.as_str()).unwrap_or("");
+        let decoded = decode_allanime_source_url(raw_u);
+        if decoded.contains("clock.json") || decoded.ends_with(".m3u8") || decoded.ends_with(".mp4") {
+            let final_url = if decoded.contains("clock.json") {
+                let Ok(clk_resp) = client.get(&decoded).timeout(Duration::from_secs(3)).send().await else {
+                    continue;
+                };
+                let Ok(clk_json) = clk_resp.json::<serde_json::Value>().await else {
+                    continue;
+                };
+                let Some(link) = clk_json.pointer("/links/0/link").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                link.to_string()
+            } else {
+                decoded
+            };
+            if final_url.starts_with("http://") || final_url.starts_with("https://") {
+                let quals = if final_url.contains(".m3u8") {
+                    if let Ok(m_resp) = client.get(&final_url).timeout(Duration::from_secs(3)).send().await {
+                        if let Ok(m_txt) = m_resp.text().await {
+                            let parsed = parse_m3u8_qualities(&final_url, &m_txt);
+                            if !parsed.is_empty() {
+                                parsed
+                            } else {
+                                vec![QualityOption::simple("1080p", final_url.clone())]
+                            }
+                        } else {
+                            vec![QualityOption::simple("1080p", final_url.clone())]
+                        }
+                    } else {
+                        vec![QualityOption::simple("1080p", final_url.clone())]
+                    }
+                } else {
+                    vec![QualityOption::simple("1080p", final_url.clone())]
+                };
+                let best_res = quals.first().map(|q| q.label.clone());
+                return Some(ProviderOption {
+                    id: "allanime".to_string(),
+                    name: "AllAnime Direct".to_string(),
+                    server_label: "AllAnime".to_string(),
+                    master_url: Some(final_url),
+                    qualities: quals,
+                    subtitles: Vec::new(),
+                    supports_sub: has_sub,
+                    supports_dub: has_dub,
+                    is_verified: true,
+                    verified_res: best_res,
+                });
+            }
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
 async fn resolve_primary_stream(
     client: &reqwest::Client,
     anilist_id: i64,
@@ -1015,7 +1343,6 @@ async fn resolve_primary_stream(
     episode: u32,
     is_dub: bool,
 ) -> Option<StreamInfo> {
-    // 1. First attempt: use cached MAL ID or resolve via AniList GraphQL
     let mal_id = match mal_id_hint {
         Some(mid) => Some(mid),
         None => fetch_mal_id(client, anilist_id).await,
@@ -1032,15 +1359,8 @@ async fn resolve_primary_stream(
             }
         }
     }
-
-    // 2. Fallback attempt: resolve via HiAnime direct search
-    if let Ok(info) = fetch_stream_via_hianime(client, query_title, episode, is_dub).await {
-        if !info.subtitles.is_empty() || !info.qualities.is_empty() {
-            return Some(info);
-        }
-    }
-
-    None
+    let all = fetch_all_hianime_providers(client, query_title, episode, is_dub).await;
+    all.into_iter().next().map(|(i, _)| i)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1064,6 +1384,7 @@ struct AniZipMappingDetails {
 struct AniZipEpDetails {
     season_number: Option<u32>,
     episode_number: Option<u32>,
+    absolute_episode_number: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1158,6 +1479,15 @@ pub async fn fetch_external_subtitles(
     let mut seen = HashSet::new();
 
     // 1. Stremio OpenSubtitles v3 addon via IMDb ID (if available)
+    let mut mapped_season = 1u32;
+    let mut mapped_ep = episode;
+    let mut mapped_abs_ep = episode;
+    if let Some(ep_info) = parsed.episodes.get(&episode.to_string()) {
+        mapped_season = ep_info.season_number.unwrap_or(1);
+        mapped_ep = ep_info.episode_number.unwrap_or(episode);
+        mapped_abs_ep = ep_info.absolute_episode_number.unwrap_or(mapped_ep);
+    }
+
     if let Some(imdb_id) = parsed.mappings.as_ref().and_then(|m| m.imdb_id.clone()).filter(|id| !id.is_empty()) {
         let is_movie = parsed
             .mappings
@@ -1169,13 +1499,7 @@ pub async fn fetch_external_subtitles(
         let query_url = if is_movie {
             format!("https://opensubtitles-v3.strem.io/subtitles/movie/{}.json", imdb_id)
         } else {
-            let ep_key = episode.to_string();
-            let (season, ep_num) = if let Some(ep_info) = parsed.episodes.get(&ep_key) {
-                (ep_info.season_number.unwrap_or(1), ep_info.episode_number.unwrap_or(episode))
-            } else {
-                (1, episode)
-            };
-            format!("https://opensubtitles-v3.strem.io/subtitles/series/{}:{}:{}.json", imdb_id, season, ep_num)
+            format!("https://opensubtitles-v3.strem.io/subtitles/series/{}:{}:{}.json", imdb_id, mapped_season, mapped_ep)
         };
 
         if let Ok(sub_resp) = client.get(&query_url).timeout(Duration::from_secs(4)).send().await {
@@ -1246,6 +1570,13 @@ pub async fn fetch_external_subtitles(
         }
     });
 
+    let ql = query_title.to_ascii_lowercase();
+    let is_split_sequel = mapped_season >= 2
+        || mapped_abs_ep > episode
+        || ql.contains("cour 2")
+        || ql.contains("part 2")
+        || ql.contains("2nd season");
+
     for items in futures_util::future::join_all(search_futs).await {
         for it in items {
             let sep = it.series_episode.as_deref().unwrap_or("");
@@ -1254,7 +1585,17 @@ pub async fn fetch_external_subtitles(
                 continue;
             };
 
-            if matches_episode(sep, fn_str, episode) {
+            let matched = if is_split_sequel && mapped_abs_ep != episode {
+                matches_episode(sep, fn_str, mapped_abs_ep)
+                    || (matches_episode(sep, fn_str, mapped_ep)
+                        && (fn_str.to_ascii_lowercase().contains("cour 2")
+                            || fn_str.to_ascii_lowercase().contains("part 2")
+                            || fn_str.to_ascii_lowercase().contains("s02")))
+            } else {
+                matches_episode(sep, fn_str, episode)
+            };
+
+            if matched {
                 let lang_id = it.sub_language_id.as_deref().unwrap_or("eng");
                 let (code, name) = resolve_lang_meta(fn_str, lang_id);
 
@@ -1364,6 +1705,7 @@ async fn fetch_stream_for_mal(
     parse_stream_embed(client, &html).await
 }
 
+#[allow(dead_code)]
 /// Fallback: search HiAnime, find episode ID and embed
 async fn fetch_stream_via_hianime(
     client: &reqwest::Client,
@@ -1371,36 +1713,8 @@ async fn fetch_stream_via_hianime(
     episode: u32,
     is_dub: bool,
 ) -> Result<StreamInfo, ()> {
-    // 1. Search anime slug
-    let search_url = format!("https://hianime.at/search?keyword={}", urlencoding::encode(query));
-    let resp = client.get(&search_url).send().await.map_err(|_| ())?;
-    let search_html = resp.text().await.map_err(|_| ())?;
-
-    let anime_id = extract_anime_id(&search_html).ok_or(())?;
-
-    // 2. Fetch episode list
-    let ep_url = format!("https://hianime.at/api/theme/episode/list/{}", anime_id);
-    let ep_resp = client.get(&ep_url).send().await.map_err(|_| ())?;
-    let ep_json: serde_json::Value = ep_resp.json().await.map_err(|_| ())?;
-    let ep_html = ep_json.get("html").and_then(|v| v.as_str()).unwrap_or("");
-
-    let ep_id = extract_episode_id(ep_html, episode).ok_or(())?;
-
-    // 3. Fetch servers
-    let srv_url = format!("https://hianime.at/api/theme/episode/servers?episodeId={}", ep_id);
-    let srv_resp = client.get(&srv_url).send().await.map_err(|_| ())?;
-    let srv_json: serde_json::Value = srv_resp.json().await.map_err(|_| ())?;
-    let srv_html = srv_json.get("html").and_then(|v| v.as_str()).unwrap_or("");
-    let has_dub = srv_html.contains("data-type=\"dub\"");
-
-    let embed_url = extract_zoko_embed_url(srv_html, is_dub).ok_or(())?;
-
-    // 4. Fetch embed HTML
-    let embed_resp = client.get(&embed_url).send().await.map_err(|_| ())?;
-    let embed_html = embed_resp.text().await.map_err(|_| ())?;
-    let mut info = parse_stream_embed(client, &embed_html).await?;
-    info.dub_available = info.dub_available || has_dub;
-    Ok(info)
+    let all = fetch_all_hianime_providers(client, query, episode, is_dub).await;
+    all.into_iter().next().map(|(i, _)| i).ok_or(())
 }
 
 async fn parse_stream_embed(client: &reqwest::Client, html: &str) -> Result<StreamInfo, ()> {
@@ -1652,10 +1966,9 @@ fn extract_anime_id(html: &str) -> Option<String> {
     None
 }
 
-fn extract_episode_id(html: &str, ep_target: u32) -> Option<String> {
+/// Strict episode extraction — returns `None` if the requested episode does NOT exist on the provider.
+fn extract_episode_id_strict(html: &str, ep_target: u32) -> Option<String> {
     let target_str = format!("data-number=\"{}\"", ep_target);
-
-    // 1. Check each anchor tag in the episode list
     for item in html.split("<a ") {
         if item.contains(&target_str) {
             if let Some(id_idx) = item.find("data-id=\"") {
@@ -1669,28 +1982,15 @@ fn extract_episode_id(html: &str, ep_target: u32) -> Option<String> {
             }
         }
     }
-
-    // 2. Fallback: window after data-number
-    if let Some(idx) = html.find(&target_str) {
-        let snippet = &html[idx..html.len().min(idx + 150)];
-        if let Some(id_idx) = snippet.find("data-id=\"") {
-            let after = &snippet[id_idx + 9..];
-            if let Some(end_idx) = after.find('"') {
-                return Some(after[..end_idx].to_string());
-            }
-        }
-    }
-
-    // 3. Last fallback: any data-id
-    if let Some(id_idx) = html.find("data-id=\"") {
-        let after = &html[id_idx + 9..];
-        if let Some(end_idx) = after.find('"') {
-            return Some(after[..end_idx].to_string());
-        }
-    }
     None
 }
 
+#[cfg(test)]
+fn extract_episode_id(html: &str, ep_target: u32) -> Option<String> {
+    extract_episode_id_strict(html, ep_target)
+}
+
+#[allow(dead_code)]
 fn extract_zoko_embed_url(html: &str, is_dub: bool) -> Option<String> {
     let mode_attr = if is_dub { "data-type=\"dub\"" } else { "data-type=\"sub\"" };
     for server_block in html.split("server-item") {
@@ -1813,6 +2113,19 @@ mod tests {
 
         let html2 = r##"<a data-id="9999" data-number="2" class="ssl-item" href="#">"##;
         assert_eq!(extract_episode_id(html2, 2), Some("9999".to_string()));
+        // Missing episodes MUST return None (no fallback to wrong episode!)
+        assert_eq!(extract_episode_id_strict(html2, 99), None);
+    }
+
+    #[test]
+    fn test_filter_verified_providers_removes_unavailable_sources() {
+        let mut raw = default_providers();
+        raw[0].master_url = Some("https://cdn.example.com/master.m3u8".into());
+        raw[0].is_verified = true;
+        // raw[1..4] have is_verified = false or master_url = None
+        let filtered = filter_verified_providers(raw);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "zoko");
     }
 
     #[test]

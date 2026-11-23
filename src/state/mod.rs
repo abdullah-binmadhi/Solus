@@ -1646,7 +1646,7 @@ impl AppState {
         self.playback_sub_cursor = 0;
         self.playback_players = Self::host_players();
         self.playback_player_cursor = self.playback_players.iter().position(|p| *p == player).unwrap_or(0);
-        self.playback_providers = crate::api::subtitles::default_providers();
+        self.playback_providers.clear();
         self.dub_available = None;
         self.playback_provider_cursor = 0;
         self.playback_focus_column = 0;
@@ -2299,6 +2299,8 @@ mod tests {
             server_label: "Zoko".into(),
             supports_sub: true,
             supports_dub: true,
+            is_verified: true,
+            verified_res: Some("1080p".into()),
             master_url: None,
             qualities: vec![],
             subtitles: vec![crate::api::subtitles::SubtitleOption {

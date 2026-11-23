@@ -1001,6 +1001,49 @@ pub async fn save_profile_subtitle_code(
     Ok(())
 }
 
+/// Fetch saved per-anime subtitle offset in milliseconds for `(profile_id, anime_id)`.
+pub async fn get_anime_subtitle_delay_ms(
+    pool:       &SqlitePool,
+    profile_id: &str,
+    anime_id:   i64,
+) -> Option<i32> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT delay_ms FROM anime_subtitle_offsets WHERE profile_id = ? AND anime_id = ?",
+    )
+    .bind(profile_id)
+    .bind(anime_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .map(|v| (v as i32).clamp(-30_000, 30_000))
+}
+
+/// Persist per-anime subtitle offset in milliseconds so subsequent episodes launch synced.
+pub async fn save_anime_subtitle_delay_ms(
+    pool:       &SqlitePool,
+    profile_id: &str,
+    anime_id:   i64,
+    delay_ms:   i32,
+    now:        i64,
+) -> Result<()> {
+    let clamped = delay_ms.clamp(-30_000, 30_000) as i64;
+    sqlx::query(
+        "INSERT INTO anime_subtitle_offsets (profile_id, anime_id, delay_ms, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(profile_id, anime_id) DO UPDATE SET
+            delay_ms   = excluded.delay_ms,
+            updated_at = excluded.updated_at",
+    )
+    .bind(profile_id)
+    .bind(anime_id)
+    .bind(clamped)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Update or insert continue_watching without marking episode in history as completed yet.
 pub async fn touch_continue_watching(
     pool:     &SqlitePool,
@@ -2986,5 +3029,19 @@ mod tests {
         let updated = get_profile_playback_settings(&pool, "default").await.unwrap();
         assert_eq!(updated.subtitle_delay_ms, 250);
         assert_eq!(updated.subtitle_code, "eng");
+    }
+
+    #[tokio::test]
+    async fn test_anime_subtitle_offset_roundtrip() {
+        let pool = setup().await;
+        assert_eq!(get_anime_subtitle_delay_ms(&pool, "default", 171032).await, None);
+        save_anime_subtitle_delay_ms(&pool, "default", 171032, -1200, 9000)
+            .await
+            .unwrap();
+        assert_eq!(get_anime_subtitle_delay_ms(&pool, "default", 171032).await, Some(-1200));
+        save_anime_subtitle_delay_ms(&pool, "default", 171032, -850, 9100)
+            .await
+            .unwrap();
+        assert_eq!(get_anime_subtitle_delay_ms(&pool, "default", 171032).await, Some(-850));
     }
 }

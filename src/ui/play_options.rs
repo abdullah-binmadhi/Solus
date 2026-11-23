@@ -468,10 +468,15 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     frame.render_widget(p_block, layout.provider_rect);
 
     let p_budget = (p_inner.width as usize).saturating_sub(7).max(4);
-    let p_items: Vec<ListItem> = if state.playback_providers.is_empty() {
+    let p_items: Vec<ListItem> = if state.is_loading_subs {
         vec![ListItem::new(Line::from(vec![
-            Span::styled(" [●] ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-            Span::styled(clamp_label("Default Provider", p_budget), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(" ⟳ ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(clamp_label("Probing sources…", p_budget), Style::default().fg(theme.text_dim)),
+        ]))]
+    } else if state.playback_providers.is_empty() {
+        vec![ListItem::new(Line::from(vec![
+            Span::styled(" ✗ ", Style::default().fg(Color::Rgb(255, 110, 110)).add_modifier(Modifier::BOLD)),
+            Span::styled(clamp_label("No source for Ep", p_budget), Style::default().fg(Color::Rgb(255, 130, 130))),
         ]))]
     } else {
         state
@@ -496,6 +501,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                 };
                 let label = if is_unsupported_dub {
                     format!("{} (No Dub)", provider.name)
+                } else if let Some(ref res) = provider.verified_res {
+                    format!("{} [✓ {}]", provider.name, res)
                 } else {
                     provider.name.clone()
                 };
@@ -774,6 +781,8 @@ mod tests {
                 server_label: "HD-1".into(),
                 supports_sub: true,
                 supports_dub: true,
+                is_verified: true,
+                verified_res: Some("1080p".into()),
                 master_url: None,
                 qualities: vec![],
                 subtitles: vec![],

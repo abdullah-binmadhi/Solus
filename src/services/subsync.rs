@@ -191,6 +191,7 @@ pub fn parse_subtitle_intervals(content: &str) -> Vec<(f64, f64)> {
 }
 
 /// Calculate optimal offset and framerate scale factor to align target intervals to reference intervals.
+/// Uses fine 25ms bins + 3x speech-onset weighting so 0.4s-2.0s lags are caught sharply.
 pub fn calculate_optimal_alignment(
     ref_intervals: &[(f64, f64)],
     target_intervals: &[(f64, f64)],
@@ -199,15 +200,21 @@ pub fn calculate_optimal_alignment(
         return SyncResult::default();
     }
 
-    const BIN_SIZE: f64 = 0.05; // 50ms temporal resolution
-    const MAX_TIME: f64 = 2400.0; // 40 minutes max episode duration
+    const BIN_SIZE: f64 = 0.025; // 25ms temporal resolution
+    const ONSET_BINS: usize = 14; // 350ms dialogue onset window weighted 3x
+    const MAX_TIME: f64 = 2400.0;
     let num_bins = (MAX_TIME / BIN_SIZE) as usize;
 
-    let mut ref_grid = vec![false; num_bins];
+    let mut ref_grid = vec![0u8; num_bins];
     for &(s, e) in ref_intervals {
         let s_idx = ((s / BIN_SIZE).max(0.0) as usize).min(num_bins - 1);
         let e_idx = ((e / BIN_SIZE).max(0.0) as usize).min(num_bins - 1);
-        ref_grid[s_idx..=e_idx].fill(true);
+        for b in s_idx..=e_idx {
+            let w = if b < s_idx + ONSET_BINS { 3 } else { 1 };
+            if w > ref_grid[b] {
+                ref_grid[b] = w;
+            }
+        }
     }
 
     let compute_score = |scale: f64, offset: f64| -> u64 {
@@ -222,22 +229,25 @@ pub fn calculate_optimal_alignment(
                 continue;
             }
 
+            let onset_end = sb + ONSET_BINS as isize;
             for b in sb..=eb {
-                if ref_grid[b as usize] {
-                    score += 1;
+                let rw = ref_grid[b as usize] as u64;
+                if rw > 0 {
+                    let tw = if b < onset_end { 2 } else { 1 };
+                    score += rw * tw;
                 }
             }
         }
         score
     };
 
-    // Phase 1: Baseline scale = 1.0 (most anime shares the same 23.976 master cadence)
+    // Phase 1: Baseline scale = 1.0
     let mut best_scale = 1.0;
     let mut best_offset = 0.0;
     let mut best_score = 0u64;
 
     for step in -450..=450 {
-        let offset = step as f64 * 0.1; // 100ms step from -45s to +45s
+        let offset = step as f64 * 0.1;
         let score = compute_score(1.0, offset);
         if score > best_score {
             best_score = score;
@@ -245,16 +255,14 @@ pub fn calculate_optimal_alignment(
         }
     }
 
-    // Plateau Centering for scale = 1.0:
-    // If a range of offsets achieves >= 98% of peak score, pick the midpoint
-    // to prevent edge bias caused by non-uniform dialogue gaps.
+    // Plateau Centering for scale = 1.0
     if best_score > 0 {
-        let threshold = (best_score as f64 * 0.98) as u64;
+        let threshold = (best_score as f64 * 0.985) as u64;
         let mut min_off = best_offset;
         let mut max_off = best_offset;
         for step in -450..=450 {
             let offset = step as f64 * 0.1;
-            if (offset - best_offset).abs() <= 2.0 {
+            if (offset - best_offset).abs() <= 1.5 {
                 let score = compute_score(1.0, offset);
                 if score >= threshold {
                     if offset < min_off {
@@ -269,7 +277,7 @@ pub fn calculate_optimal_alignment(
         best_offset = (min_off + max_off) / 2.0;
     }
 
-    // Phase 2: Test framerate drift scales only if they beat 1.0 baseline by a significant margin
+    // Phase 2: Test framerate drift scales only if they beat 1.0 baseline clearly
     const OTHER_SCALES: [f64; 4] = [
         23.976 / 25.0,
         25.0 / 23.976,
@@ -281,8 +289,7 @@ pub fn calculate_optimal_alignment(
         for step in -450..=450 {
             let offset = step as f64 * 0.1;
             let score = compute_score(scale, offset);
-            // Must beat 1.0 baseline by at least 6% to justify non-standard framerate scaling
-            if score > ((best_score as f64 * 1.06) as u64) + 15 {
+            if score > ((best_score as f64 * 1.08) as u64) + 30 {
                 best_score = score;
                 best_scale = scale;
                 best_offset = offset;
@@ -301,11 +308,14 @@ pub fn calculate_optimal_alignment(
         }
     }
 
-    // Identity Guard: If at offset 0.0s (scale 1.0) the score already achieves >= 82%
-    // of the peak score, the subtitle is already in sync with the video release.
-    // Suppress offset shift to prevent introducing an artificial delay on in-sync tracks.
+    // Precision Identity Guard:
+    // Suppress tiny <0.25s noise, or suppress >=0.25s ONLY if 0.0s scores >= 95% of peak.
     let score_zero = compute_score(1.0, 0.0);
-    if score_zero > 0 && score_zero >= ((best_score as f64 * 0.82) as u64) && (best_scale - 1.0).abs() < 0.001 {
+    let identity_thresh = if best_offset.abs() < 0.25 { 0.85 } else { 0.95 };
+    if score_zero > 0
+        && score_zero >= ((best_score as f64 * identity_thresh) as u64)
+        && (best_scale - 1.0).abs() < 0.001
+    {
         return SyncResult {
             offset_seconds: 0.0,
             scale_factor: 1.0,
@@ -314,7 +324,6 @@ pub fn calculate_optimal_alignment(
         };
     }
 
-    // Decision: only apply if the adjustment is noticeable (> 150ms or non-1.0 scale) and score is solid
     let is_already_synced = best_offset.abs() < 0.15 && (best_scale - 1.0).abs() < 0.001;
     let applied = !is_already_synced && best_score > 60;
 
@@ -422,14 +431,15 @@ pub async fn estimate_audio_lead_time(stream_url: &str) -> Option<f64> {
     None
 }
 
-/// Ensure that target subtitle is downloaded, verified, and synchronized against reference subtitle.
-/// Writes the synchronized subtitle to ~/.cache/solus/subs/{anime_id}_{ep}_{code}_synced.srt
-/// and returns the verified local path.
+/// Ensure that target subtitle is downloaded, verified, and synchronized against reference subtitle
+/// or Tier-2 audio speech onset (`ffmpeg silencedetect`).
+/// Writes the verified/aligned subtitle to `~/.cache/solus/subs/{anime_id}_{ep}_{code}_synced.{ext}`
+/// and returns the verified local path (so in-player `⚡ SNAP TO VOICE` can also inspect cue timings).
 pub async fn ensure_synchronized_subtitle(
     client: &reqwest::Client,
     target_sub_url: &str,
     ref_sub_url: Option<&str>,
-    _stream_url: Option<&str>,
+    stream_url: Option<&str>,
     anime_id: i64,
     episode: u32,
     code: &str,
@@ -547,6 +557,29 @@ pub async fn ensure_synchronized_subtitle(
     }
 
     let final_content = crate::services::substyler::apply_signage_collision_avoidance(&final_content);
+
+    // Tier 2 fallback: If no reference subtitle aligned this track, check audio lead onset for bumper shifts
+    let mut final_content = final_content;
+    if sync_res.as_ref().is_none_or(|r| !r.applied) {
+        if let Some(s_url) = stream_url {
+            let target_intervals = parse_subtitle_intervals(&final_content);
+            if let Some(&first_sub) = target_intervals.iter().map(|i| &i.0).min_by(|a, b| a.total_cmp(b)) {
+                if let Some(audio_lead) = estimate_audio_lead_time(s_url).await {
+                    let diff = audio_lead - first_sub;
+                    if (0.40..=4.5).contains(&diff.abs()) && first_sub < 25.0 {
+                        let rounded = (diff * 100.0).round() / 100.0;
+                        final_content = apply_subtitle_shift(&final_content, rounded, 1.0);
+                        sync_res = Some(SyncResult {
+                            offset_seconds: rounded,
+                            scale_factor: 1.0,
+                            score: 100,
+                            applied: true,
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     // Determine appropriate extension (.ass, .vtt, or .srt)
     let ext = if final_content.contains("[Script Info]") || final_content.contains("Dialogue:") {
@@ -731,6 +764,26 @@ Lain's acting funny.
         assert!(!result.applied);
         assert_eq!(result.offset_seconds, 0.0);
         assert_eq!(result.scale_factor, 1.0);
+    }
+
+    #[test]
+    fn test_onset_weighted_alignment_catches_subtle_1_2s_lag() {
+        // Simulates NieR:Automata Ver1.1a Cour 2 subtle 1.2s slow subtitle lag
+        let ref_intervals = vec![
+            (10.0, 14.0),
+            (22.0, 26.2),
+            (38.5, 42.0),
+            (55.0, 59.5),
+            (72.0, 76.0),
+        ];
+        let target_intervals: Vec<(f64, f64)> = ref_intervals
+            .iter()
+            .map(|&(s, e)| (s + 1.2, e + 1.2))
+            .collect();
+
+        let result = calculate_optimal_alignment(&ref_intervals, &target_intervals);
+        assert!(result.applied, "Subtle 1.2s lag must not be swallowed by Identity Guard");
+        assert!((result.offset_seconds + 1.2).abs() <= 0.15);
     }
 
     #[test]

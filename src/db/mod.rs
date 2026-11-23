@@ -457,14 +457,26 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             subtitle_code     TEXT    NOT NULL DEFAULT 'eng',
             subtitle_delay_ms INTEGER NOT NULL DEFAULT 0,
             quality           TEXT    NOT NULL DEFAULT '1080p',
-            preferred_player  TEXT    NOT NULL DEFAULT 'mpv',
+            preferred_player  TEXT    NOT NULL DEFAULT 'auto-best',
             updated_at        INTEGER NOT NULL DEFAULT 0
         );",
     )
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("PRAGMA user_version = 4;").execute(pool).await;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS anime_subtitle_offsets (
+            profile_id TEXT    NOT NULL,
+            anime_id   INTEGER NOT NULL,
+            delay_ms   INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (profile_id, anime_id)
+        );",
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("PRAGMA user_version = 5;").execute(pool).await;
 
     Ok(())
 }
@@ -501,6 +513,7 @@ mod tests {
         assert!(tables.contains(&"playlists".to_string()));
         assert!(tables.contains(&"playlist_items".to_string()));
         assert!(tables.contains(&"profile_playback_settings".to_string()));
+        assert!(tables.contains(&"anime_subtitle_offsets".to_string()));
     }
 
     #[tokio::test]

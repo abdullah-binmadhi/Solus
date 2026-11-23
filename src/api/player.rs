@@ -452,6 +452,14 @@ p script-binding solus-toggle-pip
 P script-binding solus-cycle-pip-corner
 i script-binding solus-toggle-hud
 I script-binding solus-pin-hud
+TAB script-binding solus-skip-intro
+N script-binding solus-next-episode
+S script-binding solus-toggle-sub-bar
+y script-binding solus-snap-sub-voice
+z add sub-delay -0.1
+x add sub-delay 0.1
+Z add sub-delay -0.5
+X add sub-delay 0.5
 a script-binding solus-toggle-shaders
 d script-binding solus-toggle-deband
 g script-binding solus-cycle-perf
@@ -779,7 +787,7 @@ local function render_info_hud()
         "{\\an7\\pos(66,288)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}⚡ DEMUXER CACHE   {\\1c&HFAF4F0&\\b0}%.1fs ahead  ·  %.1f MiB  %s  ·  {\\1c%s}%s\n" ..
         "{\\an7\\pos(66,314)\\bord0\\shad0\\1c&H2B2420&\\p1}m 0 0 l 520 0 l 520 10 l 0 10{\\p0}\n" ..
         "{\\an7\\pos(66,314)\\bord0\\shad0\\1c%s\\p1}m 0 0 l %d 0 l %d 10 l 0 10{\\p0}\n" ..
-        "{\\an7\\pos(66,340)\\bord0\\shad0\\fs15\\1c&HC8B8A4&}Keys: {\\1c&HF8BD38&}[i/I] HUD  {\\1c&H99D334&}[p/P] PiP  {\\1c&H24BFFB&}[a] Shaders  [d] Deband  {\\1c&HFA8BA7&}[m] Motion  [g] Perf  [F1] Raw",
+        "{\\an7\\pos(66,340)\\bord0\\shad0\\fs15\\1c&HC8B8A4&}Keys: {\\1c&HF8BD38&}[Tab] Skip  [N] Next  [S] SubSync  {\\1c&H99D334&}[p/P] PiP  {\\1c&H24BFFB&}[a] Shaders [d] Deband [m] Motion  {\\1c&HFA8BA7&}[i/I] HUD [F1] Raw",
         q_tag, win_badge, pin_badge,
         mtitle,
         fmt_clock(pos), fmt_clock(dur), math.floor(pct), fmt_clock(rem), spd,
@@ -838,6 +846,284 @@ end
 
 mp.add_forced_key_binding("i", "solus-toggle-hud", toggle_info_hud)
 mp.add_forced_key_binding("I", "solus-pin-hud", pin_info_hud)
+
+-- =============================================================================
+-- 5. Crunchyroll/Netflix Clickable Buttons ([Skip Intro/Outro], [Next Ep])
+--    & Interactive Subtitle Sync Bar ([S] / [-0.5][-0.1][⚡ SNAP][+0.1][+0.5])
+-- =============================================================================
+local utils = require 'mp.utils'
+local btn_ov = mp.create_osd_overlay("ass-events")
+btn_ov.res_x = 1280
+btn_ov.res_y = 720
+
+local player_ctx = {
+    ep = 1,
+    next_ep = nil,
+    op_start = nil,
+    op_end = nil,
+    ed_start = nil,
+    ed_end = nil,
+    sub_path = nil,
+}
+local sub_bar_open = false
+local hover_active_until = 0
+local hovered_btn_id = nil
+local active_hitboxes = {}
+
+local function active_sub_file_path()
+    if player_ctx.sub_path and player_ctx.sub_path ~= "" then
+        return player_ctx.sub_path
+    end
+    local tracks = mp.get_property_native("track-list") or {}
+    for _, t in ipairs(tracks) do
+        if t.type == "sub" and t.selected and t["external-filename"] then
+            return t["external-filename"]
+        end
+    end
+    return nil
+end
+
+local function parse_sub_ts(s)
+    if not s then return nil end
+    s = s:gsub(",", "."):match("^%s*(.-)%s*$")
+    local h, m, sec = s:match("^(%d+):(%d+):([%d%.]+)$")
+    if h then
+        return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(sec)
+    end
+    local m2, sec2 = s:match("^(%d+):([%d%.]+)$")
+    if m2 then
+        return tonumber(m2) * 60 + tonumber(sec2)
+    end
+    return nil
+end
+
+local function collect_cue_starts(path)
+    local f = io.open(path, "r")
+    if not f then return {} end
+    local cues = {}
+    for line in f:lines() do
+        local start_s = line:match("^%s*([%d:%.]+)%s*%-%->")
+        if start_s then
+            local ts = parse_sub_ts(start_s)
+            if ts then table.insert(cues, ts) end
+        elseif line:match("^Dialogue:") then
+            local s_ts = line:match("^Dialogue:%s*%d+,([^,]+),")
+            local ts = parse_sub_ts(s_ts)
+            if ts then table.insert(cues, ts) end
+        end
+    end
+    f:close()
+    return cues
+end
+
+local function snap_sub_to_voice()
+    local cur_t = mp.get_property_number("time-pos", nil)
+    if not cur_t then return end
+    local spath = active_sub_file_path()
+    if not spath or spath:match("^https?://") then
+        mp.osd_message("⚡ Snap requires cached subtitle track (use [z]/[x] -/+100ms)", 2.5)
+        return
+    end
+    local cues = collect_cue_starts(spath)
+    if #cues == 0 then
+        mp.osd_message("⚡ No subtitle timestamps found — use [z]/[x] -/+100ms", 2.5)
+        return
+    end
+    local cur_delay = mp.get_property_number("sub-delay", 0.0) or 0.0
+    -- Look for nearest subtitle cue relative to video time within +-15s
+    local best_cue = nil
+    local best_dist = 15.0
+    for _, ts in ipairs(cues) do
+        local dist = math.abs(ts - cur_t)
+        if dist < best_dist then
+            best_dist = dist
+            best_cue = ts
+        end
+    end
+    if not best_cue then
+        mp.osd_message("⚡ Speak while hovering a dialogue scene (+-15s) to snap", 2.5)
+        return
+    end
+    local new_delay = math.max(-30.0, math.min(30.0, cur_t - best_cue))
+    mp.set_property_number("sub-delay", new_delay)
+    mp.osd_message(string.format("⚡ Snapped Subtitle to Voice (%+.2fs, was %+.2fs)", new_delay, cur_delay), 2.8)
+end
+
+local function do_skip_intro_or_outro()
+    local cur_t = mp.get_property_number("time-pos", 0) or 0
+    if player_ctx.op_start and player_ctx.op_end and cur_t >= (player_ctx.op_start - 2.0) and cur_t < (player_ctx.op_end - 1.0) then
+        mp.commandv("seek", player_ctx.op_end, "absolute")
+        mp.osd_message("⏭ Skipped Intro (AniSkip)", 2.2)
+    elseif player_ctx.ed_start and player_ctx.ed_end and cur_t >= (player_ctx.ed_start - 2.0) and cur_t < (player_ctx.ed_end - 1.0) then
+        mp.commandv("seek", player_ctx.ed_end, "absolute")
+        mp.osd_message("⏭ Skipped Outro (AniSkip)", 2.2)
+    elseif cur_t < 155.0 then
+        mp.commandv("seek", cur_t + 85.0, "absolute")
+        mp.osd_message("⏭ Skipped Intro (+85s)", 2.2)
+    else
+        mp.commandv("seek", 85.0, "relative")
+        mp.osd_message("⏭ Jumped +85s", 1.8)
+    end
+end
+
+local function do_next_episode()
+    mp.osd_message("⏭ Loading Next Episode...", 2.5)
+    io.write("__SOLUS_NEXT_EPISODE__\n")
+    io.flush()
+end
+
+local function adjust_sub_delay(delta)
+    local cur = mp.get_property_number("sub-delay", 0.0) or 0.0
+    local nxt = math.max(-30.0, math.min(30.0, cur + delta))
+    mp.set_property_number("sub-delay", nxt)
+    mp.osd_message(string.format("◈ Subtitle Delay: %+.2fs", nxt), 2.0)
+end
+
+local function render_player_buttons()
+    local cur_t = mp.get_property_number("time-pos", 0) or 0
+    local dur = mp.get_property_number("duration", 0) or 0
+    local now = mp.get_time()
+    local hover_alive = now <= hover_active_until
+
+    active_hitboxes = {}
+    local lines = {}
+
+    local function draw_pill(id, x1, y1, x2, y2, label, accent_bgr)
+        local is_hov = (hovered_btn_id == id)
+        local fill_col = is_hov and accent_bgr or "&H1A1410&"
+        local text_col = is_hov and "&H08080A&" or "&HFAF4F0&"
+        local border_col = accent_bgr
+        table.insert(lines, string.format("{\\an7\\pos(0,0)\\bord0\\shad0\\1c%s\\1a&H28&\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}", fill_col, x1, y1, x2, y1, x2, y2, x1, y2))
+        table.insert(lines, string.format("{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c%s\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}", border_col, x1, y1, x2, y1, x2, y2, x1, y2))
+        local cx = math.floor((x1 + x2) / 2)
+        local cy = math.floor((y1 + y2) / 2)
+        table.insert(lines, string.format("{\\an5\\pos(%d,%d)\\bord0\\shad0\\fs17\\b1\\1c%s}%s", cx, cy, text_col, label))
+        table.insert(active_hitboxes, { id = id, x1 = x1, y1 = y1, x2 = x2, y2 = y2 })
+    end
+
+    -- 1. Skip Intro / Skip Outro Pill
+    local in_op = player_ctx.op_start and player_ctx.op_end and cur_t >= (player_ctx.op_start - 1.0) and cur_t < (player_ctx.op_end - 1.5)
+    local in_ed = player_ctx.ed_start and player_ctx.ed_end and cur_t >= (player_ctx.ed_start - 1.0) and cur_t < (player_ctx.ed_end - 1.5)
+    local op_fallback = (not player_ctx.op_end) and hover_alive and cur_t >= 2.0 and cur_t <= 150.0
+    if in_op or op_fallback then
+        draw_pill("skip_op", 978, 592, 1236, 636, ">>|  SKIP INTRO  [Tab]", "&HF8BD38&")
+    elseif in_ed then
+        draw_pill("skip_ed", 978, 592, 1236, 636, ">>|  SKIP OUTRO  [Tab]", "&HF8BD38&")
+    end
+
+    -- 2. Next Episode Pill (ED, >= 88%, final 90s, or hover in final 35%)
+    local near_end = dur > 60.0 and ((cur_t / dur) >= 0.88 or (dur - cur_t) <= 90.0 or (hover_alive and (cur_t / dur) >= 0.65))
+    if player_ctx.next_ep and (in_ed or near_end) then
+        draw_pill("next_ep", 938, 646, 1236, 692, string.format(">>|  NEXT EPISODE: Ep %d  [N]", player_ctx.next_ep), "&HFA8BA7&")
+    end
+
+    -- 3. Interactive Subtitle Sync Bar ([S] Toggle)
+    if sub_bar_open then
+        local delay = mp.get_property_number("sub-delay", 0.0) or 0.0
+        table.insert(lines, "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H100C09&\\1a&H18&\\p1}m 190 642 l 1090 642 l 1090 698 l 190 698{\\p0}")
+        table.insert(lines, "{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&H24BFFB&\\p1}m 190 642 l 1090 642 l 1090 698 l 190 698{\\p0}")
+        table.insert(lines, string.format("{\\an7\\pos(208,658)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}SUB SYNC %+.2fs", delay))
+        draw_pill("sub_m50", 358, 650, 434, 690, "-0.5s", "&H24BFFB&")
+        draw_pill("sub_m10", 442, 650, 518, 690, "-0.1s", "&H24BFFB&")
+        draw_pill("sub_snap", 528, 650, 760, 690, "⚡ SNAP TO VOICE [y]", "&H99D334&")
+        draw_pill("sub_p10", 770, 650, 846, 690, "+0.1s", "&H24BFFB&")
+        draw_pill("sub_p50", 854, 650, 930, 690, "+0.5s", "&H24BFFB&")
+        draw_pill("sub_rst", 940, 650, 1020, 690, "Reset", "&HFA8BA7&")
+        draw_pill("sub_cls", 1028, 650, 1076, 690, "X", "&H5E3FF4&")
+    end
+
+    if #lines == 0 then
+        btn_ov:remove()
+    else
+        btn_ov.data = table.concat(lines, "\n")
+        btn_ov:update()
+    end
+end
+
+local function handle_btn_click()
+    local id = hovered_btn_id
+    if id == "skip_op" or id == "skip_ed" then
+        do_skip_intro_or_outro()
+    elseif id == "next_ep" then
+        do_next_episode()
+    elseif id == "sub_m50" then
+        adjust_sub_delay(-0.5)
+    elseif id == "sub_m10" then
+        adjust_sub_delay(-0.1)
+    elseif id == "sub_snap" then
+        snap_sub_to_voice()
+    elseif id == "sub_p10" then
+        adjust_sub_delay(0.1)
+    elseif id == "sub_p50" then
+        adjust_sub_delay(0.5)
+    elseif id == "sub_rst" then
+        mp.set_property_number("sub-delay", 0.0)
+        mp.osd_message("◈ Subtitle Delay Reset: 0.00s", 1.8)
+    elseif id == "sub_cls" then
+        sub_bar_open = false
+    end
+    render_player_buttons()
+end
+
+mp.observe_property("mouse-pos", "native", function(_, mpos)
+    if not mpos or not mpos.hover then
+        if hovered_btn_id ~= nil then
+            hovered_btn_id = nil
+            mp.remove_key_binding("solus-btn-click")
+            render_player_buttons()
+        end
+        return
+    end
+    hover_active_until = mp.get_time() + 3.5
+    local dim = mp.get_property_native("osd-dimensions")
+    if not dim or (dim.w or 0) <= 0 or (dim.h or 0) <= 0 then return end
+    local vx = (mpos.x / dim.w) * 1280.0
+    local vy = (mpos.y / dim.h) * 720.0
+    local new_hov = nil
+    for _, box in ipairs(active_hitboxes) do
+        if vx >= box.x1 and vx <= box.x2 and vy >= box.y1 and vy <= box.y2 then
+            new_hov = box.id
+            break
+        end
+    end
+    if new_hov ~= hovered_btn_id then
+        hovered_btn_id = new_hov
+        if hovered_btn_id ~= nil then
+            mp.add_forced_key_binding("MBTN_LEFT", "solus-btn-click", handle_btn_click)
+        else
+            mp.remove_key_binding("solus-btn-click")
+        end
+    end
+    render_player_buttons()
+end)
+
+mp.register_script_message("solus-player-ctx", function(json_str)
+    local parsed = utils.parse_json(json_str or "")
+    if type(parsed) == "table" then
+        player_ctx.ep = parsed.ep or player_ctx.ep
+        player_ctx.next_ep = parsed.next_ep
+        player_ctx.op_start = parsed.op_start
+        player_ctx.op_end = parsed.op_end
+        player_ctx.ed_start = parsed.ed_start
+        player_ctx.ed_end = parsed.ed_end
+        if parsed.sub_path and parsed.sub_path ~= "" then
+            player_ctx.sub_path = parsed.sub_path
+        end
+        render_player_buttons()
+    end
+end)
+
+mp.add_periodic_timer(0.5, render_player_buttons)
+
+local function toggle_sub_bar()
+    sub_bar_open = not sub_bar_open
+    render_player_buttons()
+end
+
+mp.add_forced_key_binding("TAB", "solus-skip-intro", do_skip_intro_or_outro)
+mp.add_forced_key_binding("N", "solus-next-episode", do_next_episode)
+mp.add_forced_key_binding("S", "solus-toggle-sub-bar", toggle_sub_bar)
+mp.add_forced_key_binding("y", "solus-snap-sub-voice", snap_sub_to_voice)
 "##;
 
 pub fn ensure_solus_audio_lua() -> Option<PathBuf> {
@@ -1339,5 +1625,10 @@ mod tests {
         assert!(lua_text.contains("solus-toggle-pip"));
         assert!(lua_text.contains("solus-toggle-hud"));
         assert!(lua_text.contains("solus-cycle-motion"));
+        assert!(lua_text.contains("solus-skip-intro"));
+        assert!(lua_text.contains("solus-next-episode"));
+        assert!(lua_text.contains("solus-snap-sub-voice"));
+        assert!(lua_text.contains("__SOLUS_NEXT_EPISODE__"));
+        assert!(lua_text.contains("solus-toggle-sub-bar"));
     }
 }

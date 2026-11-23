@@ -48,6 +48,11 @@ enum AppMessage {
         user_quit:    bool,
         elapsed_secs: u64,
     },
+    /// Live subtitle delay changed inside external libmpv player (e.g. Snap-to-Voice / z / x)
+    PlayerSubDelayChanged {
+        anime_id: i64,
+        delay_ms: i32,
+    },
     /// AniList search results
     SearchResults(Vec<db::cache::Anime>),
     /// Cover image downloaded and decoded (anime_id, image)
@@ -576,10 +581,70 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 AppMessage::PlaybackLog(line) => {
-                    if line.trim() == "__SOLUS_AUDIO_CYCLE__" {
+                    let trimmed = line.trim();
+                    if trimmed == "__SOLUS_AUDIO_CYCLE__" {
                         cycle_active_playback_audio(&mut state, &pool, &cfg, &tx).await;
+                    } else if trimmed == "__SOLUS_NEXT_EPISODE__" {
+                        if let Some(ref anime) = state.selected_anime.clone() {
+                            let cur_ep = state.selected_episode.unwrap_or(1);
+                            let next_ep = cur_ep + 1;
+                            let max_aired = anime.aired_episodes();
+                            if max_aired == 0 || next_ep <= max_aired {
+                                state.show_toast(
+                                    format!("⏭ Advancing to Episode {}...", next_ep),
+                                    unix_now(),
+                                );
+                                launch_remote_stream_switch(
+                                    &mut state,
+                                    &pool,
+                                    &cfg,
+                                    &tx,
+                                    next_ep,
+                                    None,
+                                    None,
+                                )
+                                .await;
+                            } else {
+                                state.show_toast(
+                                    format!("Reached latest aired Episode ({})", max_aired),
+                                    unix_now(),
+                                );
+                            }
+                        }
                     } else {
                         state.push_log(line);
+                    }
+                }
+                AppMessage::PlayerSubDelayChanged { anime_id, delay_ms } => {
+                    if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id)
+                        && (state.subtitle_delay_ms - delay_ms).abs() >= 10
+                    {
+                        state.subtitle_delay_ms = delay_ms;
+                        if let Some(ref mut opts) = state.last_play_options {
+                            opts.sub_delay_ms = delay_ms;
+                        }
+                        let pool2 = pool.clone();
+                        let pid = state.active_profile_id.clone();
+                        let now = unix_now();
+                        tokio::spawn(async move {
+                            let _ = db::user::save_anime_subtitle_delay_ms(
+                                &pool2,
+                                &pid,
+                                anime_id,
+                                delay_ms,
+                                now,
+                            )
+                            .await;
+                        });
+                        let delay_secs = state.subtitle_delay_secs();
+                        let r_state = state.remote_state.clone();
+                        tokio::spawn(async move {
+                            {
+                                let mut st = r_state.write().await;
+                                st.sub_delay = delay_secs;
+                            }
+                            services::remote::broadcast_state(&r_state).await;
+                        });
                     }
                 }
                 AppMessage::PlaybackDone {
@@ -2965,6 +3030,15 @@ async fn open_detail_from_anime(
     state.anime_progress = progress;
     let offline = db::user::get_offline_episodes(pool, anime_id).await.unwrap_or_default();
     state.offline_episodes = offline;
+    if let Some(saved_delay) =
+        db::user::get_anime_subtitle_delay_ms(pool, &state.active_profile_id, anime_id).await
+    {
+        state.subtitle_delay_ms = saved_delay;
+    } else if let Some(pb) =
+        db::user::get_profile_playback_settings(pool, &state.active_profile_id).await
+    {
+        state.subtitle_delay_ms = pb.subtitle_delay_ms.clamp(-30_000, 30_000);
+    }
     let fillers = db::user::get_anime_fillers(pool, anime_id).await.unwrap_or_default();
     state.anime_fillers = fillers;
 
@@ -4359,6 +4433,16 @@ async fn adjust_subtitle_delay(
     state.subtitle_delay_ms = target_ms;
     if let Some(ref mut opts) = state.last_play_options {
         opts.sub_delay_ms = target_ms;
+    }
+    if let Some(ref anime) = state.selected_anime {
+        let _ = db::user::save_anime_subtitle_delay_ms(
+            pool,
+            &state.active_profile_id,
+            anime.id,
+            target_ms,
+            unix_now(),
+        )
+        .await;
     }
     persist_profile_playback_settings_fields(state, pool).await;
     let delay_secs = state.subtitle_delay_secs();
@@ -9791,18 +9875,15 @@ async fn start_playback(
         services::remote::broadcast_state(&remote_state_init).await;
     });
 
-    // 4. Subtitle auto-sync (only needed for external [Auto-Synced] community subtitles;
-    // native stream subtitles are already synced and loaded directly by mpv in parallel)
-    let needs_subsync = !opts.subtitles_disabled
-        && opts.sub_url.as_ref().is_some_and(|u| {
-            (u.starts_with("http://") || u.starts_with("https://"))
-                && state
-                    .playback_sub_languages
-                    .iter()
-                    .find(|s| s.url == *u)
-                    .is_some_and(|s| s.stream_label.contains("[Auto-Synced]"))
-        });
-    if needs_subsync {
+    // 4. Smart Subtitle Sync & Local Caching for ALL remote subtitles (both [Auto-Synced] and native .vtt)
+    // so (a) subtle lags like +1.2s are fixed via Onset-Weighted / Voice-Lead alignment, and
+    // (b) in-player `[ ⚡ SNAP TO VOICE (y) ]` can parse exact dialogue cues locally.
+    let needs_sub_prep = !opts.subtitles_disabled
+        && opts
+            .sub_url
+            .as_ref()
+            .is_some_and(|u| u.starts_with("http://") || u.starts_with("https://"));
+    if needs_sub_prep {
         if let Some(ref sub_u) = opts.sub_url {
             let code = opts.sub_lang.as_deref().unwrap_or("sub");
             let client = reqwest::Client::builder()
@@ -9811,24 +9892,31 @@ async fn start_playback(
                 .build()
                 .unwrap_or_default();
 
-            // Locate verified reference subtitle from the primary stream (e.g. native official English .vtt)
             let ref_sub_url = state
                 .playback_sub_languages
                 .iter()
-                .find(|s| !s.stream_label.contains("[Auto-Synced]") && (s.url.starts_with("http://") || s.url.starts_with("https://")))
+                .find(|s| {
+                    s.url != *sub_u
+                        && !s.stream_label.contains("[Auto-Synced]")
+                        && (s.url.starts_with("http://") || s.url.starts_with("https://"))
+                })
                 .map(|s| s.url.as_str())
                 .or_else(|| {
                     state
                         .playback_sub_languages
                         .iter()
-                        .find(|s| s.code.starts_with("eng") && (s.url.starts_with("http://") || s.url.starts_with("https://")))
+                        .find(|s| {
+                            s.url != *sub_u
+                                && s.code.starts_with("eng")
+                                && (s.url.starts_with("http://") || s.url.starts_with("https://"))
+                        })
                         .map(|s| s.url.as_str())
                 });
 
             let stream_ref = opts.stream_url.as_deref().or(state.pending_master_url.as_deref());
 
             if let Ok((cached_path, sync_res)) = tokio::time::timeout(
-                Duration::from_secs(4),
+                Duration::from_secs(5),
                 services::subsync::ensure_synchronized_subtitle(
                     &client,
                     sub_u,
@@ -9897,10 +9985,27 @@ async fn start_playback(
     let playback_exit_kind = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
         services::ipc::PLAYBACK_EXIT_UNKNOWN,
     ));
+    let max_aired = state
+        .selected_anime
+        .as_ref()
+        .map(|a| a.aired_episodes())
+        .unwrap_or(0);
+    let next_episode = if max_aired == 0 || episode + 1 <= max_aired {
+        Some(episode + 1)
+    } else {
+        None
+    };
+    let sub_path_for_ctx = if opts.subtitles_disabled {
+        None
+    } else {
+        opts.sub_url.clone()
+    };
     let ipc_cfg = services::ipc::IpcMonitorConfig {
         anime_id,
         mal_id: mal_id_opt,
         episode,
+        next_episode,
+        sub_path: sub_path_for_ctx,
         sock_path,
         pool: pool.clone(),
         tx: tx.clone(),

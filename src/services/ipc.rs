@@ -354,6 +354,8 @@ pub struct IpcMonitorConfig {
     pub anime_id:           i64,
     pub mal_id:             Option<i64>,
     pub episode:            u32,
+    pub next_episode:       Option<u32>,
+    pub sub_path:           Option<String>,
     pub sock_path:          String,
     pub pool:               SqlitePool,
     pub tx:                 Sender<AppMessage>,
@@ -585,10 +587,9 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
     let sock_path_for_cleanup = config.sock_path.clone();
     set_active_socket_path(Some(config.sock_path.clone()));
 
-    // Spawn AniSkip resolution completely in the background so IPC connection and
-    // loading-screen animation / playlist-next never stall waiting on network calls.
+    // Spawn AniSkip resolution in the background (needed both for auto-skip AND interactive Skip Intro/Outro pills).
     let (skip_tx, skip_rx) = tokio::sync::oneshot::channel::<Vec<SkipResult>>();
-    if config.skip_intervals.is_empty() && config.auto_skip_intro {
+    if config.skip_intervals.is_empty() {
         let mal_hint = config.mal_id;
         let aid = config.anime_id;
         let ep = config.episode;
@@ -648,6 +649,33 @@ async fn run_mpv_ipc_monitor(config: IpcMonitorConfig) {
     let _ = std::fs::remove_file(&sock_path_for_cleanup);
 }
 
+fn build_player_ctx_payload(
+    episode: u32,
+    next_episode: Option<u32>,
+    skip_intervals: &[SkipResult],
+    sub_path: Option<&str>,
+) -> String {
+    let op = skip_intervals
+        .iter()
+        .find(|s| s.skip_type == "op" || s.skip_type == "mixed-op");
+    let ed = skip_intervals
+        .iter()
+        .find(|s| s.skip_type == "ed" || s.skip_type == "mixed-ed");
+    let ctx = serde_json::json!({
+        "ep": episode,
+        "next_ep": next_episode,
+        "op_start": op.map(|s| s.interval.start_time),
+        "op_end": op.map(|s| s.interval.end_time),
+        "ed_start": ed.map(|s| s.interval.start_time),
+        "ed_end": ed.map(|s| s.interval.end_time),
+        "sub_path": sub_path,
+    });
+    serde_json::json!({
+        "command": ["script-message", "solus-player-ctx", ctx.to_string()]
+    })
+    .to_string()
+}
+
 async fn drive_ipc_stream<S>(
     stream: S,
     config: IpcMonitorConfig,
@@ -659,6 +687,8 @@ async fn drive_ipc_stream<S>(
         anime_id,
         mal_id: _,
         episode,
+        next_episode,
+        sub_path,
         sock_path,
         pool,
         tx,
@@ -676,7 +706,7 @@ async fn drive_ipc_stream<S>(
     set_active_ipc_sender(Some(cmd_tx.clone()));
     set_playback_paused_for_cache(false);
 
-    // Subscribe to time-pos, duration, track-list, playlist-pos, eof-reached, and live buffer telemetry
+    // Subscribe to time-pos, duration, track-list, playlist-pos, eof-reached, buffer telemetry, and sub-delay
     let observe_cmds = [
         r#"{"command": ["observe_property", 1, "time-pos"]}"#,
         r#"{"command": ["observe_property", 2, "duration"]}"#,
@@ -687,10 +717,13 @@ async fn drive_ipc_stream<S>(
         r#"{"command": ["observe_property", 7, "cache-buffering-state"]}"#,
         r#"{"command": ["observe_property", 8, "cache-speed"]}"#,
         r#"{"command": ["observe_property", 9, "demuxer-cache-state"]}"#,
+        r#"{"command": ["observe_property", 10, "sub-delay"]}"#,
     ];
     for cmd in observe_cmds {
         let _ = writer_half.write_all(format!("{}\n", cmd).as_bytes()).await;
     }
+    let init_ctx = build_player_ctx_payload(episode, next_episode, &skip_intervals, sub_path.as_deref());
+    let _ = writer_half.write_all(format!("{init_ctx}\n").as_bytes()).await;
     let _ = writer_half.flush().await;
 
     let mut reader = BufReader::new(reader_half).lines();
@@ -724,6 +757,14 @@ async fn drive_ipc_stream<S>(
                 if let Ok(skips) = skip_res {
                     if skip_intervals.is_empty() && !skips.is_empty() {
                         skip_intervals = skips;
+                        let ctx_cmd = build_player_ctx_payload(
+                            episode,
+                            next_episode,
+                            &skip_intervals,
+                            sub_path.as_deref(),
+                        );
+                        let _ = writer_half.write_all(format!("{ctx_cmd}\n").as_bytes()).await;
+                        let _ = writer_half.flush().await;
                     }
                 }
             }
@@ -868,6 +909,12 @@ async fn drive_ipc_stream<S>(
 
                 if let Some((name, val)) = parse_property_change(&line) {
                     match name.as_str() {
+                        "sub-delay" => {
+                            let delay_ms = (val * 1000.0).round() as i32;
+                            let _ = tx
+                                .send(AppMessage::PlayerSubDelayChanged { anime_id, delay_ms })
+                                .await;
+                        }
                         "duration" => {
                             current_duration = val;
                         }
@@ -1092,6 +1139,8 @@ mod tests {
             anime_id: 1,
             mal_id: None,
             episode: 1,
+            next_episode: Some(2),
+            sub_path: None,
             sock_path: r"\\.\pipe\solus-mpv-1-1".to_string(),
             pool,
             tx,
@@ -1112,13 +1161,15 @@ mod tests {
         let (server_read, _server_write) = tokio::io::split(server_io);
         let mut lines = BufReader::new(server_read).lines();
 
-        // First nine commands must be observe_property subscriptions
+        // First ten commands must be observe_property subscriptions (+ init script-message)
         let mut observed = Vec::new();
-        for _ in 0..9 {
+        for _ in 0..10 {
             let line = lines.next_line().await.unwrap().unwrap();
             assert!(line.contains("observe_property"));
             observed.push(line);
         }
+        let ctx_line = lines.next_line().await.unwrap().unwrap();
+        assert!(ctx_line.contains("solus-player-ctx"));
         assert!(observed[4].contains("eof-reached"));
         assert!(observed[5].contains("paused-for-cache"));
         assert!(observed[6].contains("cache-buffering-state"));
