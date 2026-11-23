@@ -455,7 +455,7 @@ fn default_sub_lang_val() -> String {
 }
 
 fn default_auto_skip_intro() -> bool {
-    true
+    false
 }
 
 fn default_true() -> bool {

@@ -806,6 +806,13 @@ async fn drive_ipc_stream<S>(
                     break;
                 };
 
+                if line.contains("client-message") && line.contains("solus-next-episode") {
+                    let _ = tx
+                        .send(AppMessage::PlaybackLog("__SOLUS_NEXT_EPISODE__".to_string()))
+                        .await;
+                    continue;
+                }
+
                 if let Some(pos) = parse_playlist_pos_change(&line) {
                     if pos >= 1 {
                         stream_started = true;

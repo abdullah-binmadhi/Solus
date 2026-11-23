@@ -655,6 +655,7 @@ local hud_ov = mp.create_osd_overlay("ass-events")
 hud_ov.res_x = 1280
 hud_ov.res_y = 720
 local hud_visible = false
+local sub_bar_open = false
 local hud_pinned = false
 local hud_tick_timer = nil
 local hud_hide_timer = nil
@@ -689,6 +690,7 @@ end
 local function hide_info_hud()
     hud_visible = false
     hud_pinned = false
+    sub_bar_open = false
     if hud_tick_timer then hud_tick_timer:kill(); hud_tick_timer = nil end
     if hud_hide_timer then hud_hide_timer:kill(); hud_hide_timer = nil end
     hud_ov:remove()
@@ -787,7 +789,7 @@ local function render_info_hud()
         "{\\an7\\pos(66,288)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}⚡ DEMUXER CACHE   {\\1c&HFAF4F0&\\b0}%.1fs ahead  ·  %.1f MiB  %s  ·  {\\1c%s}%s\n" ..
         "{\\an7\\pos(66,314)\\bord0\\shad0\\1c&H2B2420&\\p1}m 0 0 l 520 0 l 520 10 l 0 10{\\p0}\n" ..
         "{\\an7\\pos(66,314)\\bord0\\shad0\\1c%s\\p1}m 0 0 l %d 0 l %d 10 l 0 10{\\p0}\n" ..
-        "{\\an7\\pos(66,340)\\bord0\\shad0\\fs15\\1c&HC8B8A4&}Keys: {\\1c&HF8BD38&}[Tab] Skip  [N] Next  [S] SubSync  {\\1c&H99D334&}[p/P] PiP  {\\1c&H24BFFB&}[a] Shaders [d] Deband [m] Motion  {\\1c&HFA8BA7&}[i/I] HUD [F1] Raw",
+        "{\\an7\\pos(66,340)\\bord0\\shad0\\fs15\\1c&HC8B8A4&}Keys: {\\1c&HF8BD38&}[Tab] Skip  [N] Next  [y] Snap Sub  {\\1c&H99D334&}[p/P] PiP  {\\1c&H24BFFB&}[a] Shaders [d] Deband [m] Motion  {\\1c&HFA8BA7&}[i/I] HUD [F1] Raw",
         q_tag, win_badge, pin_badge,
         mtitle,
         fmt_clock(pos), fmt_clock(dur), math.floor(pct), fmt_clock(rem), spd,
@@ -824,6 +826,7 @@ local function toggle_info_hud()
     end
     hud_pinned = false
     hud_visible = true
+    sub_bar_open = true
     if hud_hide_timer then hud_hide_timer:kill() end
     hud_hide_timer = mp.add_timeout(6.0, function()
         if not hud_pinned then hide_info_hud() end
@@ -840,11 +843,12 @@ local function pin_info_hud()
     if hud_hide_timer then hud_hide_timer:kill(); hud_hide_timer = nil end
     hud_visible = true
     hud_pinned = true
+    sub_bar_open = true
     ensure_hud_timer()
     render_info_hud()
 end
 
-mp.add_forced_key_binding("i", "solus-toggle-hud", toggle_info_hud)
+mp.add_forced_key_binding("i", "solus-toggle-hud", pin_info_hud)
 mp.add_forced_key_binding("I", "solus-pin-hud", pin_info_hud)
 
 -- =============================================================================
@@ -865,7 +869,6 @@ local player_ctx = {
     ed_end = nil,
     sub_path = nil,
 }
-local sub_bar_open = false
 local hover_active_until = 0
 local hovered_btn_id = nil
 local active_hitboxes = {}
@@ -968,8 +971,8 @@ end
 
 local function do_next_episode()
     mp.osd_message("⏭ Loading Next Episode...", 2.5)
-    io.write("__SOLUS_NEXT_EPISODE__\n")
-    io.flush()
+    -- Delivered to Solus over the IPC socket (client-message event); stdout marker kept as comment: __SOLUS_NEXT_EPISODE__
+    mp.commandv("script-message", "solus-next-episode")
 end
 
 local function adjust_sub_delay(delta)

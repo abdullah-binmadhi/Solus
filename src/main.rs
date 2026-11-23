@@ -9534,6 +9534,19 @@ async fn launch_remote_stream_switch(
                     || s.lang_keyword().eq_ignore_ascii_case(&pref_lower)
             })
             .map(|(i, _)| i)
+            .or_else(|| {
+                // Fallback: English when the preferred language is missing for this episode
+                state
+                    .playback_sub_languages
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find(|(_, s)| {
+                        s.code.to_lowercase().starts_with("en")
+                            || s.name.to_lowercase().contains("english")
+                    })
+                    .map(|(i, _)| i)
+            })
             .or_else(|| (state.playback_sub_languages.len() > 1).then_some(1))
     };
     state.playback_sub_cursor = chosen_idx.unwrap_or(0);
