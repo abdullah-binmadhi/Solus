@@ -1003,6 +1003,11 @@ async fn main() -> anyhow::Result<()> {
                         referer: prov_referer,
                         audio_urls: chosen_audio_urls,
                         has_demuxed_audio: chosen_has_demuxed,
+                        embedded_sub: chosen_prov
+                            .as_ref()
+                            .map(|p| p.embedded_sub)
+                            .unwrap_or_default(),
+                        hardsub_shield: state.hardsub_shield_mode,
                     };
                     wrap_opts_with_hls_proxy_if_needed(&mut state, &cfg, &mut opts, needs_hls_proxy).await;
                     start_playback(&mut state, opts, title, episode, &tx, &pool, &cfg).await;
@@ -1060,6 +1065,7 @@ async fn main() -> anyhow::Result<()> {
                     state.active_stream_referer = None;
                     state.active_sub_path = None;
                     state.live_playback.clear();
+                    state.invalidate_detail_image_protocols();
                     services::ipc::set_playback_paused_for_cache(false);
                     services::ipc::set_active_ipc_sender(None);
                     services::ipc::set_active_socket_path(None);
@@ -1436,6 +1442,7 @@ async fn main() -> anyhow::Result<()> {
                         } else {
                             cfg.default_sub_lang.clone()
                         };
+                        api::subtitles::sort_providers_for_sub_lang(&mut state.playback_providers, &pref_sub);
                         let (sub_idx, _) =
                             api::subtitles::SubtitleOption::select_index_with_english_fallback(
                                 &state.playback_sub_languages,
@@ -1444,6 +1451,12 @@ async fn main() -> anyhow::Result<()> {
                         state.playback_sub_cursor = sub_idx;
 
                         state.sync_active_provider();
+                        let (post_sub_idx, _) =
+                            api::subtitles::SubtitleOption::select_index_with_english_fallback(
+                                &state.playback_sub_languages,
+                                &pref_sub,
+                            );
+                        state.playback_sub_cursor = post_sub_idx;
                         sync_provider_delay_for_cursor(&mut state, &pool).await;
                         if let Some(ref ladder) = info.ladder {
                             state
@@ -2163,7 +2176,11 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if state.screen != last_screen {
+            let returning_to_detail = state.screen == Screen::Detail;
             let _ = terminal.clear();
+            if returning_to_detail {
+                state.invalidate_detail_image_protocols();
+            }
             last_screen = state.screen.clone();
             needs_redraw = true;
         }
@@ -2190,11 +2207,11 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Screen::PlaybackQuery => {
-                        ui::detail::render(frame, &mut state);
+                        ui::detail::render_with_image_policy(frame, &mut state, false);
                         ui::play_query::render_overlay(frame, &state);
                     }
                     Screen::PlaybackOptions => {
-                        ui::detail::render(frame, &mut state);
+                        ui::detail::render_with_image_policy(frame, &mut state, false);
                         ui::play_options::render_overlay(frame, &state);
                     }
                     Screen::Playback => ui::playback::render(frame, &state),
@@ -5032,6 +5049,13 @@ async fn handle_playback_options(
         KeyCode::Char('I') => {
             toggle_info_hud_action(state, true);
         }
+        KeyCode::Char('b') | KeyCode::Char('B') => {
+            state.cycle_hardsub_shield_mode();
+            state.show_toast(
+                format!("◈ Hardsub Shield: {}", state.hardsub_shield_mode.label()),
+                unix_now(),
+            );
+        }
         KeyCode::Char('e') | KeyCode::Enter => {
             let force_enqueue = matches!(key.code, KeyCode::Char('e'));
             if let Some(anime) = state.selected_anime.clone() {
@@ -5237,6 +5261,11 @@ async fn handle_playback_options(
                             performance_mode: cfg.performance_mode,
                             deband_mode: cfg.deband_mode,
                             motion_mode: cfg.motion_mode,
+                            embedded_sub: chosen_prov
+                                .as_ref()
+                                .map(|p| p.embedded_sub)
+                                .unwrap_or_default(),
+                            hardsub_shield: state.hardsub_shield_mode,
                             referer: chosen_prov.and_then(|p| p.referer),
                             audio_urls,
                             has_demuxed_audio,
@@ -7926,6 +7955,8 @@ async fn play_queue_item(
             referer: None,
             audio_urls: Vec::new(),
             has_demuxed_audio: false,
+            embedded_sub: Default::default(),
+            hardsub_shield: state.hardsub_shield_mode,
         });
 
     opts.ipc_socket = None;
@@ -7938,6 +7969,7 @@ async fn play_queue_item(
     opts.performance_mode = cfg.performance_mode;
     opts.deband_mode = cfg.deband_mode;
     opts.motion_mode = cfg.motion_mode;
+    opts.hardsub_shield = state.hardsub_shield_mode;
     opts.sub_style = Some(cfg.subtitle_style.clone());
     opts.sub_delay_ms = state.subtitle_delay_ms;
     if state.anime4k_mode != config::Anime4KMode::Off {
@@ -9290,6 +9322,13 @@ async fn handle_playback(
         KeyCode::Char('I') => {
             toggle_info_hud_action(state, true);
         }
+        KeyCode::Char('b') | KeyCode::Char('B') => {
+            state.cycle_hardsub_shield_mode();
+            state.show_toast(
+                format!("◈ Hardsub Shield: {}", state.hardsub_shield_mode.label()),
+                unix_now(),
+            );
+        }
         _ => {}
     }
 }
@@ -10050,6 +10089,7 @@ async fn start_playback(
     state.last_played_anime_id = state.selected_anime.as_ref().map(|anime| anime.id);
     state.screen      = Screen::Detail;
     state.pending_playback_query = None;
+    state.invalidate_detail_image_protocols();
 
     let deps = api::player::detect_dependencies();
     state.set_dependencies(deps.has_ani_cli, deps.has_mpv, deps.has_mpvnet, deps.has_celluloid);
@@ -11145,7 +11185,9 @@ fn render_base_screen(
     base_screen: &Screen,
 ) {
     match base_screen {
-        Screen::Detail if state.selected_anime.is_some() => ui::detail::render(frame, state),
+        Screen::Detail if state.selected_anime.is_some() => {
+            ui::detail::render_with_image_policy(frame, state, false)
+        }
         _ => {
             if state.is_loading {
                 render_loading(frame, state);

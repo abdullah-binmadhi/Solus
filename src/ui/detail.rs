@@ -55,9 +55,18 @@ pub fn format_mini_bar(pos: f64, dur: f64, width: usize) -> String {
 
 /// Render the detail screen.
 pub fn render(frame: &mut Frame, state: &mut AppState) {
+    render_with_image_policy(frame, state, true);
+}
+
+/// Render the detail screen while optionally suppressing Kitty image placements
+/// (prevents opaque `Clear` overlays like `PlaybackOptions` from wiping one-shot transmissions).
+pub fn render_with_image_policy(frame: &mut Frame, state: &mut AppState, allow_kitty_images: bool) {
     let Some(anime) = state.selected_anime.clone() else {
         return;
     };
+    let show_images = allow_kitty_images
+        && !state.is_download_modal_open
+        && !state.is_batch_queue_modal_open;
 
     let area = frame.area();
     let chunks = Layout::default()
@@ -71,8 +80,8 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         .split(area);
 
     render_top_bar(frame, chunks[0], state, &anime);
-    render_info(frame, chunks[1], state, &anime);
-    render_episodes(frame, chunks[2], state, &anime);
+    render_info(frame, chunks[1], state, &anime, show_images);
+    render_episodes(frame, chunks[2], state, &anime, show_images);
     render_footer(frame, chunks[3], state);
 
     if state.is_download_modal_open {
@@ -430,7 +439,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 /// Top section: cover + metadata side by side.
-fn render_info(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anime) {
+fn render_info(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anime, show_images: bool) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -448,8 +457,8 @@ fn render_info(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anim
     let cover_inner = cover_block.inner(cols[0]);
     frame.render_widget(cover_block, cols[0]);
 
-    // Cover: real image when terminal supports it, halfblock otherwise
-    if state.has_image_support() {
+    // Cover: real image when terminal supports it (and not under an opaque overlay), halfblock otherwise
+    if show_images && state.has_image_support() {
         if let Some(cover) =
             state.resolve_cover_protocol(anime.id, cover_inner.width, cover_inner.height, 0.15, true)
         {
@@ -629,45 +638,59 @@ fn render_metadata(frame: &mut Frame, area: Rect, state: &AppState, anime: &Anim
 }
 
 /// Render an episode's 16:9 thumbnail (or lazy fallback banner) inside `thumb_area`,
-/// rebuilding cached image protocols only when the widget geometry or font size changes.
+/// rebuilding cached image protocols when widget geometry changes or protocols were invalidated.
 fn render_episode_thumbnail_slot(
     frame: &mut Frame,
     state: &mut AppState,
     ep: u32,
     thumb_area: Rect,
+    show_images: bool,
 ) -> bool {
+    if !show_images || !state.has_image_support() || thumb_area.width == 0 || thumb_area.height == 0 {
+        return false;
+    }
+
     let font_size = state.picker.map(|p| p.font_size).unwrap_or((12, 24));
     let geo_key = (thumb_area.width, thumb_area.height, font_size.0, font_size.1);
-    if thumb_area.width > 0 && thumb_area.height > 0 && state.thumbnail_geometry_key != Some(geo_key) {
-        let had_prev_geo = state.thumbnail_geometry_key.is_some();
+    if state.thumbnail_geometry_key != Some(geo_key) {
         state.thumbnail_geometry_key = Some(geo_key);
-        if had_prev_geo {
-            if let Some(picker) = state.picker {
-                let raw_eps: Vec<(u32, image::DynamicImage)> = state
-                    .episode_raw_thumbnails
-                    .iter()
-                    .map(|(&ep_k, img)| (ep_k, img.clone()))
-                    .collect();
-                for (ep_k, raw) in raw_eps {
-                    let prepared = crate::ui::components::cover::scale_to_frame_cover(
-                        raw,
-                        thumb_area.width,
-                        thumb_area.height,
-                        picker.font_size,
-                        0.20,
-                    );
-                    state.episode_thumbnails.insert(
-                        ep_k,
-                        crate::ui::components::cover::build_stateful_protocol(picker, prepared),
-                    );
-                }
-                state.episode_fallback_thumbnails.clear();
+        if let Some(picker) = state.picker {
+            let raw_eps: Vec<(u32, image::DynamicImage)> = state
+                .episode_raw_thumbnails
+                .iter()
+                .map(|(&ep_k, img)| (ep_k, img.clone()))
+                .collect();
+            for (ep_k, raw) in raw_eps {
+                let prepared = crate::ui::components::cover::scale_to_frame_cover(
+                    raw,
+                    thumb_area.width,
+                    thumb_area.height,
+                    picker.font_size,
+                    0.20,
+                );
+                state.episode_thumbnails.insert(
+                    ep_k,
+                    crate::ui::components::cover::build_stateful_protocol(picker, prepared),
+                );
             }
+            state.episode_fallback_thumbnails.clear();
         }
     }
 
-    if !state.has_image_support() {
-        return false;
+    if !state.episode_thumbnails.contains_key(&ep) {
+        if let (Some(picker), Some(raw)) = (state.picker, state.episode_raw_thumbnails.get(&ep).cloned()) {
+            let prepared = crate::ui::components::cover::scale_to_frame_cover(
+                raw,
+                thumb_area.width,
+                thumb_area.height,
+                picker.font_size,
+                0.20,
+            );
+            state.episode_thumbnails.insert(
+                ep,
+                crate::ui::components::cover::build_stateful_protocol(picker, prepared),
+            );
+        }
     }
 
     if let Some(thumb) = state.episode_thumbnails.get_mut(&ep) {
@@ -680,11 +703,25 @@ fn render_episode_thumbnail_slot(
     }
 
     if !state.episode_fallback_thumbnails.contains_key(&ep) {
-        if let (Some(picker), Some(ref card_img)) = (state.picker, &state.current_card_img) {
-            let proto = crate::ui::components::cover::build_stateful_protocol(
-                picker,
-                card_img.clone(),
+        let fallback_src = state
+            .current_card_img
+            .clone()
+            .or_else(|| {
+                state
+                    .selected_anime
+                    .as_ref()
+                    .and_then(|a| state.cover_raw_cache.get(&a.id))
+                    .cloned()
+            });
+        if let (Some(picker), Some(raw_fb)) = (state.picker, fallback_src) {
+            let prepared = crate::ui::components::cover::scale_to_frame_cover(
+                raw_fb,
+                thumb_area.width,
+                thumb_area.height,
+                picker.font_size,
+                0.20,
             );
+            let proto = crate::ui::components::cover::build_stateful_protocol(picker, prepared);
             state.episode_fallback_thumbnails.insert(ep, proto);
         }
     }
@@ -701,16 +738,16 @@ fn render_episode_thumbnail_slot(
 }
 
 /// Dispatch episode browser to selected layout (List or Split-Deck).
-fn render_episodes(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anime) {
+fn render_episodes(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anime, show_images: bool) {
     match state.episode_view_mode {
-        EpisodeViewMode::List => render_netflix_list(frame, area, state, anime),
-        EpisodeViewMode::Split => render_netflix_split(frame, area, state, anime),
+        EpisodeViewMode::List => render_netflix_list(frame, area, state, anime, show_images),
+        EpisodeViewMode::Split => render_netflix_split(frame, area, state, anime, show_images),
     }
 }
 
 /// Option 1: Netflix Vertical Episode List.
 /// Dense, scrollable stack of full-width horizontal cards with 16:9 thumbnails and rich metadata.
-fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anime) {
+fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anime, show_images: bool) {
     let theme = state.theme();
     let max_aired = anime.aired_episodes();
     let total_eps = anime.episodes.map(|e| e as u32).unwrap_or(max_aired);
@@ -853,7 +890,7 @@ fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anim
 
         // ── Render 16:9 Thumbnail (Dedicated per-episode StatefulProtocol — zero Kitty collisions) ──
         let thumb_rect = card_cols[0];
-        let rendered_img = render_episode_thumbnail_slot(frame, state, ep, thumb_rect);
+        let rendered_img = render_episode_thumbnail_slot(frame, state, ep, thumb_rect, show_images);
 
         if !rendered_img {
             // Stylized placeholder card
@@ -1000,7 +1037,7 @@ fn render_netflix_list(frame: &mut Frame, area: Rect, state: &mut AppState, anim
 /// Option 3: Netflix TV Split-Deck View.
 /// Left column: rapid-scrolling Episode Queue.
 /// Right column: expansive 16:9 Thumbnail Theater + full episode inspector.
-fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anime) {
+fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, anime: &Anime, show_images: bool) {
     let theme = state.theme();
     let max_aired = anime.aired_episodes();
     let total_eps = anime.episodes.map(|e| e as u32).unwrap_or(max_aired);
@@ -1172,7 +1209,7 @@ fn render_netflix_split(frame: &mut Frame, area: Rect, state: &mut AppState, ani
     let specs_area = top_split[1];
     let is_aired = selected_ep <= max_aired;
     let is_watched = state.watched_episodes.contains(&selected_ep);
-    let rendered_img = render_episode_thumbnail_slot(frame, state, selected_ep, thumb_area);
+    let rendered_img = render_episode_thumbnail_slot(frame, state, selected_ep, thumb_area, show_images);
 
     if !rendered_img {
         let bg = if !is_aired { Color::Rgb(20, 20, 25) } else { Color::Rgb(30, 25, 45) };

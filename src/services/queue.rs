@@ -1041,6 +1041,12 @@ pub async fn resolve_item_prefetch(
         referer: stream_info.providers.first().and_then(|p| p.referer.clone()),
         audio_urls: chosen_audio_urls,
         has_demuxed_audio: chosen_demuxed,
+        embedded_sub: stream_info
+            .providers
+            .first()
+            .map(|p| p.embedded_sub)
+            .unwrap_or_default(),
+        hardsub_shield: crate::api::player::HardsubShieldMode::OpaqueMask,
     };
 
     Some(ResolvedPrefetch {
@@ -1103,6 +1109,8 @@ mod tests {
                 referer: None,
                 audio_urls: Vec::new(),
                 has_demuxed_audio: false,
+                embedded_sub: Default::default(),
+                hardsub_shield: crate::api::player::HardsubShieldMode::OpaqueMask,
             },
             resolved_at,
             sub_synced: false,

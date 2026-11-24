@@ -375,6 +375,9 @@ pub struct AppState {
     /// Playback options purpose (LaunchNow, EnqueueSingle, or EditQueueItem)
     pub playback_options_purpose: PlaybackOptionsPurpose,
 
+    /// Visual overlap shield for non-English subtitles over baked-in English streams
+    pub hardsub_shield_mode: crate::api::player::HardsubShieldMode,
+
     /// Playback: oneshot sender to stop the background player task
     pub player_stop:      Option<tokio::sync::oneshot::Sender<()>>,
 
@@ -921,6 +924,7 @@ impl AppState {
             pending_playback_query: None,
             pending_dub: false,
             playback_options_purpose: PlaybackOptionsPurpose::LaunchNow,
+            hardsub_shield_mode: crate::api::player::HardsubShieldMode::OpaqueMask,
             player_stop:      None,
             now_playing:      None,
             playback_logs:    Vec::new(),
@@ -1209,6 +1213,22 @@ impl AppState {
             return self.cover_cache.get_mut(&anime_id);
         }
         None
+    }
+
+    /// Clear encoded Kitty/terminal `StatefulProtocol` widgets while preserving decoded raw images
+    /// in RAM (`cover_raw_cache`, `episode_raw_thumbnails`, `current_card_img`) so returning from
+    /// playback or closing modal overlays re-transmits every cover & episode thumbnail cleanly.
+    pub fn invalidate_detail_image_protocols(&mut self) {
+        self.fitted_cover_cache.clear();
+        self.detail_cache.clear();
+        self.episode_thumbnails.clear();
+        self.episode_fallback_thumbnails.clear();
+        self.thumbnail_geometry_key = None;
+    }
+
+    /// Cycle Hardsub Shield protection (`Opaque Mask` -> `Top Edge` -> `Off`).
+    pub fn cycle_hardsub_shield_mode(&mut self) {
+        self.hardsub_shield_mode = self.hardsub_shield_mode.next();
     }
 
     /// Show a toast notification (auto-dismissed after 4 seconds).
@@ -2313,6 +2333,7 @@ mod tests {
             }],
             referer: None,
             needs_hls_proxy: false,
+            embedded_sub: crate::api::subtitles::EmbeddedSubtitleKind::None,
         }];
         state.playback_provider_cursor = 0;
         state.sync_active_provider();
@@ -2331,6 +2352,11 @@ mod tests {
             13,
             image::DynamicImage::ImageRgb8(image::RgbImage::new(16, 9)),
         );
+        state.thumbnail_geometry_key = Some((32, 9, 12, 24));
+        state.invalidate_detail_image_protocols();
+        assert_eq!(state.episode_raw_thumbnails.len(), 1);
+        assert!(state.thumbnail_geometry_key.is_none());
+
         state.open_detail(other);
         assert!(state.episode_metadata_generation > gen1);
         assert!(state.episode_raw_thumbnails.is_empty());

@@ -381,6 +381,29 @@ pub struct AudioTrackOption {
     pub is_default: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbeddedSubtitleKind {
+    #[default]
+    None,
+    HardsubEn,
+    SoftMuxed,
+}
+
+impl EmbeddedSubtitleKind {
+    pub fn badge_label(self) -> &'static str {
+        match self {
+            Self::None => "Clean",
+            Self::HardsubEn => "Hardsub EN",
+            Self::SoftMuxed => "Muxed Sub",
+        }
+    }
+
+    pub fn has_baked_english(self) -> bool {
+        matches!(self, Self::HardsubEn)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderOption {
     pub id: String,
@@ -399,6 +422,8 @@ pub struct ProviderOption {
     pub referer: Option<String>,
     #[serde(default)]
     pub needs_hls_proxy: bool,
+    #[serde(default)]
+    pub embedded_sub: EmbeddedSubtitleKind,
 }
 
 /// Canonical multi-alias identity passed to stream providers so we never prompt the user
@@ -487,6 +512,7 @@ pub fn default_providers() -> Vec<ProviderOption> {
             verified_res: None,
             referer: Some("https://zokoanime.video/".to_string()),
             needs_hls_proxy: false,
+            embedded_sub: EmbeddedSubtitleKind::None,
         },
         ProviderOption {
             id: "hd1".to_string(),
@@ -505,6 +531,7 @@ pub fn default_providers() -> Vec<ProviderOption> {
             verified_res: None,
             referer: Some("https://megaplay.buzz/".to_string()),
             needs_hls_proxy: false,
+            embedded_sub: EmbeddedSubtitleKind::None,
         },
         ProviderOption {
             id: "animegg".to_string(),
@@ -524,6 +551,7 @@ pub fn default_providers() -> Vec<ProviderOption> {
             verified_res: None,
             referer: Some("https://www.animegg.org/".to_string()),
             needs_hls_proxy: false,
+            embedded_sub: EmbeddedSubtitleKind::HardsubEn,
         },
     ]
 }
@@ -1290,6 +1318,33 @@ fn normalize_stream_dedup_key(url: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn m3u8_has_embedded_subtitles(m3u8_content: &str) -> bool {
+    m3u8_content.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("#EXT-X-MEDIA:")
+            && extract_hls_attr(trimmed, "TYPE").is_some_and(|t| t.eq_ignore_ascii_case("SUBTITLES"))
+    })
+}
+
+/// Rank providers for a desired subtitle language: when the user wants a non-English/non-Off
+/// track (e.g. Arabic), prioritize `Clean` raw-video streams ahead of `HardsubEn` streams.
+pub fn sort_providers_for_sub_lang(providers: &mut [ProviderOption], sub_lang_or_code: &str) {
+    let lower = sub_lang_or_code.trim().to_ascii_lowercase();
+    let wants_non_english = !lower.is_empty()
+        && lower != "none"
+        && lower != "off"
+        && !lower.starts_with("eng")
+        && lower != "en";
+    providers.sort_by_key(|p| {
+        let embed_penalty: u8 = if wants_non_english && p.embedded_sub.has_baked_english() {
+            1
+        } else {
+            0
+        };
+        (embed_penalty, provider_rank_priority(&p.id))
+    });
+}
+
 fn provider_rank_priority(id: &str) -> u8 {
     match id {
         "megaplay_mal" | "hd1" => 0,
@@ -1324,10 +1379,10 @@ pub async fn fetch_stream_info_with_identity(
     let mal_fut = async {
         if let Some(mid) = resolved_mal_id {
             let (mut res, dub_avail) = tokio::join!(
-                fetch_stream_for_mal(&client, mid, episode, is_dub),
+                fetch_stream_for_mal_with_mode(&client, mid, episode, is_dub),
                 check_mal_dub_available(&client, mid, episode)
             );
-            if let Ok(ref mut z_info) = res {
+            if let Ok((ref mut z_info, used_hsub)) = res {
                 let probe_url = z_info
                     .qualities
                     .first()
@@ -1338,16 +1393,16 @@ pub async fn fetch_stream_info_with_identity(
                 let (ok, needs_proxy) =
                     probe_hls_segment_health(&client, probe_url, "https://zokoanime.video/").await;
                 if !ok {
-                    return (None, dub_avail, false);
+                    return (None, dub_avail, false, false);
                 }
                 for q in &mut z_info.qualities {
                     q.needs_hls_proxy = needs_proxy;
                 }
-                return (Some(z_info.clone()), dub_avail, needs_proxy);
+                return (Some(z_info.clone()), dub_avail, needs_proxy, used_hsub);
             }
-            return (None, dub_avail, false);
+            return (None, dub_avail, false, false);
         }
-        (None, false, false)
+        (None, false, false, false)
     };
 
     let megaplay_direct_fut = async {
@@ -1391,7 +1446,7 @@ pub async fn fetch_stream_info_with_identity(
         )
     );
 
-    let (zoko_res, zoko_dub, zoko_proxy) = zoko_timeout_res.unwrap_or((None, false, false));
+    let (zoko_res, zoko_dub, zoko_proxy, zoko_hsub) = zoko_timeout_res.unwrap_or((None, false, false, false));
     let ext_subs = ext_subs_res.unwrap_or_default();
     let megaplay_direct_provs = megaplay_direct_res.unwrap_or_default();
     let nineanime_provs = nineanime_vidmoly_res.unwrap_or_default();
@@ -1499,7 +1554,11 @@ pub async fn fetch_stream_info_with_identity(
                 let best_res = z_info.qualities.first().map(|q| q.label.clone());
                 verified_providers.push(ProviderOption {
                     id: "zoko".to_string(),
-                    name: "ZokoAnime".to_string(),
+                    name: if zoko_hsub {
+                        "ZokoAnime (Hardsub)".to_string()
+                    } else {
+                        "ZokoAnime".to_string()
+                    },
                     server_label: if zoko_proxy {
                         "ZokoAnime Direct (Proxy)".to_string()
                     } else {
@@ -1514,6 +1573,11 @@ pub async fn fetch_stream_info_with_identity(
                     verified_res: best_res,
                     referer: Some("https://zokoanime.video/".to_string()),
                     needs_hls_proxy: zoko_proxy,
+                    embedded_sub: if zoko_hsub {
+                        EmbeddedSubtitleKind::HardsubEn
+                    } else {
+                        EmbeddedSubtitleKind::None
+                    },
                 });
                 seen_ids.insert("zoko".to_string());
                 seen_stream_keys.insert(normalize_stream_dedup_key(m_url));
@@ -1637,12 +1701,13 @@ async fn fetch_all_hianime_providers_identity(
     let has_dub_srv = srv_html.contains("data-type=\"dub\"");
     let has_sub_srv = srv_html.contains("data-type=\"sub\"") || srv_html.contains("data-type=\"hsub\"");
 
-    let mut embeds: Vec<(String, String, String)> = Vec::new();
+    let mut embeds: Vec<(String, String, String, EmbeddedSubtitleKind)> = Vec::new();
     for block in srv_html.split("server-item") {
+        let is_hsub_blk = block.contains("data-type=\"hsub\"");
         let is_matching_mode = if is_dub {
             block.contains("data-type=\"dub\"")
         } else {
-            block.contains("data-type=\"sub\"") || block.contains("data-type=\"hsub\"")
+            block.contains("data-type=\"sub\"") || is_hsub_blk
         };
         if !is_matching_mode {
             continue;
@@ -1662,7 +1727,12 @@ async fn fetch_all_hianime_providers_identity(
                             } else {
                                 ("hianime", "HiAnime Alt")
                             };
-                            embeds.push((label.0.to_string(), label.1.to_string(), url));
+                            let embed_kind = if is_hsub_blk {
+                                EmbeddedSubtitleKind::HardsubEn
+                            } else {
+                                EmbeddedSubtitleKind::None
+                            };
+                            embeds.push((label.0.to_string(), label.1.to_string(), url, embed_kind));
                         }
                     }
                 }
@@ -1670,7 +1740,7 @@ async fn fetch_all_hianime_providers_identity(
         }
     }
 
-    let embed_futs = embeds.into_iter().map(|(pid, pname, embed_url)| {
+    let embed_futs = embeds.into_iter().map(|(pid, pname, embed_url, embed_kind)| {
         let client = client.clone();
         async move {
             let resp = client
@@ -1720,6 +1790,7 @@ async fn fetch_all_hianime_providers_identity(
                     verified_res: best_res,
                     referer: Some(referer_hdr),
                     needs_hls_proxy: needs_proxy,
+                    embedded_sub: embed_kind,
                 };
                 return Some((st_info, prov));
             }
@@ -2122,6 +2193,11 @@ async fn fetch_animegg_provider(
         verified_res: best_res,
         referer: Some("https://www.animegg.org/".to_string()),
         needs_hls_proxy: false,
+        embedded_sub: if is_dub {
+            EmbeddedSubtitleKind::None
+        } else {
+            EmbeddedSubtitleKind::HardsubEn
+        },
     })
 }
 
@@ -2345,6 +2421,11 @@ async fn fetch_animeheaven_provider(
         verified_res: Some("1080p".to_string()),
         referer: Some("https://animeheaven.me/".to_string()),
         needs_hls_proxy: false,
+        embedded_sub: if is_dub || supports_dub {
+            EmbeddedSubtitleKind::None
+        } else {
+            EmbeddedSubtitleKind::HardsubEn
+        },
     })
 }
 
@@ -2705,6 +2786,33 @@ async fn fetch_mal_id(client: &reqwest::Client, anilist_id: i64) -> Option<i64> 
     json.pointer("/data/Media/idMal")?.as_i64()
 }
 
+/// Fetch and parse stream info using MAL ID directly on ZokoAnime embed (`sub` -> `hsub` fallback),
+/// returning `(StreamInfo, used_hardsub_fallback)`.
+async fn fetch_stream_for_mal_with_mode(
+    client: &reqwest::Client,
+    mal_id: i64,
+    episode: u32,
+    is_dub: bool,
+) -> Result<(StreamInfo, bool), ()> {
+    let modes: &[(&str, bool)] = if is_dub {
+        &[("dub", false)]
+    } else {
+        &[("sub", false), ("hsub", true)]
+    };
+    for &(mode_str, is_hsub) in modes {
+        let url = format!("https://zokoanime.video/stream/mal/{}/{}/{}", mal_id, episode, mode_str);
+        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(4)).send().await {
+            if let Ok(html) = resp.text().await {
+                if let Ok(info) = parse_stream_embed(client, &html, is_dub).await {
+                    return Ok((info, is_hsub));
+                }
+            }
+        }
+    }
+    Err(())
+}
+
+#[allow(dead_code)]
 /// Fetch and parse stream info using MAL ID directly on ZokoAnime embed (`sub` -> `hsub` fallback).
 async fn fetch_stream_for_mal(
     client: &reqwest::Client,
@@ -2712,18 +2820,9 @@ async fn fetch_stream_for_mal(
     episode: u32,
     is_dub: bool,
 ) -> Result<StreamInfo, ()> {
-    let modes: &[&str] = if is_dub { &["dub"] } else { &["sub", "hsub"] };
-    for mode_str in modes {
-        let url = format!("https://zokoanime.video/stream/mal/{}/{}/{}", mal_id, episode, mode_str);
-        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(4)).send().await {
-            if let Ok(html) = resp.text().await {
-                if let Ok(info) = parse_stream_embed(client, &html, is_dub).await {
-                    return Ok(info);
-                }
-            }
-        }
-    }
-    Err(())
+    fetch_stream_for_mal_with_mode(client, mal_id, episode, is_dub)
+        .await
+        .map(|(info, _)| info)
 }
 
 #[allow(dead_code)]
@@ -3071,6 +3170,11 @@ async fn fetch_megaplay_direct_providers(
                 verified_res: best_res,
                 referer: Some("https://megaplay.buzz/".to_string()),
                 needs_hls_proxy: needs_proxy,
+                embedded_sub: if mode == "hsub" {
+                    EmbeddedSubtitleKind::HardsubEn
+                } else {
+                    EmbeddedSubtitleKind::None
+                },
             };
             Some((st_info, prov))
         }
@@ -3225,7 +3329,13 @@ async fn resolve_vidmoly_provider(
         verified_res: best_res,
         referer: Some(referer.to_string()),
         needs_hls_proxy: needs_proxy,
+        embedded_sub: if is_dub {
+            EmbeddedSubtitleKind::None
+        } else {
+            EmbeddedSubtitleKind::HardsubEn
+        },
     };
+    let _ = m3u8_has_embedded_subtitles(&m3u8_text);
     Some((info, prov))
 }
 
@@ -3353,6 +3463,7 @@ async fn fetch_9anime_and_vidmoly_providers(
                     verified_res: best_res,
                     referer: Some("https://megaplay.buzz/".to_string()),
                     needs_hls_proxy: needs_proxy,
+                    embedded_sub: EmbeddedSubtitleKind::None,
                 };
                 return Some((st_info, prov));
             }
@@ -3887,5 +3998,47 @@ index-f1.m3u8
         "#;
         let id = AnimeSearchIdentity::from_query(20605, Some(22319), "Tokyo Ghoul");
         assert_eq!(extract_best_anime_id_scored(html, &id).as_deref(), Some("890"));
+    }
+
+    #[test]
+    fn test_sort_providers_prefers_clean_for_arabic() {
+        let mut provs = vec![
+            ProviderOption {
+                id: "vidmoly".into(),
+                name: "Vidmoly Direct".into(),
+                server_label: "Vidmoly".into(),
+                master_url: Some("https://cdn.example/v.m3u8".into()),
+                qualities: vec![],
+                subtitles: vec![],
+                supports_sub: true,
+                supports_dub: false,
+                is_verified: true,
+                verified_res: Some("900p".into()),
+                referer: None,
+                needs_hls_proxy: false,
+                embedded_sub: EmbeddedSubtitleKind::HardsubEn,
+            },
+            ProviderOption {
+                id: "zoko".into(),
+                name: "ZokoAnime".into(),
+                server_label: "ZokoAnime".into(),
+                master_url: Some("https://cdn.example/z.m3u8".into()),
+                qualities: vec![],
+                subtitles: vec![],
+                supports_sub: true,
+                supports_dub: false,
+                is_verified: true,
+                verified_res: Some("1080p".into()),
+                referer: None,
+                needs_hls_proxy: false,
+                embedded_sub: EmbeddedSubtitleKind::None,
+            },
+        ];
+        sort_providers_for_sub_lang(&mut provs, "ara");
+        assert_eq!(provs[0].id, "zoko");
+        assert_eq!(provs[1].id, "vidmoly");
+
+        sort_providers_for_sub_lang(&mut provs, "eng");
+        assert_eq!(provs[0].id, "vidmoly");
     }
 }

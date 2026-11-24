@@ -45,6 +45,35 @@ impl DependencyStatus {
 }
 
 /// Options passed to the playback engine when launching an episode.
+/// Hardsub visual overlap protection mode when pairing non-English subtitles
+/// (e.g. Arabic) with providers that have burned-in English frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HardsubShieldMode {
+    #[default]
+    OpaqueMask,
+    TopEdge,
+    Off,
+}
+
+impl HardsubShieldMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::OpaqueMask => Self::TopEdge,
+            Self::TopEdge => Self::Off,
+            Self::Off => Self::OpaqueMask,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpaqueMask => "Opaque Mask",
+            Self::TopEdge => "Top Edge",
+            Self::Off => "Off",
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlayOptions {
     /// Title to pass to ani-cli as the search query
@@ -112,6 +141,12 @@ pub struct PlayOptions {
     /// True if the video URL is video-only demuxed HLS requiring external `--audio-file`
     #[serde(default)]
     pub has_demuxed_audio: bool,
+    /// Embedded/hardcoded subtitle status reported by the selected provider
+    #[serde(default)]
+    pub embedded_sub: crate::api::subtitles::EmbeddedSubtitleKind,
+    /// Visual protection mode for non-English subtitles over baked English streams
+    #[serde(default)]
+    pub hardsub_shield: HardsubShieldMode,
 }
 
 /// Build the `ani-cli` command arguments for legacy fallback scraping.
@@ -884,6 +919,32 @@ end
 mp.add_forced_key_binding("i", "solus-toggle-hud", pin_info_hud)
 mp.add_forced_key_binding("I", "solus-pin-hud", pin_info_hud)
 
+local shield_modes = { "Opaque Mask", "Top Edge", "Off" }
+local shield_idx = 1
+local function solus_cycle_hardsub_shield()
+    shield_idx = (shield_idx % #shield_modes) + 1
+    local m = shield_modes[shield_idx]
+    if m == "Opaque Mask" then
+        mp.set_property("sub-border-style", "opaque-box")
+        mp.set_property("sub-back-color", "#EE0A0A0E")
+        mp.set_property_number("sub-margin-y", 24)
+        mp.set_property_number("sub-pos", 98)
+        mp.set_property("sub-ass-override", "force")
+    elseif m == "Top Edge" then
+        mp.set_property("sub-border-style", "outline-and-shadow")
+        mp.set_property_number("sub-margin-y", 22)
+        mp.set_property_number("sub-pos", 8)
+        mp.set_property("sub-ass-override", "force")
+    else
+        mp.set_property("sub-border-style", "outline-and-shadow")
+        mp.set_property_number("sub-margin-y", 38)
+        mp.set_property_number("sub-pos", 100)
+    end
+    mp.osd_message("◈ Hardsub Shield: " .. m, 2.2)
+end
+mp.add_forced_key_binding("h", "solus-hardsub-shield", solus_cycle_hardsub_shield)
+mp.add_forced_key_binding("H", "solus-hardsub-shield-upper", solus_cycle_hardsub_shield)
+
 -- =============================================================================
 -- 5. Crunchyroll/Netflix Clickable Buttons ([Skip Intro/Outro], [Next Ep])
 --    & Elevated Sub Sync Bar ([S] / [i] / [-5s][-1s][-0.2s][◈ AUTO-SYNC][+0.2s][+1s][+5s])
@@ -1365,6 +1426,9 @@ pub fn shared_mpv_kv_flags(
             .sub_lang
             .as_deref()
             .is_some_and(|l| l.eq_ignore_ascii_case("none"));
+    // Never render a second container/HLS soft-embedded subtitle simultaneously.
+    item_kv.push("secondary-sid=no".to_string());
+    item_kv.push("sub-auto=no".to_string());
     if subs_disabled {
         item_kv.push("sid=no".to_string());
         item_kv.push("sub-visibility=no".to_string());
@@ -1372,7 +1436,6 @@ pub fn shared_mpv_kv_flags(
         if !url.is_empty() {
             item_kv.push(format!("sub-file={url}"));
             item_kv.push("sub-visibility=yes".to_string());
-            item_kv.push("sub-auto=fuzzy".to_string());
         }
     }
     if opts.sub_delay_ms != 0 {
@@ -1405,6 +1468,28 @@ pub fn shared_mpv_kv_flags(
     if let Some(ref style) = opts.sub_style {
         for flag in style.to_mpv_flags() {
             item_kv.push(flag.trim_start_matches("--").to_string());
+        }
+    }
+    let wants_non_english = opts.sub_lang.as_deref().is_some_and(|l| {
+        let low = l.trim().to_ascii_lowercase();
+        !low.is_empty() && low != "none" && low != "off" && !low.starts_with("eng") && low != "en"
+    });
+    if !subs_disabled && opts.embedded_sub.has_baked_english() && wants_non_english {
+        match opts.hardsub_shield {
+            HardsubShieldMode::OpaqueMask => {
+                item_kv.push("sub-border-style=opaque-box".to_string());
+                item_kv.push("sub-back-color=0.04/0.04/0.06/0.94".to_string());
+                item_kv.push("sub-margin-y=24".to_string());
+                item_kv.push("sub-pos=98".to_string());
+                item_kv.push("sub-ass-override=force".to_string());
+            }
+            HardsubShieldMode::TopEdge => {
+                item_kv.push("sub-border-style=outline-and-shadow".to_string());
+                item_kv.push("sub-margin-y=22".to_string());
+                item_kv.push("sub-pos=8".to_string());
+                item_kv.push("sub-ass-override=force".to_string());
+            }
+            HardsubShieldMode::Off => {}
         }
     }
 
@@ -1670,6 +1755,8 @@ mod tests {
             referer: None,
             audio_urls: Vec::new(),
             has_demuxed_audio: false,
+            embedded_sub: crate::api::subtitles::EmbeddedSubtitleKind::None,
+            hardsub_shield: HardsubShieldMode::OpaqueMask,
         }
     }
 
@@ -1782,5 +1869,17 @@ mod tests {
         let demux_args = build_mpv_direct_args(&o_demux, "https://fetch.nexabloom.top/a/index-f1.m3u8", None);
         assert!(demux_args.contains(&"--audio-file=https://fetch.nexabloom.top/a/audio/ja/index.m3u8".to_string()));
         assert!(demux_args.contains(&"--audio-file=https://fetch.nexabloom.top/a/audio/en/index.m3u8".to_string()));
+
+        // Verify strict soft-track isolation and Hardsub Shield opaque mask for Arabic on baked English
+        let mut o_ar = opts("Chainsmoker Cat", 1, "900p", false);
+        o_ar.sub_lang = Some("Arabic".to_string());
+        o_ar.sub_url = Some("/tmp/ar.vtt".to_string());
+        o_ar.embedded_sub = crate::api::subtitles::EmbeddedSubtitleKind::HardsubEn;
+        o_ar.hardsub_shield = HardsubShieldMode::OpaqueMask;
+        let shield_args = build_mpv_direct_args(&o_ar, "https://vmpx.online/master.m3u8", None);
+        assert!(shield_args.contains(&"--secondary-sid=no".to_string()));
+        assert!(shield_args.contains(&"--sub-auto=no".to_string()));
+        assert!(shield_args.contains(&"--sub-border-style=opaque-box".to_string()));
+        assert!(shield_args.contains(&"--sub-back-color=0.04/0.04/0.06/0.94".to_string()));
     }
 }
