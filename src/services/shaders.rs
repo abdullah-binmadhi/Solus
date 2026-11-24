@@ -472,6 +472,96 @@ pub fn build_shader_files(mode: Anime4KMode, season_year: Option<i64>) -> Vec<St
 }
 
 /// Capability-aware 4-stage shader pipeline builder (`01_master_fused` + `02_chroma_444` + `03_era_restore` + `04_upscale_2x`).
+/// Shared Pass 1 (`HS_RAW` horizontal ink-transition glyph detector) + Pass 2 (`HS_BOX` localized pill box)
+/// so blur/inpaint/matte target ONLY actual 1- or 2-line hardsub regions cleanly without triggering
+/// on bright T-shirts, clouds, or casting venetian-blind scanlines.
+fn hardsub_localized_passes_glsl(band_top: f32, band_bot: f32, top_i: u32, bot_i: u32) -> String {
+    format!(
+r#"//!HOOK MAIN
+//!BIND HOOKED
+//!SAVE HS_RAW
+//!COMPONENTS 1
+//!DESC Solus Hardsub Eradicator — Ink Transition Mask ({top_i}..{bot_i})
+
+vec4 hook() {{
+    float top = {band_top:.3};
+    float bot = {band_bot:.3};
+    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.04 || HOOKED_pos.x > 0.96) {{
+        return vec4(0.0);
+    }}
+    vec2 px = HOOKED_pt;
+    int white_cnt = 0;
+    int dark_cnt = 0;
+    int transitions = 0;
+    int prev_state = -1;
+    // Count horizontal bright-to-dark stroke alternations across ±15px (text letters oscillate; T-shirts/clouds do not)
+    for (int dx = -6; dx <= 6; ++dx) {{
+        vec3 s = HOOKED_tex(HOOKED_pos + vec2(float(dx) * 2.5, 0.0) * px).rgb;
+        float l = dot(s, vec3(0.299, 0.587, 0.114));
+        float sat = max(s.r, max(s.g, s.b)) - min(s.r, min(s.g, s.b));
+        int state = 0;
+        if (l > 0.66 && sat < 0.24) {{
+            state = 1;
+            white_cnt += 1;
+        }} else if (l < 0.25) {{
+            state = -1;
+            dark_cnt += 1;
+        }}
+        if (state != 0 && prev_state != 0 && state != prev_state) {{
+            transitions += 1;
+        }}
+        if (state != 0) {{
+            prev_state = state;
+        }}
+    }}
+    // Also verify vertical stroke height contrast (±4px) so horizontal roof/table edges aren't mistaken for letters
+    float vmax = 0.0;
+    float vmin = 1.0;
+    for (int dy = -2; dy <= 2; ++dy) {{
+        vec3 vs = HOOKED_tex(HOOKED_pos + vec2(0.0, float(dy) * 2.5) * px).rgb;
+        float vl = dot(vs, vec3(0.299, 0.587, 0.114));
+        vmax = max(vmax, vl);
+        vmin = min(vmin, vl);
+    }}
+    if (white_cnt >= 2 && dark_cnt >= 2 && transitions >= 2 && (vmax - vmin) > 0.34) {{
+        return vec4(1.0, 0.0, 0.0, 1.0);
+    }}
+    return vec4(0.0);
+}}
+
+//!HOOK MAIN
+//!BIND HS_RAW
+//!SAVE HS_BOX
+//!COMPONENTS 1
+//!DESC Solus Hardsub Eradicator — Tight Text-Line Pill Builder ({top_i}..{bot_i})
+
+vec4 hook() {{
+    float top = {band_top:.3};
+    float bot = {band_bot:.3};
+    if (HS_RAW_pos.y < top || HS_RAW_pos.y > bot || HS_RAW_pos.x < 0.03 || HS_RAW_pos.x > 0.97) {{
+        return vec4(0.0);
+    }}
+    vec2 px = HS_RAW_pt;
+    // Dilate tightly: bridge spaces between words (±28px X) and fit single/double line height cleanly (±10px Y)
+    float m_max = 0.0;
+    float m_sum = 0.0;
+    float cnt = 0.0;
+    for (int dy = -2; dy <= 2; ++dy) {{
+        for (int dx = -4; dx <= 4; ++dx) {{
+            float v = HS_RAW_tex(HS_RAW_pos + vec2(float(dx) * 7.0, float(dy) * 4.5) * px).r;
+            m_max = max(m_max, v);
+            m_sum += v;
+            cnt += 1.0;
+        }}
+    }}
+    // Require sustained cluster density across the pill neighborhood (rejects isolated 1px sparkle noise)
+    float density = m_sum / cnt;
+    float pill = m_max * smoothstep(0.03, 0.12, density);
+    return vec4(clamp(pill, 0.0, 1.0), 0.0, 0.0, 1.0);
+}}
+"#)
+}
+
 /// Build or verify parameterized GLSL Hardsub Eradication shaders (`blur`, `inpaint`, `matte`)
 /// for a given normalized screen-Y band `[band_top, band_bot]`. Returns the `.glsl` path if valid.
 pub fn ensure_hardsub_shader_file(engine_slug: &str, band_top: f32, band_bot: f32) -> Option<PathBuf> {
@@ -482,45 +572,14 @@ pub fn ensure_hardsub_shader_file(engine_slug: &str, band_top: f32, band_bot: f3
     let top_i = (band_top.clamp(0.55, 0.94) * 100.0).round() as u32;
     let bot_i = (band_bot.clamp(0.85, 0.999) * 100.0).round() as u32;
     let path = dir.join(format!("solus_hs_{engine_slug}_{top_i}_{bot_i}.glsl"));
+    let prefix = hardsub_localized_passes_glsl(band_top, band_bot, top_i, bot_i);
 
-    let glsl = match engine_slug {
+    let pass3 = match engine_slug {
         "blur" => format!(
 r#"//!HOOK MAIN
 //!BIND HOOKED
-//!SAVE HS_MASK
-//!COMPONENTS 1
-//!DESC Solus Hardsub Eradicator — Text Mask Pass ({top_i}..{bot_i})
-
-vec4 hook() {{
-    float top = {band_top:.3};
-    float bot = {band_bot:.3};
-    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.03 || HOOKED_pos.x > 0.97) {{
-        return vec4(0.0);
-    }}
-    vec3 orig = HOOKED_tex(HOOKED_pos).rgb;
-    float luma = dot(orig, vec3(0.299, 0.587, 0.114));
-    float sat = max(orig.r, max(orig.g, orig.b)) - min(orig.r, min(orig.g, orig.b));
-    vec2 px = HOOKED_pt;
-    float lmax = luma;
-    float lmin = luma;
-    for (int dy = -2; dy <= 2; ++dy) {{
-        for (int dx = -2; dx <= 2; ++dx) {{
-            vec3 s = HOOKED_tex(HOOKED_pos + vec2(float(dx) * 2.0, float(dy) * 2.0) * px).rgb;
-            float sl = dot(s, vec3(0.299, 0.587, 0.114));
-            lmax = max(lmax, sl);
-            lmin = min(lmin, sl);
-        }}
-    }}
-    // Crisp white glyph core + dark outline signature (ignores bright clouds/shirts without dark borders)
-    float outline_contrast = smoothstep(0.30, 0.52, lmax - lmin) * (1.0 - smoothstep(0.16, 0.34, lmin));
-    float white_core = smoothstep(0.60, 0.78, luma) * (1.0 - smoothstep(0.18, 0.30, sat)) * (1.0 - smoothstep(0.18, 0.36, lmin));
-    return vec4(clamp(max(white_core, outline_contrast), 0.0, 1.0), 0.0, 0.0, 1.0);
-}}
-
-//!HOOK MAIN
-//!BIND HOOKED
-//!BIND HS_MASK
-//!DESC Solus Hardsub Eradicator — Dynamic Frosted Blur Scrim ({top_i}..{bot_i})
+//!BIND HS_BOX
+//!DESC Solus Hardsub Eradicator — Localized Frosted Blur ({top_i}..{bot_i})
 
 vec4 hook() {{
     vec4 orig = HOOKED_tex(HOOKED_pos);
@@ -529,72 +588,37 @@ vec4 hook() {{
     if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.03 || HOOKED_pos.x > 0.97) {{
         return orig;
     }}
-    // Auto-detect active hardsub strokes in this frame's bottom subtitle band so silent frames stay 100% clear
-    float band_hit = 0.0;
-    for (int sx = 0; sx < 7; ++sx) {{
-        float probe_x = 0.22 + float(sx) * 0.093;
-        for (int sy = -1; sy <= 1; ++sy) {{
-            float probe_y = clamp(HOOKED_pos.y + float(sy) * 0.018, top, bot);
-            band_hit = max(band_hit, HS_MASK_tex(vec2(probe_x, probe_y)).r);
+    vec2 px = HOOKED_pt;
+    float box_sum = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {{
+        for (int dx = -1; dx <= 1; ++dx) {{
+            box_sum += HS_BOX_tex(HOOKED_pos + vec2(float(dx) * 4.0, float(dy) * 4.0) * px).r;
         }}
     }}
-    float hs_alpha = smoothstep(0.18, 0.45, band_hit);
-    if (hs_alpha < 0.02) {{
+    float hs_alpha = smoothstep(0.06, 0.35, box_sum / 9.0);
+    if (hs_alpha < 0.01) {{
         return orig;
     }}
-    float w_v = smoothstep(top, top + 0.020, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.002, bot, HOOKED_pos.y));
-    float w_h = smoothstep(0.03, 0.07, HOOKED_pos.x) * (1.0 - smoothstep(0.93, 0.97, HOOKED_pos.x));
-    float w = w_v * w_h * hs_alpha;
-    vec2 step_px = HOOKED_pt * 4.5;
+    vec2 step_px = px * 5.0;
     vec3 acc = vec3(0.0);
     float norm = 0.0;
     for (int dy = -2; dy <= 2; ++dy) {{
         for (int dx = -3; dx <= 3; ++dx) {{
-            float wt = 1.0 / (1.0 + float(dx * dx + dy * dy) * 0.35);
+            float wt = 1.0 / (1.0 + float(dx * dx + dy * dy) * 0.30);
             acc += HOOKED_tex(HOOKED_pos + vec2(float(dx), float(dy)) * step_px).rgb * wt;
             norm += wt;
         }}
     }}
-    vec3 blurred = (acc / norm) * 0.16;
-    return vec4(mix(orig.rgb, blurred, w * 0.97), orig.a);
+    vec3 blurred = (acc / norm) * 0.14;
+    return vec4(mix(orig.rgb, blurred, hs_alpha * 0.97), orig.a);
 }}
 "#),
         "inpaint" => format!(
 r#"//!HOOK MAIN
 //!BIND HOOKED
-//!SAVE HS_MASK
-//!COMPONENTS 1
-//!DESC Solus Hardsub Eradicator — Text Ribbon Mask ({top_i}..{bot_i})
-
-vec4 hook() {{
-    float top = {band_top:.3};
-    float bot = {band_bot:.3};
-    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.03 || HOOKED_pos.x > 0.97) {{
-        return vec4(0.0);
-    }}
-    vec3 orig = HOOKED_tex(HOOKED_pos).rgb;
-    float luma = dot(orig, vec3(0.299, 0.587, 0.114));
-    float sat = max(orig.r, max(orig.g, orig.b)) - min(orig.r, min(orig.g, orig.b));
-    vec2 px = HOOKED_pt;
-    float lmax = luma;
-    float lmin = luma;
-    for (int dy = -2; dy <= 2; ++dy) {{
-        for (int dx = -2; dx <= 2; ++dx) {{
-            vec3 s = HOOKED_tex(HOOKED_pos + vec2(float(dx) * 2.0, float(dy) * 2.0) * px).rgb;
-            float sl = dot(s, vec3(0.299, 0.587, 0.114));
-            lmax = max(lmax, sl);
-            lmin = min(lmin, sl);
-        }}
-    }}
-    float outline_contrast = smoothstep(0.30, 0.52, lmax - lmin) * (1.0 - smoothstep(0.16, 0.34, lmin));
-    float white_core = smoothstep(0.60, 0.78, luma) * (1.0 - smoothstep(0.18, 0.30, sat)) * (1.0 - smoothstep(0.18, 0.36, lmin));
-    return vec4(clamp(max(white_core, outline_contrast), 0.0, 1.0), 0.0, 0.0, 1.0);
-}}
-
-//!HOOK MAIN
-//!BIND HOOKED
-//!BIND HS_MASK
-//!DESC Solus Hardsub Eradicator — Clean Ribbon Inpainter ({top_i}..{bot_i})
+//!BIND HS_RAW
+//!BIND HS_BOX
+//!DESC Solus Hardsub Eradicator — Tight Text-Only Inpainter ({top_i}..{bot_i})
 
 vec4 hook() {{
     vec4 orig = HOOKED_tex(HOOKED_pos);
@@ -604,71 +628,38 @@ vec4 hook() {{
         return orig;
     }}
     vec2 px = HOOKED_pt;
-    // Coalesce individual letters horizontally into one smooth rounded sentence ribbon (no glyph-shaped smudges)
-    float ribbon = 0.0;
-    for (int dy = -2; dy <= 2; ++dy) {{
-        for (int dx = -4; dx <= 4; ++dx) {{
-            float s = HS_MASK_tex(HOOKED_pos + vec2(float(dx) * 5.0, float(dy) * 3.0) * px).r;
-            ribbon = max(ribbon, s);
+    float box_sum = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {{
+        for (int dx = -1; dx <= 1; ++dx) {{
+            box_sum += HS_BOX_tex(HOOKED_pos + vec2(float(dx) * 4.0, float(dy) * 4.0) * px).r;
         }}
     }}
-    float w_v = smoothstep(top, top + 0.018, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.002, bot, HOOKED_pos.y));
-    float w_h = smoothstep(0.03, 0.07, HOOKED_pos.x) * (1.0 - smoothstep(0.93, 0.97, HOOKED_pos.x));
-    float box_alpha = smoothstep(0.12, 0.52, ribbon) * w_v * w_h;
-    if (box_alpha < 0.02) {{
+    float hs_alpha = smoothstep(0.06, 0.35, box_sum / 9.0);
+    if (hs_alpha < 0.01) {{
         return orig;
     }}
-    // Reconstruct column smoothly from clean exterior anime bands strictly above/below text ribbon (no dark glyph taint!)
-    vec3 above = vec3(0.0);
-    vec3 below = vec3(0.0);
-    for (int kx = -2; kx <= 2; ++kx) {{
-        float sx = clamp(HOOKED_pos.x + float(kx) * 8.0 * px.x, 0.01, 0.99);
-        above += HOOKED_tex(vec2(sx, max(0.01, top - 0.014))).rgb;
-        below += HOOKED_tex(vec2(sx, min(0.996, bot + 0.002))).rgb;
+    // Reconstruct tightly from local pixels strictly outside raw glyph strokes (no vertical shirt/hand streaking!)
+    vec3 clean_acc = vec3(0.0);
+    float clean_wt = 0.0;
+    for (int dy = -2; dy <= 2; ++dy) {{
+        for (int dx = -3; dx <= 3; ++dx) {{
+            vec2 sp = clamp(HOOKED_pos + vec2(float(dx) * 5.5, float(dy) * 5.5) * px, vec2(0.005), vec2(0.995));
+            float raw_m = HS_RAW_tex(sp).r;
+            float w = pow(max(0.0, 1.0 - raw_m), 2.5) / (1.0 + float(dx * dx + dy * dy) * 0.25);
+            clean_acc += HOOKED_tex(sp).rgb * w;
+            clean_wt += w;
+        }}
     }}
-    above /= 5.0;
-    below /= 5.0;
-    float t_y = clamp((HOOKED_pos.y - top) / max(0.01, bot - top), 0.0, 1.0);
-    vec3 bridged = mix(above, below, t_y) * 0.86;
-    return vec4(mix(orig.rgb, bridged, box_alpha * 0.96), orig.a);
+    vec3 clean_bg = (clean_wt > 0.05) ? (clean_acc / clean_wt) : (orig.rgb * 0.5);
+    vec3 pill = clean_bg * 0.32;
+    return vec4(mix(orig.rgb, pill, hs_alpha * 0.96), orig.a);
 }}
 "#),
         _ => format!(
 r#"//!HOOK MAIN
 //!BIND HOOKED
-//!SAVE HS_MASK
-//!COMPONENTS 1
-//!DESC Solus Hardsub Eradicator — Matte Text Detector ({top_i}..{bot_i})
-
-vec4 hook() {{
-    float top = {band_top:.3};
-    float bot = {band_bot:.3};
-    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.03 || HOOKED_pos.x > 0.97) {{
-        return vec4(0.0);
-    }}
-    vec3 orig = HOOKED_tex(HOOKED_pos).rgb;
-    float luma = dot(orig, vec3(0.299, 0.587, 0.114));
-    float sat = max(orig.r, max(orig.g, orig.b)) - min(orig.r, min(orig.g, orig.b));
-    vec2 px = HOOKED_pt;
-    float lmax = luma;
-    float lmin = luma;
-    for (int dy = -2; dy <= 2; ++dy) {{
-        for (int dx = -2; dx <= 2; ++dx) {{
-            vec3 s = HOOKED_tex(HOOKED_pos + vec2(float(dx) * 2.0, float(dy) * 2.0) * px).rgb;
-            float sl = dot(s, vec3(0.299, 0.587, 0.114));
-            lmax = max(lmax, sl);
-            lmin = min(lmin, sl);
-        }}
-    }}
-    float outline_contrast = smoothstep(0.30, 0.52, lmax - lmin) * (1.0 - smoothstep(0.16, 0.34, lmin));
-    float white_core = smoothstep(0.60, 0.78, luma) * (1.0 - smoothstep(0.18, 0.30, sat)) * (1.0 - smoothstep(0.18, 0.36, lmin));
-    return vec4(clamp(max(white_core, outline_contrast), 0.0, 1.0), 0.0, 0.0, 1.0);
-}}
-
-//!HOOK MAIN
-//!BIND HOOKED
-//!BIND HS_MASK
-//!DESC Solus Hardsub Eradicator — Dynamic Blackout Matte ({top_i}..{bot_i})
+//!BIND HS_BOX
+//!DESC Solus Hardsub Eradicator — Tight Text-Only Matte ({top_i}..{bot_i})
 
 vec4 hook() {{
     vec4 orig = HOOKED_tex(HOOKED_pos);
@@ -677,26 +668,23 @@ vec4 hook() {{
     if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.03 || HOOKED_pos.x > 0.97) {{
         return orig;
     }}
-    float band_hit = 0.0;
-    for (int sx = 0; sx < 7; ++sx) {{
-        float probe_x = 0.22 + float(sx) * 0.093;
-        for (int sy = -1; sy <= 1; ++sy) {{
-            float probe_y = clamp(HOOKED_pos.y + float(sy) * 0.018, top, bot);
-            band_hit = max(band_hit, HS_MASK_tex(vec2(probe_x, probe_y)).r);
+    vec2 px = HOOKED_pt;
+    float box_sum = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {{
+        for (int dx = -1; dx <= 1; ++dx) {{
+            box_sum += HS_BOX_tex(HOOKED_pos + vec2(float(dx) * 4.0, float(dy) * 4.0) * px).r;
         }}
     }}
-    float hs_alpha = smoothstep(0.18, 0.45, band_hit);
-    if (hs_alpha < 0.02) {{
+    float hs_alpha = smoothstep(0.06, 0.35, box_sum / 9.0);
+    if (hs_alpha < 0.01) {{
         return orig;
     }}
-    float w_v = smoothstep(top, top + 0.015, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.002, bot, HOOKED_pos.y));
-    float w_h = smoothstep(0.03, 0.07, HOOKED_pos.x) * (1.0 - smoothstep(0.93, 0.97, HOOKED_pos.x));
-    float w = w_v * w_h * hs_alpha;
     vec3 matte = vec3(0.015, 0.015, 0.024);
-    return vec4(mix(orig.rgb, matte, w * 0.99), orig.a);
+    return vec4(mix(orig.rgb, matte, hs_alpha * 0.98), orig.a);
 }}
 "#),
     };
+    let glsl = format!("{prefix}\n{pass3}");
 
     let needs_write = std::fs::read_to_string(&path).map(|c| c != glsl).unwrap_or(true);
     if needs_write && std::fs::write(&path, glsl).is_err() {
@@ -952,8 +940,9 @@ mod tests {
             let content = std::fs::read_to_string(&p).unwrap();
             assert!(content.contains("//!HOOK MAIN"));
             assert!(content.contains("//!BIND HOOKED"));
-            assert!(content.contains("//!SAVE HS_MASK"));
-            assert!(content.contains("//!BIND HS_MASK"));
+            assert!(content.contains("//!SAVE HS_RAW"));
+            assert!(content.contains("//!SAVE HS_BOX"));
+            assert!(content.contains("//!BIND HS_BOX"));
             assert!(content.contains("vec4 hook()"));
         }
         assert!(ensure_hardsub_shader_file("unknown", 0.73, 0.998).is_none());
