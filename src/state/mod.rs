@@ -1748,7 +1748,11 @@ impl AppState {
                     self.playback_sub_cursor = self
                         .playback_sub_languages
                         .iter()
-                        .position(|s| s.code == *code)
+                        .position(|s| {
+                            s.code.eq_ignore_ascii_case(code)
+                                || (code.to_ascii_lowercase().starts_with("ar")
+                                    && s.code.to_ascii_lowercase().starts_with("ar"))
+                        })
                         .unwrap_or(0);
                 } else if self.playback_sub_cursor >= self.playback_sub_languages.len() {
                     self.playback_sub_cursor = 0;

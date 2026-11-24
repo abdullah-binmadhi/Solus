@@ -494,16 +494,16 @@ vec4 hook() {{
     int dark_cnt = 0;
     int transitions = 0;
     int prev_state = -1;
-    // Count horizontal bright-to-dark stroke alternations across ±15px (text letters oscillate; T-shirts/clouds do not)
-    for (int dx = -6; dx <= 6; ++dx) {{
+    // Count horizontal bright-to-dark stroke alternations across ±20px (text letters oscillate >=4 times; shirts/folds do not)
+    for (int dx = -8; dx <= 8; ++dx) {{
         vec3 s = HOOKED_tex(HOOKED_pos + vec2(float(dx) * 2.5, 0.0) * px).rgb;
         float l = dot(s, vec3(0.299, 0.587, 0.114));
         float sat = max(s.r, max(s.g, s.b)) - min(s.r, min(s.g, s.b));
         int state = 0;
-        if (l > 0.66 && sat < 0.24) {{
+        if (l > 0.68 && sat < 0.24) {{
             state = 1;
             white_cnt += 1;
-        }} else if (l < 0.25) {{
+        }} else if (l < 0.24) {{
             state = -1;
             dark_cnt += 1;
         }}
@@ -523,7 +523,7 @@ vec4 hook() {{
         vmax = max(vmax, vl);
         vmin = min(vmin, vl);
     }}
-    if (white_cnt >= 2 && dark_cnt >= 2 && transitions >= 2 && (vmax - vmin) > 0.34) {{
+    if (white_cnt >= 3 && dark_cnt >= 3 && transitions >= 4 && (vmax - vmin) > 0.38) {{
         return vec4(1.0, 0.0, 0.0, 1.0);
     }}
     return vec4(0.0);
@@ -554,9 +554,9 @@ vec4 hook() {{
             cnt += 1.0;
         }}
     }}
-    // Require sustained cluster density across the pill neighborhood (rejects isolated 1px sparkle noise)
+    // Require sustained cluster density across the pill neighborhood (rejects clothing creases & isolated noise)
     float density = m_sum / cnt;
-    float pill = m_max * smoothstep(0.03, 0.12, density);
+    float pill = m_max * smoothstep(0.08, 0.22, density);
     return vec4(clamp(pill, 0.0, 1.0), 0.0, 0.0, 1.0);
 }}
 "#)
@@ -595,22 +595,22 @@ vec4 hook() {{
             box_sum += HS_BOX_tex(HOOKED_pos + vec2(float(dx) * 4.0, float(dy) * 4.0) * px).r;
         }}
     }}
-    float hs_alpha = smoothstep(0.06, 0.35, box_sum / 9.0);
+    float hs_alpha = smoothstep(0.03, 0.16, box_sum / 9.0);
     if (hs_alpha < 0.01) {{
         return orig;
     }}
-    vec2 step_px = px * 5.0;
+    vec2 step_px = px * 9.0;
     vec3 acc = vec3(0.0);
     float norm = 0.0;
     for (int dy = -2; dy <= 2; ++dy) {{
         for (int dx = -3; dx <= 3; ++dx) {{
-            float wt = 1.0 / (1.0 + float(dx * dx + dy * dy) * 0.30);
+            float wt = 1.0 / (1.0 + float(dx * dx + dy * dy) * 0.22);
             acc += HOOKED_tex(HOOKED_pos + vec2(float(dx), float(dy)) * step_px).rgb * wt;
             norm += wt;
         }}
     }}
-    vec3 blurred = (acc / norm) * 0.14;
-    return vec4(mix(orig.rgb, blurred, hs_alpha * 0.97), orig.a);
+    vec3 blurred = (acc / norm) * 0.06;
+    return vec4(mix(orig.rgb, blurred, hs_alpha * 0.99), orig.a);
 }}
 "#),
         "inpaint" => format!(
@@ -634,7 +634,7 @@ vec4 hook() {{
             box_sum += HS_BOX_tex(HOOKED_pos + vec2(float(dx) * 4.0, float(dy) * 4.0) * px).r;
         }}
     }}
-    float hs_alpha = smoothstep(0.06, 0.35, box_sum / 9.0);
+    float hs_alpha = smoothstep(0.03, 0.16, box_sum / 9.0);
     if (hs_alpha < 0.01) {{
         return orig;
     }}
@@ -643,16 +643,16 @@ vec4 hook() {{
     float clean_wt = 0.0;
     for (int dy = -2; dy <= 2; ++dy) {{
         for (int dx = -3; dx <= 3; ++dx) {{
-            vec2 sp = clamp(HOOKED_pos + vec2(float(dx) * 5.5, float(dy) * 5.5) * px, vec2(0.005), vec2(0.995));
+            vec2 sp = clamp(HOOKED_pos + vec2(float(dx) * 6.5, float(dy) * 6.5) * px, vec2(0.005), vec2(0.995));
             float raw_m = HS_RAW_tex(sp).r;
-            float w = pow(max(0.0, 1.0 - raw_m), 2.5) / (1.0 + float(dx * dx + dy * dy) * 0.25);
+            float w = pow(max(0.0, 1.0 - raw_m), 3.0) / (1.0 + float(dx * dx + dy * dy) * 0.22);
             clean_acc += HOOKED_tex(sp).rgb * w;
             clean_wt += w;
         }}
     }}
-    vec3 clean_bg = (clean_wt > 0.05) ? (clean_acc / clean_wt) : (orig.rgb * 0.5);
-    vec3 pill = clean_bg * 0.32;
-    return vec4(mix(orig.rgb, pill, hs_alpha * 0.96), orig.a);
+    vec3 clean_bg = (clean_wt > 0.05) ? (clean_acc / clean_wt) : (orig.rgb * 0.35);
+    vec3 pill = clean_bg * 0.22;
+    return vec4(mix(orig.rgb, pill, hs_alpha * 0.98), orig.a);
 }}
 "#),
         _ => format!(
@@ -675,12 +675,12 @@ vec4 hook() {{
             box_sum += HS_BOX_tex(HOOKED_pos + vec2(float(dx) * 4.0, float(dy) * 4.0) * px).r;
         }}
     }}
-    float hs_alpha = smoothstep(0.06, 0.35, box_sum / 9.0);
+    float hs_alpha = smoothstep(0.03, 0.16, box_sum / 9.0);
     if (hs_alpha < 0.01) {{
         return orig;
     }}
     vec3 matte = vec3(0.015, 0.015, 0.024);
-    return vec4(mix(orig.rgb, matte, hs_alpha * 0.98), orig.a);
+    return vec4(mix(orig.rgb, matte, hs_alpha * 0.99), orig.a);
 }}
 "#),
     };

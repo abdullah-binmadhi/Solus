@@ -2173,6 +2173,69 @@ pub async fn ensure_synchronized_subtitle(
     .await
 }
 
+fn smart_sub_referer(url: &str) -> Option<&'static str> {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("zokoanime") {
+        Some("https://zokoanime.video/")
+    } else if lower.contains("megaplay") {
+        Some("https://megaplay.buzz/")
+    } else if lower.contains("hianime") || lower.contains("aniwatch") {
+        Some("https://hianime.to/")
+    } else if lower.contains("animegg") {
+        Some("https://www.animegg.org/")
+    } else if lower.contains("animeheaven") {
+        Some("https://animeheaven.me/")
+    } else {
+        None
+    }
+}
+
+async fn download_subtitle_text_smart(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Option<String> {
+    const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    let primary_ref = smart_sub_referer(url);
+    let mut attempts: Vec<Option<&'static str>> = vec![primary_ref];
+    if primary_ref.is_some() {
+        attempts.push(None);
+    } else {
+        attempts.push(Some("https://zokoanime.video/"));
+    }
+
+    for ref_opt in attempts {
+        let mut req = client
+            .get(url)
+            .header("User-Agent", UA)
+            .timeout(Duration::from_secs(timeout_secs));
+        if let Some(r) = ref_opt {
+            req = req.header("Referer", r);
+        }
+        if let Ok(resp) = req.send().await {
+            if resp.status().is_success() {
+                if let Ok(bytes) = resp.bytes().await {
+                    if !bytes.is_empty() {
+                        let raw_bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
+                            use std::io::Read;
+                            let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+                            let mut out = Vec::new();
+                            if decoder.read_to_end(&mut out).is_ok() {
+                                out
+                            } else {
+                                bytes.to_vec()
+                            }
+                        } else {
+                            bytes.to_vec()
+                        };
+                        let text = decode_subtitle_bytes(&raw_bytes);
+                        if is_valid_subtitle_content(&text) {
+                            return Some(text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub async fn ensure_synchronized_subtitle_for_provider(
     client: &reqwest::Client,
     target_sub_url: &str,
@@ -2222,93 +2285,31 @@ pub async fn ensure_synchronized_subtitle_for_provider(
         }
     }
 
-    // 1. Download target subtitle content (retry without Zoko Referer on 401/403 from external CDNs)
-    let mut target_resp = client
-        .get(target_sub_url)
-        .header("Referer", "https://zokoanime.video/")
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-        .timeout(Duration::from_secs(8))
-        .send()
-        .await;
-    if target_resp.as_ref().is_ok_and(|r| !r.status().is_success()) || target_resp.is_err() {
-        target_resp = client
-            .get(target_sub_url)
-            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-            .timeout(Duration::from_secs(8))
-            .send()
-            .await;
-    }
-    let target_resp = match target_resp {
-        Ok(r) if r.status().is_success() => r,
-        _ => return (target_sub_url.to_string(), None),
-    };
-    let Ok(target_bytes) = target_resp.bytes().await else {
+    // 1. Download target subtitle content with host-aware Referer & fallback
+    let Some(target_text) = download_subtitle_text_smart(client, target_sub_url, 6).await else {
         return (target_sub_url.to_string(), None);
     };
-    if target_bytes.is_empty() {
-        return (target_sub_url.to_string(), None);
-    }
 
-    // Transparent gzip decompression if payload is .gz
-    let raw_target_bytes = if target_bytes.starts_with(&[0x1f, 0x8b]) {
-        use std::io::Read;
-        let mut decoder = flate2::read::GzDecoder::new(&target_bytes[..]);
-        let mut out = Vec::new();
-        if decoder.read_to_end(&mut out).is_ok() {
-            out
-        } else {
-            target_bytes.to_vec()
-        }
-    } else {
-        target_bytes.to_vec()
-    };
-
-    let target_text = decode_subtitle_bytes(&raw_target_bytes);
-    if !is_valid_subtitle_content(&target_text) {
-        return (target_sub_url.to_string(), None);
-    }
-
-    // 2. Tier 1: Align against reference subtitle if available
+    // 2. Tier 1: Align against reference subtitle if available (bounded to 3s so slow refs never block caching)
     let mut sync_res: Option<SyncResult> = None;
     let mut final_content = target_text.clone();
 
     if let Some(ref_url) = ref_sub_url {
         if ref_url != target_sub_url && (ref_url.starts_with("http://") || ref_url.starts_with("https://")) {
-            let ref_req = client
-                .get(ref_url)
-                .header("Referer", "https://zokoanime.video/")
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-                .timeout(Duration::from_secs(6));
+            if let Ok(Some(ref_text)) = tokio::time::timeout(
+                Duration::from_secs(3),
+                download_subtitle_text_smart(client, ref_url, 3),
+            )
+            .await
+            {
+                let ref_intervals = parse_subtitle_intervals(&ref_text);
+                let target_intervals = parse_subtitle_intervals(&target_text);
 
-            if let Ok(ref_resp) = ref_req.send().await {
-                if ref_resp.status().is_success() {
-                    if let Ok(ref_bytes) = ref_resp.bytes().await {
-                        let raw_ref_bytes = if ref_bytes.starts_with(&[0x1f, 0x8b]) {
-                            use std::io::Read;
-                            let mut decoder = flate2::read::GzDecoder::new(&ref_bytes[..]);
-                            let mut out = Vec::new();
-                            if decoder.read_to_end(&mut out).is_ok() {
-                                out
-                            } else {
-                                ref_bytes.to_vec()
-                            }
-                        } else {
-                            ref_bytes.to_vec()
-                        };
-
-                        let ref_text = decode_subtitle_bytes(&raw_ref_bytes);
-                        if is_valid_subtitle_content(&ref_text) {
-                            let ref_intervals = parse_subtitle_intervals(&ref_text);
-                            let target_intervals = parse_subtitle_intervals(&target_text);
-
-                            let alignment = calculate_optimal_alignment(&ref_intervals, &target_intervals);
-                            if alignment.applied {
-                                final_content = apply_subtitle_shift(&target_text, alignment.offset_seconds, alignment.scale_factor);
-                            }
-                            sync_res = Some(alignment);
-                        }
-                    }
+                let alignment = calculate_optimal_alignment(&ref_intervals, &target_intervals);
+                if alignment.applied {
+                    final_content = apply_subtitle_shift(&target_text, alignment.offset_seconds, alignment.scale_factor);
                 }
+                sync_res = Some(alignment);
             }
         }
     }

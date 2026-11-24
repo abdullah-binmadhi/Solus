@@ -10502,11 +10502,7 @@ async fn start_playback(
     if needs_sub_prep {
         if let Some(ref sub_u) = opts.sub_url {
             let code = opts.sub_lang.as_deref().unwrap_or("sub");
-            let client = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(3))
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap_or_default();
+            let client = api::subtitles::build_http_client(cfg.force_ipv4, 8);
 
             let ref_sub_url = state
                 .playback_sub_languages
@@ -10533,7 +10529,7 @@ async fn start_playback(
             let prov_hint = state.active_provider_id.as_deref();
 
             if let Ok((cached_path, sync_res)) = tokio::time::timeout(
-                Duration::from_secs(5),
+                Duration::from_secs(9),
                 services::subsync::ensure_synchronized_subtitle_for_provider(
                     &client,
                     sub_u,
