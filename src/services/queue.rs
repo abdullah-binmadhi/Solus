@@ -1046,7 +1046,8 @@ pub async fn resolve_item_prefetch(
             .first()
             .map(|p| p.embedded_sub)
             .unwrap_or_default(),
-        hardsub_shield: crate::api::player::HardsubShieldMode::OpaqueMask,
+        hardsub_shield: crate::api::player::HardsubShieldMode::FrostedBlur,
+        hardsub_band: crate::api::player::HardsubBandHeight::Standard,
     };
 
     Some(ResolvedPrefetch {
@@ -1110,7 +1111,8 @@ mod tests {
                 audio_urls: Vec::new(),
                 has_demuxed_audio: false,
                 embedded_sub: Default::default(),
-                hardsub_shield: crate::api::player::HardsubShieldMode::OpaqueMask,
+                hardsub_shield: crate::api::player::HardsubShieldMode::FrostedBlur,
+                hardsub_band: crate::api::player::HardsubBandHeight::Standard,
             },
             resolved_at,
             sub_synced: false,

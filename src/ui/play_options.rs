@@ -291,17 +291,24 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             Span::styled(" ([u])", Style::default().fg(theme.text_dim)),
             Span::raw("   "),
             Span::styled("Delay: ", Style::default().fg(theme.text_dim)),
-            Span::styled(
-                if state.subtitle_delay_ms == 0 {
+            {
+                let extreme_delay = state.subtitle_delay_ms.abs() > 15_000;
+                let text = if state.subtitle_delay_ms == 0 {
                     " 0ms ".to_string()
+                } else if extreme_delay {
+                    format!(" {:+}ms [0] ", state.subtitle_delay_ms)
                 } else {
                     format!(" {:+}ms ", state.subtitle_delay_ms)
-                },
-                Style::default()
-                    .fg(if state.subtitle_delay_ms == 0 { Color::White } else { Color::Black })
-                    .bg(if state.subtitle_delay_ms == 0 { theme.border_idle } else { theme.accent })
-                    .add_modifier(Modifier::BOLD),
-            ),
+                };
+                let (fg, bg) = if state.subtitle_delay_ms == 0 {
+                    (Color::White, theme.border_idle)
+                } else if extreme_delay {
+                    (Color::Black, Color::Rgb(248, 189, 56))
+                } else {
+                    (Color::Black, theme.accent)
+                };
+                Span::styled(text, Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD))
+            },
         ]),
         {
             let net_bg = match state.network_mode {
@@ -499,23 +506,45 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
                 } else {
                     Style::default().fg(theme.text_dim)
                 };
-                let label = if is_unsupported_dub {
-                    format!("{} (No Dub)", provider.name)
-                } else if let Some(ref res) = provider.verified_res {
-                    let sub_badge = provider.embedded_sub.badge_label();
-                    format!("{} [✓ {} · {}]", provider.name, res, sub_badge)
+                if is_unsupported_dub {
+                    ListItem::new(Line::from(vec![
+                        Span::styled(radio, radio_style),
+                        Span::styled(clamp_label(&format!("{} (No Dub)", provider.name), p_budget), style),
+                    ]))
                 } else {
-                    format!("{} [{}]", provider.name, provider.embedded_sub.badge_label())
-                };
-                let label_style = if !is_unsupported_dub && !is_selected && provider.embedded_sub.has_baked_english() {
-                    Style::default().fg(Color::Rgb(245, 190, 95))
-                } else {
-                    style
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(radio, radio_style),
-                    Span::styled(clamp_label(&label, p_budget), label_style),
-                ]))
+                    let (tag_str, tag_color) = match provider.embedded_sub {
+                        crate::api::subtitles::EmbeddedSubtitleKind::None => {
+                            let r = provider.verified_res.as_deref().unwrap_or("✓");
+                            (format!("[CLN {r}]"), Color::Rgb(80, 220, 145))
+                        }
+                        crate::api::subtitles::EmbeddedSubtitleKind::HardsubEn => {
+                            let r = provider.verified_res.as_deref().unwrap_or("SD");
+                            (format!("[EN {r}]"), Color::Rgb(248, 189, 56))
+                        }
+                        crate::api::subtitles::EmbeddedSubtitleKind::SoftMuxed => {
+                            let r = provider.verified_res.as_deref().unwrap_or("✓");
+                            (format!("[MUX {r}]"), Color::Rgb(110, 210, 255))
+                        }
+                    };
+                    let tag_len = tag_str.chars().count();
+                    let name_budget = p_budget.saturating_sub(tag_len + 1).max(3);
+                    let tag_style = if is_selected {
+                        Style::default().fg(Color::Black).bg(tag_color).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(tag_color).add_modifier(Modifier::BOLD)
+                    };
+                    let name_style = if !is_selected && provider.embedded_sub.has_baked_english() {
+                        Style::default().fg(Color::Rgb(245, 190, 95))
+                    } else {
+                        style
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(radio, radio_style),
+                        Span::styled(tag_str, tag_style),
+                        Span::raw(" "),
+                        Span::styled(clamp_label(&provider.name, name_budget), name_style),
+                    ]))
+                }
             })
             .collect()
     };
@@ -702,6 +731,11 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     frame.render_stateful_widget(List::new(sub_items), sub_list_area, &mut sub_state);
 
     if let Some(s_area) = shield_area {
+        let band_hint = if state.hardsub_shield_mode.shader_slug().is_some() {
+            format!(" [B] Band: {}", state.hardsub_band_height.label())
+        } else {
+            String::new()
+        };
         let shield_msg = Paragraph::new(vec![
             Line::from(Span::styled(
                 clamp_label(" ⚠ Stream has Baked EN Sub", (s_area.width as usize).saturating_sub(1)),
@@ -710,7 +744,10 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
             Line::from(vec![
                 Span::styled(" [b] ", Style::default().fg(Color::Black).bg(Color::Rgb(248, 189, 56)).add_modifier(Modifier::BOLD)),
                 Span::styled(
-                    clamp_label(&format!(" Shield: {}", state.hardsub_shield_mode.label()), (s_area.width as usize).saturating_sub(6)),
+                    clamp_label(
+                        &format!(" {}{}", state.hardsub_shield_mode.label(), band_hint),
+                        (s_area.width as usize).saturating_sub(6),
+                    ),
                     Style::default().fg(Color::White),
                 ),
             ]),

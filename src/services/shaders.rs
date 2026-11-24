@@ -472,6 +472,121 @@ pub fn build_shader_files(mode: Anime4KMode, season_year: Option<i64>) -> Vec<St
 }
 
 /// Capability-aware 4-stage shader pipeline builder (`01_master_fused` + `02_chroma_444` + `03_era_restore` + `04_upscale_2x`).
+/// Build or verify parameterized GLSL Hardsub Eradication shaders (`blur`, `inpaint`, `matte`)
+/// for a given normalized screen-Y band `[band_top, band_bot]`. Returns the `.glsl` path if valid.
+pub fn ensure_hardsub_shader_file(engine_slug: &str, band_top: f32, band_bot: f32) -> Option<PathBuf> {
+    if !matches!(engine_slug, "blur" | "inpaint" | "matte") {
+        return None;
+    }
+    let dir = ensure_shaders_installed().ok()?;
+    let top_i = (band_top.clamp(0.55, 0.94) * 100.0).round() as u32;
+    let bot_i = (band_bot.clamp(0.85, 0.995) * 100.0).round() as u32;
+    let path = dir.join(format!("solus_hs_{engine_slug}_{top_i}_{bot_i}.glsl"));
+
+    let glsl = match engine_slug {
+        "blur" => format!(
+r#"//!HOOK MAIN
+//!BIND HOOKED
+//!DESC Solus Hardsub Eradicator — Frosted Blur Scrim ({top_i}..{bot_i})
+
+vec4 hook() {{
+    vec4 orig = HOOKED_tex(HOOKED_pos);
+    float top = {band_top:.3};
+    float bot = {band_bot:.3};
+    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.04 || HOOKED_pos.x > 0.96) {{
+        return orig;
+    }}
+    float w_v = smoothstep(top, top + 0.022, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.015, bot, HOOKED_pos.y));
+    float w_h = smoothstep(0.04, 0.09, HOOKED_pos.x) * (1.0 - smoothstep(0.91, 0.96, HOOKED_pos.x));
+    float w = w_v * w_h;
+    vec2 step_px = HOOKED_pt * 4.5;
+    vec3 acc = vec3(0.0);
+    float norm = 0.0;
+    for (int dy = -2; dy <= 2; ++dy) {{
+        for (int dx = -3; dx <= 3; ++dx) {{
+            float wt = 1.0 / (1.0 + float(dx * dx + dy * dy) * 0.35);
+            acc += HOOKED_tex(HOOKED_pos + vec2(float(dx), float(dy)) * step_px).rgb * wt;
+            norm += wt;
+        }}
+    }}
+    vec3 blurred = (acc / norm) * 0.20;
+    return vec4(mix(orig.rgb, blurred, w * 0.96), orig.a);
+}}
+"#),
+        "inpaint" => format!(
+r#"//!HOOK MAIN
+//!BIND HOOKED
+//!DESC Solus Hardsub Eradicator — Smart Text Inpainter ({top_i}..{bot_i})
+
+vec4 hook() {{
+    vec4 orig = HOOKED_tex(HOOKED_pos);
+    float top = {band_top:.3};
+    float bot = {band_bot:.3};
+    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.08 || HOOKED_pos.x > 0.92) {{
+        return orig;
+    }}
+    float luma = dot(orig.rgb, vec3(0.299, 0.587, 0.114));
+    float mx = max(orig.r, max(orig.g, orig.b));
+    float mn = min(orig.r, min(orig.g, orig.b));
+    float sat = mx - mn;
+
+    float local_max = luma;
+    float local_min = luma;
+    vec3 bg_acc = vec3(0.0);
+    float bg_wt = 0.0;
+    vec2 px = HOOKED_pt;
+    for (int dy = -3; dy <= 3; ++dy) {{
+        for (int dx = -3; dx <= 3; ++dx) {{
+            vec3 s = HOOKED_tex(HOOKED_pos + vec2(float(dx) * 2.5, float(dy) * 2.5) * px).rgb;
+            float sl = dot(s, vec3(0.299, 0.587, 0.114));
+            float smx = max(s.r, max(s.g, s.b));
+            float smn = min(s.r, min(s.g, s.b));
+            local_max = max(local_max, sl);
+            local_min = min(local_min, sl);
+            bool is_stroke = (sl > 0.72 && (smx - smn) < 0.24) || (sl < 0.14 && abs(dx) <= 1 && abs(dy) <= 1);
+            if (!is_stroke && (abs(dx) + abs(dy)) >= 2) {{
+                bg_acc += s;
+                bg_wt += 1.0;
+            }}
+        }}
+    }}
+    bool is_sub_core = (luma > 0.70 && sat < 0.24 && (local_max - local_min) > 0.42);
+    bool is_sub_halo = (local_max > 0.72 && luma < 0.22);
+    if ((is_sub_core || is_sub_halo) && bg_wt > 0.5) {{
+        vec3 filled = (bg_acc / bg_wt) * 0.72;
+        return vec4(filled, orig.a);
+    }}
+    return orig;
+}}
+"#),
+        _ => format!(
+r#"//!HOOK MAIN
+//!BIND HOOKED
+//!DESC Solus Hardsub Eradicator — Total Blackout Matte ({top_i}..{bot_i})
+
+vec4 hook() {{
+    vec4 orig = HOOKED_tex(HOOKED_pos);
+    float top = {band_top:.3};
+    float bot = {band_bot:.3};
+    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.03 || HOOKED_pos.x > 0.97) {{
+        return orig;
+    }}
+    float w_v = smoothstep(top, top + 0.015, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.010, bot, HOOKED_pos.y));
+    float w_h = smoothstep(0.03, 0.07, HOOKED_pos.x) * (1.0 - smoothstep(0.93, 0.97, HOOKED_pos.x));
+    float w = w_v * w_h;
+    vec3 matte = vec3(0.015, 0.015, 0.024);
+    return vec4(mix(orig.rgb, matte, w * 0.98), orig.a);
+}}
+"#),
+    };
+
+    let needs_write = std::fs::read_to_string(&path).map(|c| c != glsl).unwrap_or(true);
+    if needs_write && std::fs::write(&path, glsl).is_err() {
+        return None;
+    }
+    Some(path)
+}
+
 pub fn build_shader_files_with_caps(
     mode: Anime4KMode,
     perf: PerformanceMode,
@@ -710,6 +825,18 @@ mod tests {
         assert_eq!(build_shader_arg(Anime4KMode::Off), None);
         assert_eq!(build_shader_arg_for_year(Anime4KMode::Off, Some(1998)), None);
         assert!(mpv_mastering_flags(Anime4KMode::Off).is_empty());
+    }
+
+    #[test]
+    fn test_hardsub_eradicator_glsl_shaders_generated_cleanly() {
+        for slug in ["blur", "inpaint", "matte"] {
+            let p = ensure_hardsub_shader_file(slug, 0.78, 0.97).expect("shader generated");
+            let content = std::fs::read_to_string(&p).unwrap();
+            assert!(content.contains("//!HOOK MAIN"));
+            assert!(content.contains("//!BIND HOOKED"));
+            assert!(content.contains("vec4 hook()"));
+        }
+        assert!(ensure_hardsub_shader_file("unknown", 0.78, 0.97).is_none());
     }
 
     #[test]

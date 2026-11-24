@@ -378,6 +378,9 @@ pub struct AppState {
     /// Visual overlap shield for non-English subtitles over baked-in English streams
     pub hardsub_shield_mode: crate::api::player::HardsubShieldMode,
 
+    /// Band height for GPU hardsub eradication shaders
+    pub hardsub_band_height: crate::api::player::HardsubBandHeight,
+
     /// Playback: oneshot sender to stop the background player task
     pub player_stop:      Option<tokio::sync::oneshot::Sender<()>>,
 
@@ -741,6 +744,7 @@ pub struct AppState {
     pub active_stream_referer:       Option<String>,
     pub active_sub_path:             Option<String>,
     pub active_provider_id:          Option<String>,
+    pub active_ref_sync_source:      Option<(String, Option<String>, Option<String>)>,
     /// Settings Control Hub v2 navigation + Remote live state
     pub settings_category:           usize,
     pub settings_scroll_offset:      usize,
@@ -924,7 +928,8 @@ impl AppState {
             pending_playback_query: None,
             pending_dub: false,
             playback_options_purpose: PlaybackOptionsPurpose::LaunchNow,
-            hardsub_shield_mode: crate::api::player::HardsubShieldMode::OpaqueMask,
+            hardsub_shield_mode: crate::api::player::HardsubShieldMode::FrostedBlur,
+            hardsub_band_height: crate::api::player::HardsubBandHeight::Standard,
             player_stop:      None,
             now_playing:      None,
             playback_logs:    Vec::new(),
@@ -1095,6 +1100,7 @@ impl AppState {
             active_stream_referer: None,
             active_sub_path: None,
             active_provider_id: None,
+            active_ref_sync_source: None,
             settings_category: 0,
             settings_scroll_offset: 0,
             remote_ws_clients: 0,
@@ -1226,9 +1232,14 @@ impl AppState {
         self.thumbnail_geometry_key = None;
     }
 
-    /// Cycle Hardsub Shield protection (`Opaque Mask` -> `Top Edge` -> `Off`).
+    /// Cycle Hardsub Eradicator protection (`Frosted Blur` -> `Smart Inpaint` -> `Total Blackout` -> `Frame Lift` -> `Top Edge` -> `Off`).
     pub fn cycle_hardsub_shield_mode(&mut self) {
         self.hardsub_shield_mode = self.hardsub_shield_mode.next();
+    }
+
+    /// Cycle GPU Hardsub Eradicator band height (`Compact 12%` -> `Standard 19%` -> `Tall 25%`).
+    pub fn cycle_hardsub_band_height(&mut self) {
+        self.hardsub_band_height = self.hardsub_band_height.next();
     }
 
     /// Show a toast notification (auto-dismissed after 4 seconds).

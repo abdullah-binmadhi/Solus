@@ -922,23 +922,27 @@ pub fn select_dialogue_windows(sub_cues: &[(f64, f64)], cur_pos_secs: f64) -> Ve
     windows
 }
 
-/// Correlate a 10 Hz vocal modulation envelope over `[win_start, win_start + len*0.1]`
-/// against all subtitle cues using a bidirectional onset/body/silence-gap mask (`-150s..+150s`).
-pub fn correlate_envelope_against_cues(
+/// Compute exact zero-mean Pearson normalized cross-correlation over `delta in [-150s..+150s]`
+/// alongside its full coarse score curve `(offset_secs, pearson_r)`.
+fn correlate_envelope_with_curve(
     audio_env: &[f32],
     win_start: f64,
     sub_cues: &[(f64, f64)],
-) -> SpeechVadSyncResult {
+) -> (SpeechVadSyncResult, Vec<(f64, f64)>) {
     const BIN: f64 = 0.10;
     if audio_env.len() < 150 || sub_cues.len() < 3 {
-        return SpeechVadSyncResult {
-            reason: "Too few audio frames or subtitle cues".to_string(),
-            ..Default::default()
-        };
+        return (
+            SpeechVadSyncResult {
+                reason: "Too few audio frames or subtitle cues".to_string(),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
     }
 
     let n = audio_env.len();
-    let a_mean = audio_env.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+    let n_f = n as f64;
+    let a_mean = audio_env.iter().map(|&v| v as f64).sum::<f64>() / n_f;
     let a_std = (audio_env
         .iter()
         .map(|&v| {
@@ -946,18 +950,17 @@ pub fn correlate_envelope_against_cues(
             d * d
         })
         .sum::<f64>()
-        / n as f64)
+        / n_f)
         .sqrt()
         .max(1e-6);
     let norm_env: Vec<f64> = audio_env.iter().map(|&v| (v as f64 - a_mean) / a_std).collect();
 
     let score_offset = |delta: f64| -> f64 {
         let mut mask = vec![0.0_f64; n];
-        // Silence gap penalty +-300ms around each shifted cue
         for &(s, e) in sub_cues {
             let ss = s + delta - win_start;
             let ee = e + delta - win_start;
-            if ee < -0.5 || ss > n as f64 * BIN + 0.5 {
+            if ee < -0.5 || ss > n_f * BIN + 0.5 {
                 continue;
             }
             let pre_lo = ((ss - 0.3) / BIN).floor() as isize;
@@ -975,13 +978,14 @@ pub fn correlate_envelope_against_cues(
                 }
             }
         }
-        // Positive cue onset (+2.0 for 0..300ms) and body (+1.0) overwrite gap penalties
+        let mut overlapping = 0usize;
         for &(s, e) in sub_cues {
             let ss = s + delta - win_start;
             let ee = e + delta - win_start;
-            if ee < 0.0 || ss > n as f64 * BIN {
+            if ee < 0.0 || ss > n_f * BIN {
                 continue;
             }
+            overlapping += 1;
             let sb = (ss / BIN).round() as isize;
             let eb = (ee / BIN).round() as isize;
             let onset_end = sb + 3;
@@ -992,12 +996,23 @@ pub fn correlate_envelope_against_cues(
                 }
             }
         }
-        norm_env
-            .iter()
-            .zip(mask.iter())
-            .map(|(&a, &m)| a * m)
-            .sum::<f64>()
-            / (n as f64).sqrt()
+        if overlapping < 3 {
+            return 0.0;
+        }
+        let mut sum_m = 0.0_f64;
+        let mut sum_mm = 0.0_f64;
+        let mut sum_am = 0.0_f64;
+        for (&a, &m) in norm_env.iter().zip(mask.iter()) {
+            sum_m += m;
+            sum_mm += m * m;
+            sum_am += a * m;
+        }
+        let m_mean = sum_m / n_f;
+        let m_var = sum_mm - n_f * m_mean * m_mean;
+        if m_var <= 1e-4 {
+            return 0.0;
+        }
+        sum_am / (n_f * m_var).sqrt()
     };
 
     // Coarse scan: -150.0s .. +150.0s in 0.20s steps
@@ -1057,28 +1072,142 @@ pub fn correlate_envelope_against_cues(
     } else {
         2.0
     };
-    let confidence_pct = (((z_score - 2.0) / 3.0).clamp(0.0, 1.0) * 49.0 + 50.0)
+    let confidence_pct = (((z_score - 2.2) / 3.2).clamp(0.0, 1.0) * 49.0 + 50.0)
         .round()
         .clamp(0.0, 99.0) as u8;
-    let applied = z_score >= 2.6 && best_score > 0.5;
+    let extreme_ok = best_offset.abs() <= 25.0 || z_score >= 3.6;
+    let applied = z_score >= 3.0 && best_score >= 0.08 && extreme_ok;
     let reason = if applied {
         format!("Voice-Locked ({confidence_pct}% confidence, Z={z_score:.2})")
     } else {
         format!("Weak voice match (Z={z_score:.2}) — seek to clear dialogue and retry")
     };
 
-    SpeechVadSyncResult {
+    let res = SpeechVadSyncResult {
         offset_seconds: (best_offset * 100.0).round() / 100.0,
         scale_factor: 1.0,
-        confidence_pct: if applied { confidence_pct } else { ((z_score / 3.0).clamp(0.0, 0.49) * 100.0).round() as u8 },
+        confidence_pct: if applied {
+            confidence_pct
+        } else {
+            ((z_score / 3.5).clamp(0.0, 0.49) * 100.0).round() as u8
+        },
         z_score,
         prominence,
         applied,
         reason,
-    }
+    };
+    (res, coarse)
 }
 
-/// Automated dialogue-clustered `ffmpeg` PCM envelope extraction + wide cross-correlation for `SNAP TO VOICE`.
+/// Correlate a 10 Hz vocal modulation envelope over `[win_start, win_start + len*0.1]`
+/// against all subtitle cues using zero-mean Pearson NCC (`-150s..+150s`).
+pub fn correlate_envelope_against_cues(
+    audio_env: &[f32],
+    win_start: f64,
+    sub_cues: &[(f64, f64)],
+) -> SpeechVadSyncResult {
+    correlate_envelope_with_curve(audio_env, win_start, sub_cues).0
+}
+
+/// Cross-correlate two 10 Hz audio envelopes (`ref_env` from Clean sibling, `target_env` from active stream)
+/// extracted over the exact same timestamp range, returning `(delta_secs, z_score, confidence_pct)`
+/// where `t_target = t_ref + delta_secs`.
+pub fn correlate_audio_envelopes(
+    ref_env: &[f32],
+    target_env: &[f32],
+    max_shift_secs: f64,
+) -> Option<(f64, f64, u8)> {
+    const BIN: f64 = 0.10;
+    let n = ref_env.len().min(target_env.len());
+    if n < 150 {
+        return None;
+    }
+
+    let max_lag = ((max_shift_secs / BIN).round() as isize).clamp(20, (n / 3) as isize);
+    let mut scores: Vec<(f64, f64)> = Vec::with_capacity((max_lag * 2 + 1) as usize);
+
+    // At delta = lag * 0.1s: target[i + lag] corresponds to ref[i] (target happens delta AFTER ref)
+    for lag in -max_lag..=max_lag {
+        let (r_start, t_start, overlap) = if lag >= 0 {
+            let l = lag as usize;
+            (0usize, l, n - l)
+        } else {
+            let l = (-lag) as usize;
+            (l, 0usize, n - l)
+        };
+        if overlap < 100 {
+            continue;
+        }
+        let ov_f = overlap as f64;
+        let mut s_r = 0.0_f64;
+        let mut s_t = 0.0_f64;
+        for k in 0..overlap {
+            s_r += ref_env[r_start + k] as f64;
+            s_t += target_env[t_start + k] as f64;
+        }
+        let m_r = s_r / ov_f;
+        let m_t = s_t / ov_f;
+        let mut num = 0.0_f64;
+        let mut vr = 0.0_f64;
+        let mut vt = 0.0_f64;
+        for k in 0..overlap {
+            let dr = ref_env[r_start + k] as f64 - m_r;
+            let dt = target_env[t_start + k] as f64 - m_t;
+            num += dr * dt;
+            vr += dr * dr;
+            vt += dt * dt;
+        }
+        let denom = (vr * vt).sqrt();
+        let r = if denom > 1e-6 { num / denom } else { 0.0 };
+        scores.push((lag as f64 * BIN, r));
+    }
+    if scores.len() < 10 {
+        return None;
+    }
+
+    let mean = scores.iter().map(|&(_, sc)| sc).sum::<f64>() / scores.len() as f64;
+    let var = scores
+        .iter()
+        .map(|&(_, sc)| {
+            let d = sc - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / scores.len() as f64;
+    let std = var.sqrt().max(1e-6);
+
+    let (best_idx, &(best_off, best_r)) = scores
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.1.total_cmp(&b.1.1))?;
+
+    // Parabolic sub-bin interpolation across neighbors [best_idx-1, best_idx, best_idx+1] for ±0.02s precision
+    let refined_off = if best_idx > 0 && best_idx + 1 < scores.len() {
+        let y0 = scores[best_idx - 1].1;
+        let y1 = best_r;
+        let y2 = scores[best_idx + 1].1;
+        let denom = 2.0 * (y0 - 2.0 * y1 + y2);
+        if denom.abs() > 1e-7 {
+            let shift = ((y0 - y2) / denom).clamp(-0.5, 0.5);
+            best_off + shift * BIN
+        } else {
+            best_off
+        }
+    } else {
+        best_off
+    };
+
+    let z = (best_r - mean) / std;
+    if best_r < 0.35 || z < 3.6 {
+        return None;
+    }
+    let conf = (((z - 3.0) / 8.0).clamp(0.0, 1.0) * 29.0 + 70.0)
+        .round()
+        .clamp(70.0, 99.0) as u8;
+    Some(((refined_off * 100.0).round() / 100.0, z, conf))
+}
+
+/// Automated dialogue-clustered `ffmpeg` PCM envelope extraction + Joint 2-Window consensus for `SNAP TO VOICE`.
 pub async fn auto_sync_subtitle_to_audio(
     stream_url: &str,
     referer: Option<&str>,
@@ -1103,31 +1232,150 @@ pub async fn auto_sync_subtitle_to_audio(
     }
 
     let windows = select_dialogue_windows(&sub_cues, cur_pos_secs);
-    let mut best_res = SpeechVadSyncResult {
-        reason: "Audio envelope extraction failed".to_string(),
-        ..Default::default()
-    };
+    let env_futs = windows
+        .iter()
+        .map(|&(w_start, w_dur)| extract_vocal_envelope_ffmpeg(stream_url, referer, w_start, w_dur));
+    let env_results = futures_util::future::join_all(env_futs).await;
 
-    for (w_start, w_dur) in windows {
-        match extract_vocal_envelope_ffmpeg(stream_url, referer, w_start, w_dur).await {
+    let mut parsed_windows: Vec<(SpeechVadSyncResult, Vec<(f64, f64)>)> = Vec::new();
+    let mut last_err = String::from("Audio envelope extraction failed");
+
+    for (&(w_start, _), env_res) in windows.iter().zip(env_results.into_iter()) {
+        match env_res {
             Ok(env) => {
-                let res = correlate_envelope_against_cues(&env, w_start, &sub_cues);
-                if res.applied {
-                    return res;
-                }
-                if res.z_score > best_res.z_score {
-                    best_res = res;
-                }
+                parsed_windows.push(correlate_envelope_with_curve(&env, w_start, &sub_cues));
             }
             Err(err) => {
-                if !best_res.applied && best_res.z_score == 0.0 {
-                    best_res.reason = err;
+                last_err = err;
+            }
+        }
+    }
+
+    if parsed_windows.is_empty() {
+        return SpeechVadSyncResult {
+            reason: last_err,
+            ..Default::default()
+        };
+    }
+
+    // Joint 2-Window Consensus eliminates random single-scene BGM spikes (e.g. false +52.95s locks)
+    if parsed_windows.len() >= 2 {
+        let (ref res_a, ref curve_a) = parsed_windows[0];
+        let (ref res_b, ref curve_b) = parsed_windows[1];
+        if curve_a.len() == curve_b.len() && !curve_a.is_empty() {
+            let joint: Vec<(f64, f64)> = curve_a
+                .iter()
+                .zip(curve_b.iter())
+                .map(|(&(off, ra), &(_, rb))| (off, 0.5 * (ra + rb)))
+                .collect();
+            let j_mean = joint.iter().map(|&(_, s)| s).sum::<f64>() / joint.len() as f64;
+            let j_std = (joint
+                .iter()
+                .map(|&(_, s)| {
+                    let d = s - j_mean;
+                    d * d
+                })
+                .sum::<f64>()
+                / joint.len() as f64)
+                .sqrt()
+                .max(1e-6);
+            if let Some(&(best_off, best_j)) = joint.iter().max_by(|a, b| a.1.total_cmp(&b.1)) {
+                let j_z = (best_j - j_mean) / j_std;
+                let windows_agree = (res_a.offset_seconds - res_b.offset_seconds).abs() <= 1.25
+                    || ((res_a.offset_seconds - best_off).abs() <= 0.65 && res_a.z_score >= 2.8)
+                    || ((res_b.offset_seconds - best_off).abs() <= 0.65 && res_b.z_score >= 2.8);
+                if j_z >= 3.0 && best_j >= 0.08 && (windows_agree || best_off.abs() <= 25.0) {
+                    let conf = (((j_z - 2.2) / 3.2).clamp(0.0, 1.0) * 49.0 + 50.0)
+                        .round()
+                        .clamp(50.0, 99.0) as u8;
+                    return SpeechVadSyncResult {
+                        offset_seconds: (best_off * 100.0).round() / 100.0,
+                        scale_factor: 1.0,
+                        confidence_pct: conf,
+                        z_score: j_z,
+                        prominence: 1.5,
+                        applied: true,
+                        reason: format!("Dual-Window Voice Lock ({conf}% confidence, Z={j_z:.2})"),
+                    };
                 }
             }
         }
     }
 
-    best_res
+    // Single-window strict fallback (when only 1 window exists / succeeded)
+    parsed_windows
+        .into_iter()
+        .map(|(r, _)| r)
+        .max_by(|a, b| a.z_score.total_cmp(&b.z_score))
+        .unwrap_or(SpeechVadSyncResult {
+            reason: last_err,
+            ..Default::default()
+        })
+}
+
+/// Unified Tier-A + Tier-B Synchronizer:
+/// Attempts Audio-to-Audio waveform lock against a Clean sibling provider first (when available),
+/// composing with Tier-1 subtitle-to-subtitle alignment, then falls back cleanly to Speech-VAD v3.
+pub async fn sync_subtitle_with_reference_or_vad(
+    client: &reqwest::Client,
+    target_stream_url: &str,
+    target_referer: Option<&str>,
+    target_sub_path: &str,
+    cur_pos_secs: f64,
+    ref_stream_url: Option<&str>,
+    ref_referer: Option<&str>,
+    ref_sub_url: Option<&str>,
+) -> SpeechVadSyncResult {
+    if let Some(r_url) = ref_stream_url.filter(|u| !u.is_empty() && *u != target_stream_url) {
+        let sub_text = std::fs::read_to_string(target_sub_path).unwrap_or_default();
+        let cues = parse_subtitle_intervals(&sub_text);
+        let max_t = cues.iter().map(|c| c.1).fold(0.0_f64, f64::max);
+        let probe_start = if max_t > 240.0 { 130.0 } else { 18.0 };
+
+        let (ref_res, tgt_res) = tokio::join!(
+            extract_vocal_envelope_ffmpeg(r_url, ref_referer, probe_start, 65.0),
+            extract_vocal_envelope_ffmpeg(target_stream_url, target_referer, probe_start, 65.0),
+        );
+        if let (Ok(ref_env), Ok(tgt_env)) = (ref_res, tgt_res) {
+            if let Some((delta_video, z, conf)) = correlate_audio_envelopes(&ref_env, &tgt_env, 60.0) {
+                let mut delta_sub_vs_ref = 0.0_f64;
+                if let Some(rs_url) = ref_sub_url.filter(|u| !u.is_empty() && *u != target_sub_path) {
+                    if let Ok(resp) = client
+                        .get(rs_url)
+                        .header("Referer", ref_referer.unwrap_or("https://zokoanime.video/"))
+                        .timeout(Duration::from_secs(5))
+                        .send()
+                        .await
+                    {
+                        if resp.status().is_success() {
+                            if let Ok(bytes) = resp.bytes().await {
+                                let ref_txt = decode_subtitle_bytes(&bytes);
+                                if is_valid_subtitle_content(&ref_txt) {
+                                    let ref_cues = parse_subtitle_intervals(&ref_txt);
+                                    let align = calculate_optimal_alignment(&ref_cues, &cues);
+                                    if align.applied {
+                                        delta_sub_vs_ref = align.offset_seconds;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let total_offset = ((delta_video + delta_sub_vs_ref) * 100.0).round() / 100.0;
+                return SpeechVadSyncResult {
+                    offset_seconds: total_offset,
+                    scale_factor: 1.0,
+                    confidence_pct: conf,
+                    z_score: z,
+                    prominence: 2.0,
+                    applied: true,
+                    reason: format!("Reference-Audio Locked ({conf}% confidence, Z={z:.2})"),
+                };
+            }
+        }
+    }
+
+    auto_sync_subtitle_to_audio(target_stream_url, target_referer, target_sub_path, cur_pos_secs).await
 }
 
 /// Fallback Tier 2: Probe audio lead time via ffmpeg silencedetect (runs in < 1.5s).
@@ -1708,5 +1956,60 @@ Dialogue: 0,0:01:37.75,0:01:40.91,NHK Dialogue - Border,,0,0,0,,Outline duplicat
             "Window should skip 140s OP gap and land in post-OP dialogue, got {:?}",
             wins[0]
         );
+    }
+
+    #[test]
+    fn test_pearson_ncc_rejects_cue_density_bias_and_prevents_false_52s_spike() {
+        // Constant/noisy background envelope across 90s + 3 real speech bursts near t=185, 200, 215
+        let win_start = 175.0;
+        let mut env = vec![0.45_f32; 900];
+        for b in (100..150).chain(250..300).chain(400..450) {
+            env[b] = 1.65;
+        }
+        // Dense cue cluster 53s earlier (would inflate naive sum-over-cues near +53s)
+        let mut cues = Vec::new();
+        for k in 0..15 {
+            let s = 122.0 + k as f64 * 2.1;
+            cues.push((s, s + 1.4));
+        }
+        // True dialogue cues near offset 0.0
+        cues.extend([(185.0, 190.0), (200.0, 205.0), (215.0, 220.0)]);
+
+        let res = correlate_envelope_against_cues(&env, win_start, &cues);
+        assert!(
+            !res.applied || res.offset_seconds.abs() < 1.0,
+            "Pearson NCC must reject dense +53s false lock, got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn test_audio_to_audio_flux_correlator_recovers_bumper_offset() {
+        let len = 900;
+        let true_bins: usize = 125; // +12.50s studio bumper delay on target stream
+        let mut ref_env = vec![0.0_f32; len];
+        for i in 0..len {
+            // Non-periodic multi-syllable speech energy pattern
+            let s = ((i as f64 * 0.17).sin() * (i as f64 * 0.43).cos()).max(0.0);
+            let gate = if (i / 17) % 3 == 0 { 1.0 } else { 0.1 };
+            ref_env[i] = (s * gate) as f32;
+        }
+        let mut target_env = vec![0.05_f32; len];
+        for i in true_bins..len {
+            target_env[i] = 0.85 * ref_env[i - true_bins] + 0.02 * ((i % 7) as f32 * 0.1);
+        }
+
+        let got = correlate_audio_envelopes(&ref_env, &target_env, 60.0);
+        assert!(got.is_some(), "Expected confident audio-to-audio lock");
+        let (offset, corr, conf) = got.unwrap();
+        assert!(
+            (offset - 12.5).abs() <= 0.25,
+            "Expected ~+12.5s offset, got {} (corr={}, conf={})",
+            offset,
+            corr,
+            conf
+        );
+        assert!(corr >= 0.70, "Expected strong correlation, got {}", corr);
+        assert!(conf >= 75, "Expected high confidence, got {}", conf);
     }
 }

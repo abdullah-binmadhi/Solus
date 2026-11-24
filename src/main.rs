@@ -706,13 +706,14 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_else(|| "sub".to_string());
                     let provider_id = state.active_provider_id.clone().unwrap_or_default();
                     let referer = state.active_stream_referer.clone();
+                    let ref_sync = state.active_ref_sync_source.clone();
                     let force_ipv4 = cfg.force_ipv4;
                     state.sub_sync_in_progress = true;
-                    state.show_toast("◈ Running Speech-VAD subtitle voice alignment...", unix_now());
+                    state.show_toast("◈ Running Reference-Audio & Speech-VAD alignment...", unix_now());
                     let tx_sync = tx.clone();
                     tokio::spawn(async move {
+                        let client = api::subtitles::build_http_client(force_ipv4, 8);
                         let local_sub = if sub_path.starts_with("http://") || sub_path.starts_with("https://") {
-                            let client = api::subtitles::build_http_client(force_ipv4, 8);
                             let (cached_path, _) = services::subsync::ensure_synchronized_subtitle(
                                 &client,
                                 &sub_path,
@@ -727,11 +728,19 @@ async fn main() -> anyhow::Result<()> {
                         } else {
                             sub_path
                         };
-                        let result = services::subsync::auto_sync_subtitle_to_audio(
+                        let (ref_url, ref_ref, ref_sub) = match ref_sync {
+                            Some((u, r, s)) => (Some(u), r, s),
+                            None => (None, None, None),
+                        };
+                        let result = services::subsync::sync_subtitle_with_reference_or_vad(
+                            &client,
                             &stream_url,
                             referer.as_deref(),
                             &local_sub,
                             time_pos_secs,
+                            ref_url.as_deref(),
+                            ref_ref.as_deref(),
+                            ref_sub.as_deref(),
                         )
                         .await;
                         let _ = tx_sync
@@ -755,21 +764,26 @@ async fn main() -> anyhow::Result<()> {
                                 opts.sub_delay_ms = clamped_ms;
                             }
                         }
-                        let pool2 = pool.clone();
-                        let pid = state.active_profile_id.clone();
-                        let prov_id = provider_id.clone();
-                        let now = unix_now();
-                        tokio::spawn(async move {
-                            let _ = db::user::save_anime_provider_subtitle_delay_ms(
-                                &pool2,
-                                &pid,
-                                anime_id,
-                                &prov_id,
-                                clamped_ms,
-                                now,
-                            )
-                            .await;
-                        });
+                        let safe_to_persist = clamped_ms.abs() <= 25_000
+                            || result.reason.contains("Reference-Audio")
+                            || result.z_score >= 3.6;
+                        if safe_to_persist {
+                            let pool2 = pool.clone();
+                            let pid = state.active_profile_id.clone();
+                            let prov_id = provider_id.clone();
+                            let now = unix_now();
+                            tokio::spawn(async move {
+                                let _ = db::user::save_anime_provider_subtitle_delay_ms(
+                                    &pool2,
+                                    &pid,
+                                    anime_id,
+                                    &prov_id,
+                                    clamped_ms,
+                                    now,
+                                )
+                                .await;
+                            });
+                        }
                         let r_state = state.remote_state.clone();
                         tokio::spawn(async move {
                             {
@@ -1008,6 +1022,7 @@ async fn main() -> anyhow::Result<()> {
                             .map(|p| p.embedded_sub)
                             .unwrap_or_default(),
                         hardsub_shield: state.hardsub_shield_mode,
+                        hardsub_band: state.hardsub_band_height,
                     };
                     wrap_opts_with_hls_proxy_if_needed(&mut state, &cfg, &mut opts, needs_hls_proxy).await;
                     start_playback(&mut state, opts, title, episode, &tx, &pool, &cfg).await;
@@ -1064,6 +1079,7 @@ async fn main() -> anyhow::Result<()> {
                     state.active_stream_url_for_sync = None;
                     state.active_stream_referer = None;
                     state.active_sub_path = None;
+                    state.active_ref_sync_source = None;
                     state.live_playback.clear();
                     state.invalidate_detail_image_protocols();
                     services::ipc::set_playback_paused_for_cache(false);
@@ -5049,10 +5065,17 @@ async fn handle_playback_options(
         KeyCode::Char('I') => {
             toggle_info_hud_action(state, true);
         }
-        KeyCode::Char('b') | KeyCode::Char('B') => {
+        KeyCode::Char('b') => {
             state.cycle_hardsub_shield_mode();
             state.show_toast(
-                format!("◈ Hardsub Shield: {}", state.hardsub_shield_mode.label()),
+                format!("◈ Hardsub Eradicator: {}", state.hardsub_shield_mode.label()),
+                unix_now(),
+            );
+        }
+        KeyCode::Char('B') => {
+            state.cycle_hardsub_band_height();
+            state.show_toast(
+                format!("◈ Hardsub Band Height: {}", state.hardsub_band_height.label()),
                 unix_now(),
             );
         }
@@ -5266,6 +5289,7 @@ async fn handle_playback_options(
                                 .map(|p| p.embedded_sub)
                                 .unwrap_or_default(),
                             hardsub_shield: state.hardsub_shield_mode,
+                            hardsub_band: state.hardsub_band_height,
                             referer: chosen_prov.and_then(|p| p.referer),
                             audio_urls,
                             has_demuxed_audio,
@@ -7957,6 +7981,7 @@ async fn play_queue_item(
             has_demuxed_audio: false,
             embedded_sub: Default::default(),
             hardsub_shield: state.hardsub_shield_mode,
+            hardsub_band: state.hardsub_band_height,
         });
 
     opts.ipc_socket = None;
@@ -7970,6 +7995,7 @@ async fn play_queue_item(
     opts.deband_mode = cfg.deband_mode;
     opts.motion_mode = cfg.motion_mode;
     opts.hardsub_shield = state.hardsub_shield_mode;
+    opts.hardsub_band = state.hardsub_band_height;
     opts.sub_style = Some(cfg.subtitle_style.clone());
     opts.sub_delay_ms = state.subtitle_delay_ms;
     if state.anime4k_mode != config::Anime4KMode::Off {
@@ -9322,10 +9348,17 @@ async fn handle_playback(
         KeyCode::Char('I') => {
             toggle_info_hud_action(state, true);
         }
-        KeyCode::Char('b') | KeyCode::Char('B') => {
+        KeyCode::Char('b') => {
             state.cycle_hardsub_shield_mode();
             state.show_toast(
-                format!("◈ Hardsub Shield: {}", state.hardsub_shield_mode.label()),
+                format!("◈ Hardsub Eradicator: {}", state.hardsub_shield_mode.label()),
+                unix_now(),
+            );
+        }
+        KeyCode::Char('B') => {
+            state.cycle_hardsub_band_height();
+            state.show_toast(
+                format!("◈ Hardsub Band Height: {}", state.hardsub_band_height.label()),
                 unix_now(),
             );
         }
@@ -10068,6 +10101,63 @@ fn resolve_sync_stream_url(
     opts.stream_url.clone()
 }
 
+fn resolve_clean_ref_sync_source(
+    state: &AppState,
+    active_pid: Option<&str>,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let clean = state.playback_providers.iter().find(|p| {
+        Some(p.id.as_str()) != active_pid
+            && !p.embedded_sub.has_baked_english()
+            && !p.qualities.is_empty()
+    })?;
+
+    let ref_raw = clean
+        .qualities
+        .iter()
+        .find_map(|q| q.audio_urls.first().filter(|u| !u.trim().is_empty()).cloned())
+        .or_else(|| {
+            clean
+                .qualities
+                .iter()
+                .filter(|q| !q.url.trim().is_empty() && !q.label.contains("Mirror"))
+                .min_by_key(|q| q.height.unwrap_or(1080))
+                .map(|q| q.url.clone())
+        })?;
+
+    let referer = clean.referer.clone();
+    let ref_url = {
+        let is_hls = ref_raw.contains(".m3u8") || ref_raw.contains("/m3u8");
+        let needs_proxy = clean.needs_hls_proxy
+            || clean.qualities.iter().any(|q| q.url == ref_raw && q.needs_hls_proxy);
+        if is_hls && needs_proxy && !ref_raw.starts_with("http://127.0.0.1:") {
+            if let Some(ref proxy) = state.hls_proxy {
+                proxy.wrap_playlist_url(
+                    &ref_raw,
+                    referer.as_deref().unwrap_or("https://zokoanime.video/"),
+                )
+            } else {
+                ref_raw
+            }
+        } else {
+            ref_raw
+        }
+    };
+
+    let ref_sub = clean
+        .subtitles
+        .iter()
+        .find(|s| {
+            !s.url.trim().is_empty()
+                && (s.code == "eng"
+                    || s.code == "en"
+                    || s.name.to_ascii_lowercase().contains("english"))
+        })
+        .or_else(|| clean.subtitles.iter().find(|s| !s.url.trim().is_empty()))
+        .map(|s| s.url.clone());
+
+    Some((ref_url, referer, ref_sub))
+}
+
 async fn start_playback(
     state:   &mut AppState,
     opts:    api::player::PlayOptions,
@@ -10482,9 +10572,10 @@ async fn start_playback(
     );
     state.active_stream_referer = opts.referer.clone();
     state.active_sub_path = sub_path_for_ctx.clone();
+    state.active_ref_sync_source = resolve_clean_ref_sync_source(state, state.active_provider_id.as_deref());
     state.sub_sync_in_progress = false;
 
-    // Non-blocking background Speech-VAD auto-sync for cross-provider direct MP4 streams
+    // Non-blocking background Reference-Audio + Speech-VAD auto-sync for cross-provider streams
     if has_mpv_ipc
         && !is_offline_local
         && opts.sub_delay_ms == 0
@@ -10500,14 +10591,25 @@ async fn start_playback(
                 let sub_p_bg = sub_p.clone();
                 let anchor_pos = opts.start_pos.filter(|&p| p >= 185.0).unwrap_or(0.0);
                 let prov_id_bg = state.active_provider_id.clone().unwrap_or_default();
+                let ref_sync_bg = state.active_ref_sync_source.clone();
+                let force_ipv4_bg = cfg.force_ipv4;
                 let tx_bg = tx.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(1500)).await;
-                    let result = services::subsync::auto_sync_subtitle_to_audio(
+                    let client = api::subtitles::build_http_client(force_ipv4_bg, 8);
+                    let (ref_u, ref_r, ref_s) = match ref_sync_bg {
+                        Some((u, r, s)) => (Some(u), r, s),
+                        None => (None, None, None),
+                    };
+                    let result = services::subsync::sync_subtitle_with_reference_or_vad(
+                        &client,
                         &s_url_bg,
                         ref_bg.as_deref(),
                         &sub_p_bg,
                         anchor_pos,
+                        ref_u.as_deref(),
+                        ref_r.as_deref(),
+                        ref_s.as_deref(),
                     )
                     .await;
                     if result.applied && result.offset_seconds.abs() >= 0.45 {
