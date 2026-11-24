@@ -121,9 +121,17 @@ impl HardsubBandHeight {
 
     pub fn bounds(self) -> (f32, f32) {
         match self {
-            Self::Compact => (0.85, 0.97),
-            Self::Standard => (0.78, 0.97),
-            Self::Tall => (0.72, 0.97),
+            Self::Compact => (0.840, 0.998),
+            Self::Standard => (0.770, 0.998),
+            Self::Tall => (0.700, 0.998),
+        }
+    }
+
+    pub fn sub_alignment(self) -> (u8, u8) {
+        match self {
+            Self::Compact => (93, 14),
+            Self::Standard => (91, 16),
+            Self::Tall => (89, 18),
         }
     }
 }
@@ -987,9 +995,9 @@ local shield_modes = {
     { name = "Off",            slug = nil },
 }
 local band_sizes = {
-    { label = "Compact (12%)",  tag = "85_97" },
-    { label = "Standard (19%)", tag = "78_97" },
-    { label = "Tall (25%)",     tag = "72_97" },
+    { label = "Compact (12%)",  tag = "84_100", sub_pos = 93, margin_y = 14 },
+    { label = "Standard (19%)", tag = "77_100", sub_pos = 91, margin_y = 16 },
+    { label = "Tall (25%)",     tag = "70_100", sub_pos = 89, margin_y = 18 },
 }
 local shield_idx = 1
 local band_idx = 2
@@ -1004,16 +1012,17 @@ local function solus_detect_initial_shield()
             if s:find("solus_hs_inpaint_", 1, true) then shield_idx = 2
             elseif s:find("solus_hs_matte_", 1, true) then shield_idx = 3
             else shield_idx = 1 end
-            if s:find("_85_97.glsl", 1, true) then band_idx = 1
-            elseif s:find("_72_97.glsl", 1, true) then band_idx = 3
+            if s:find("_84_100.glsl", 1, true) then band_idx = 1
+            elseif s:find("_70_100.glsl", 1, true) then band_idx = 3
             else band_idx = 2 end
             break
         end
     end
     if not found_hs then
         local vay = mp.get_property_number("video-align-y", 0)
+        local vzoom = mp.get_property_number("video-zoom", 0)
         local spos = mp.get_property_number("sub-pos", 100)
-        if vay < -0.2 then shield_idx = 4
+        if vay < -0.2 or vzoom < -0.05 then shield_idx = 4
         elseif spos <= 15 then shield_idx = 5
         elseif mp.get_property("sub-border-style", "") == "outline-and-shadow" and spos >= 95 then shield_idx = 6 end
     end
@@ -1036,14 +1045,21 @@ local function solus_apply_hardsub_shield(announce)
     mp.set_property_native("glsl-shaders", next_shaders)
 
     if mode.name == "Frame Lift" then
-        mp.set_property_number("video-align-y", -0.65)
-        mp.set_property("sub-border-style", "opaque-box")
-        mp.set_property("sub-back-color", "#EE0A0A0E")
-        mp.set_property_number("sub-margin-y", 18)
+        mp.set_property_number("video-zoom", -0.16)
+        mp.set_property_number("video-align-y", -1.0)
+        mp.set_property("sub-use-margins", "yes")
+        mp.set_property("sub-ass-force-margins", "yes")
+        mp.set_property("sub-border-style", "outline-and-shadow")
+        mp.set_property_number("sub-border-size", 2.4)
+        mp.set_property_number("sub-shadow-offset", 1.0)
+        mp.set_property_number("sub-margin-y", 6)
         mp.set_property_number("sub-pos", 99)
         mp.set_property("sub-ass-override", "force")
     elseif mode.name == "Top Edge" then
+        mp.set_property_number("video-zoom", 0)
         mp.set_property_number("video-align-y", 0)
+        mp.set_property("sub-use-margins", "no")
+        mp.set_property("sub-ass-force-margins", "no")
         mp.set_property("sub-border-style", "outline-and-shadow")
         mp.set_property_number("sub-border-size", 2.6)
         mp.set_property_number("sub-shadow-offset", 1.0)
@@ -1051,15 +1067,21 @@ local function solus_apply_hardsub_shield(announce)
         mp.set_property_number("sub-pos", 7)
         mp.set_property("sub-ass-override", "force")
     elseif mode.slug ~= nil then
+        mp.set_property_number("video-zoom", 0)
         mp.set_property_number("video-align-y", 0)
+        mp.set_property("sub-use-margins", "no")
+        mp.set_property("sub-ass-force-margins", "no")
         mp.set_property("sub-border-style", "outline-and-shadow")
         mp.set_property_number("sub-border-size", 2.6)
         mp.set_property_number("sub-shadow-offset", 1.0)
-        mp.set_property_number("sub-margin-y", 26)
-        mp.set_property_number("sub-pos", 96)
+        mp.set_property_number("sub-margin-y", band.margin_y)
+        mp.set_property_number("sub-pos", band.sub_pos)
         mp.set_property("sub-ass-override", "force")
     else
+        mp.set_property_number("video-zoom", 0)
         mp.set_property_number("video-align-y", 0)
+        mp.set_property("sub-use-margins", "yes")
+        mp.set_property("sub-ass-force-margins", "no")
         mp.set_property("sub-border-style", "outline-and-shadow")
         mp.set_property_number("sub-margin-y", 38)
         mp.set_property_number("sub-pos", 100)
@@ -1141,16 +1163,35 @@ local function parse_sub_ts(s)
     return nil
 end
 
+local function utf8_truncate(s, max_chars)
+    if not s then return "" end
+    local chars = 0
+    local i = 1
+    local len = #s
+    while i <= len do
+        local b = s:byte(i)
+        local step = 1
+        if b >= 0xF0 then step = 4
+        elseif b >= 0xE0 then step = 3
+        elseif b >= 0xC0 then step = 2 end
+        if chars + 1 > max_chars then
+            return string.sub(s, 1, i - 1) .. "..."
+        end
+        chars = chars + 1
+        i = i + step
+    end
+    return s
+end
+
 local function find_active_cue_preview(delay_secs)
     local live_txt = esc_ass(mp.get_property("sub-text", "") or "")
     local cur_t = (mp.get_property_number("time-pos", 0) or 0) - (delay_secs or 0)
     if live_txt ~= "" then
-        if #live_txt > 62 then live_txt = string.sub(live_txt, 1, 59) .. "..." end
-        return string.format("Live Subtitle: \"%s\"", live_txt)
+        return string.format("Live: \"%s\"", utf8_truncate(live_txt, 38))
     end
     local spath = active_sub_file_path()
     if not spath or spath:match("^https?://") then
-        return "No local cue preview — subtitles will preview live when cached"
+        return "No local cue preview — subtitles preview when cached"
     end
     local f = io.open(spath, "r")
     if not f then return "Cue preview unavailable" end
@@ -1181,26 +1222,43 @@ local function find_active_cue_preview(delay_secs)
     end
     f:close()
     if nearest_ts and nearest_txt then
-        if #nearest_txt > 52 then nearest_txt = string.sub(nearest_txt, 1, 49) .. "..." end
-        return string.format("Nearest Cue @ %s: \"%s\"", fmt_clock(nearest_ts + (delay_secs or 0)), nearest_txt)
+        return string.format("Nearest @ %s: \"%s\"", fmt_clock(nearest_ts + (delay_secs or 0)), utf8_truncate(nearest_txt, 34))
     end
     return "No dialogue cues found in file"
 end
 
-local function do_skip_intro_or_outro()
+local function do_skip_intro_op()
     local cur_t = mp.get_property_number("time-pos", 0) or 0
-    if player_ctx.op_start and player_ctx.op_end and cur_t >= (player_ctx.op_start - 2.0) and cur_t < (player_ctx.op_end - 1.0) then
+    if player_ctx.op_start and player_ctx.op_end and cur_t >= (player_ctx.op_start - 5.0) and cur_t < (player_ctx.op_end - 1.0) then
         mp.commandv("seek", player_ctx.op_end, "absolute")
         mp.osd_message(">>| Skipped Intro (AniSkip)", 2.2)
-    elseif player_ctx.ed_start and player_ctx.ed_end and cur_t >= (player_ctx.ed_start - 2.0) and cur_t < (player_ctx.ed_end - 1.0) then
-        mp.commandv("seek", player_ctx.ed_end, "absolute")
-        mp.osd_message(">>| Skipped Outro (AniSkip)", 2.2)
-    elseif cur_t < 155.0 then
+    else
         mp.commandv("seek", cur_t + 85.0, "absolute")
-        mp.osd_message(">>| Skipped Intro (+85s)", 2.2)
+        mp.osd_message(">>| Skipped Intro (+85s)", 2.0)
+    end
+end
+
+local function do_skip_outro_ed()
+    local cur_t = mp.get_property_number("time-pos", 0) or 0
+    local dur = mp.get_property_number("duration", 0) or 0
+    if player_ctx.ed_start and player_ctx.ed_end and cur_t >= (player_ctx.ed_start - 10.0) and cur_t < (player_ctx.ed_end - 1.0) then
+        mp.commandv("seek", player_ctx.ed_end, "absolute")
+        mp.osd_message(">>| Skipped Ending (AniSkip)", 2.2)
+    elseif dur > 120.0 and (dur - cur_t) <= 180.0 then
+        mp.commandv("seek", math.max(cur_t, dur - 8.0), "absolute")
+        mp.osd_message(">>| Skipped to End", 2.0)
     else
         mp.commandv("seek", 85.0, "relative")
-        mp.osd_message(">>| Jumped +85s", 1.8)
+        mp.osd_message(">>| Jumped Ending (+85s)", 2.0)
+    end
+end
+
+local function do_skip_intro_or_outro()
+    local cur_t = mp.get_property_number("time-pos", 0) or 0
+    if player_ctx.ed_start and player_ctx.ed_end and cur_t >= (player_ctx.ed_start - 2.0) and cur_t < (player_ctx.ed_end - 1.0) then
+        do_skip_outro_ed()
+    else
+        do_skip_intro_op()
     end
 end
 
@@ -1223,11 +1281,6 @@ local function adjust_sub_delay(delta)
 end
 
 local function render_player_buttons()
-    local cur_t = mp.get_property_number("time-pos", 0) or 0
-    local dur = mp.get_property_number("duration", 0) or 0
-    local now = mp.get_time()
-    local hover_alive = now <= hover_active_until
-
     active_hitboxes = {}
     local lines = {}
 
@@ -1244,32 +1297,16 @@ local function render_player_buttons()
         table.insert(active_hitboxes, { id = id, x1 = x1, y1 = y1, x2 = x2, y2 = y2 })
     end
 
-    -- 1. Skip Intro / Skip Outro Pill (elevated safely above OSC)
-    local in_op = player_ctx.op_start and player_ctx.op_end and cur_t >= (player_ctx.op_start - 1.0) and cur_t < (player_ctx.op_end - 1.5)
-    local in_ed = player_ctx.ed_start and player_ctx.ed_end and cur_t >= (player_ctx.ed_start - 1.0) and cur_t < (player_ctx.ed_end - 1.5)
-    local op_fallback = (not player_ctx.op_end) and hover_alive and cur_t >= 2.0 and cur_t <= 150.0
-    if in_op or op_fallback then
-        draw_pill("skip_op", 978, 540, 1236, 584, ">>|  SKIP INTRO  [Tab]", "&HF8BD38&")
-    elseif in_ed then
-        draw_pill("skip_ed", 978, 540, 1236, 584, ">>|  SKIP OUTRO  [Tab]", "&HF8BD38&")
-    end
-
-    -- 2. Next Episode Pill (ED, >= 88%, final 90s, or hover in final 35%)
-    local near_end = dur > 60.0 and ((cur_t / dur) >= 0.88 or (dur - cur_t) <= 90.0 or (hover_alive and (cur_t / dur) >= 0.65))
-    if player_ctx.next_ep and (in_ed or near_end) then
-        draw_pill("next_ep", 938, 590, 1236, 634, string.format(">>|  NEXT EPISODE: Ep %d  [n/N]", player_ctx.next_ep), "&HFA8BA7&")
-    end
-
-    -- 3. Interactive Subtitle Sync Bar ([S] or [i] HUD — elevated cleanly above mpv OSC!)
-    if sub_bar_open then
+    -- Embedded inside Solus Info HUD ([i]/[I]) or Sub Sync ([S]) — zero random auto popups!
+    if sub_bar_open or hud_visible then
         local delay = mp.get_property_number("sub-delay", 0.0) or 0.0
-        local sy1 = hud_visible and 390 or 516
-        local sy2 = sy1 + 96
+        local sy1 = hud_visible and 388 or 486
+        local sy2 = sy1 + 92
         local py1 = sy1 + 10
-        local py2 = sy1 + 48
+        local py2 = sy1 + 46
         table.insert(lines, string.format("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H100C09&\\1a&H14&\\p1}m 42 %d l 1238 %d l 1238 %d l 42 %d{\\p0}", sy1, sy1, sy2, sy2))
         table.insert(lines, string.format("{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&H24BFFB&\\p1}m 42 %d l 1238 %d l 1238 %d l 42 %d{\\p0}", sy1, sy1, sy2, sy2))
-        table.insert(lines, string.format("{\\an7\\pos(62,%d)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}SUB SYNC %+.2fs", sy1 + 20, delay))
+        table.insert(lines, string.format("{\\an7\\pos(62,%d)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}SUB SYNC %+.2fs", sy1 + 19, delay))
         draw_pill("sub_m500", 214, py1, 274, py2, "-5s", "&H24BFFB&")
         draw_pill("sub_m100", 280, py1, 340, py2, "-1s", "&H24BFFB&")
         draw_pill("sub_m20",  346, py1, 414, py2, "-0.2s", "&H24BFFB&")
@@ -1283,7 +1320,25 @@ local function render_player_buttons()
         draw_pill("sub_cls",  982, py1, 1028, py2, "X", "&H5E3FF4&")
 
         local cue_preview = find_active_cue_preview(delay)
-        table.insert(lines, string.format("{\\an7\\pos(62,%d)\\bord0\\shad0\\fs14\\1c&HFAF4F0&}%s   {\\1c%s}[%s]", sy1 + 60, cue_preview, sync_status_col, esc_ass(sync_status_msg)))
+        local status_txt = utf8_truncate(esc_ass(sync_status_msg), 56)
+        table.insert(lines, string.format("{\\an7\\pos(62,%d)\\bord0\\shad0\\fs14\\1c&HFAF4F0&}%s", sy1 + 58, cue_preview))
+        table.insert(lines, string.format("{\\an7\\pos(620,%d)\\bord0\\shad0\\fs14\\1c%s}[%s]", sy1 + 58, sync_status_col, status_txt))
+
+        -- Quick Episode Controls bar directly below SUB SYNC section inside HUD
+        local cy1 = sy2 + 8
+        local cy2 = cy1 + 52
+        local cpy1 = cy1 + 8
+        local cpy2 = cy2 - 8
+        table.insert(lines, string.format("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H100C09&\\1a&H14&\\p1}m 42 %d l 1238 %d l 1238 %d l 42 %d{\\p0}", cy1, cy1, cy2, cy2))
+        table.insert(lines, string.format("{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&HFA8BA7&\\p1}m 42 %d l 1238 %d l 1238 %d l 42 %d{\\p0}", cy1, cy1, cy2, cy2))
+        table.insert(lines, string.format("{\\an7\\pos(62,%d)\\bord0\\shad0\\fs15\\b1\\1c&HFA8BA7&}CONTROLS", cy1 + 17))
+        draw_pill("ctrl_skip_op", 214, cpy1, 470, cpy2, ">>|  SKIP INTRO  [Tab]", "&HF8BD38&")
+        draw_pill("ctrl_skip_ed", 482, cpy1, 728, cpy2, ">>|  SKIP ENDING", "&HF8BD38&")
+        if player_ctx.next_ep then
+            draw_pill("ctrl_next_ep", 740, cpy1, 1028, cpy2, string.format(">>|  NEXT EPISODE: Ep %d  [n/N]", player_ctx.next_ep), "&HFA8BA7&")
+        else
+            table.insert(lines, string.format("{\\an7\\pos(750,%d)\\bord0\\shad0\\fs15\\1c&H686058&}Final Episode in Series", cy1 + 17))
+        end
     end
 
     if #lines == 0 then
@@ -1302,18 +1357,20 @@ local function snap_sub_to_voice()
         return
     end
     sync_in_progress = true
-    sync_status_msg = "Analyzing voice track & correlating (-150s..+150s)..."
+    sync_status_msg = "Analyzing 4 speech scenes & cadence (-150s..+150s)..."
     sync_status_col = "&HF8BD38&"
-    mp.osd_message("◈ Analyzing speech audio (-150s..+150s)... please wait", 3.5)
+    mp.osd_message("◈ Analyzing voice cadence & sync (-150s..+150s)... please wait", 3.5)
     mp.commandv("script-message", "solus-ipc-auto-sync-sub", string.format("%.2f", cur_t))
     render_player_buttons()
 end
 
 local function handle_btn_click()
     local id = hovered_btn_id
-    if id == "skip_op" or id == "skip_ed" then
-        do_skip_intro_or_outro()
-    elseif id == "next_ep" then
+    if id == "ctrl_skip_op" then
+        do_skip_intro_op()
+    elseif id == "ctrl_skip_ed" then
+        do_skip_outro_ed()
+    elseif id == "ctrl_next_ep" then
         do_next_episode()
     elseif id == "sub_m500" then
         adjust_sub_delay(-5.0)
@@ -1635,6 +1692,7 @@ pub fn shared_mpv_kv_flags(
     if !subs_disabled && opts.embedded_sub.has_baked_english() && wants_non_english {
         if let Some(slug) = opts.hardsub_shield.shader_slug() {
             let (top, bot) = opts.hardsub_band.bounds();
+            let (sub_pos, margin_y) = opts.hardsub_band.sub_alignment();
             if let Some(hs_path) = crate::services::shaders::ensure_hardsub_shader_file(slug, top, bot) {
                 let hs_str = hs_path.to_string_lossy().into_owned();
                 if let Some(existing) = item_kv.iter_mut().find(|k| k.starts_with("glsl-shaders=")) {
@@ -1644,23 +1702,31 @@ pub fn shared_mpv_kv_flags(
                     item_kv.push(format!("glsl-shaders={hs_str}"));
                 }
             }
+            item_kv.push("sub-use-margins=no".to_string());
+            item_kv.push("sub-ass-force-margins=no".to_string());
             item_kv.push("sub-border-style=outline-and-shadow".to_string());
             item_kv.push("sub-border-size=2.6".to_string());
             item_kv.push("sub-shadow-offset=1.0".to_string());
-            item_kv.push("sub-margin-y=26".to_string());
-            item_kv.push("sub-pos=96".to_string());
+            item_kv.push(format!("sub-margin-y={margin_y}"));
+            item_kv.push(format!("sub-pos={sub_pos}"));
             item_kv.push("sub-ass-override=force".to_string());
         } else {
             match opts.hardsub_shield {
                 HardsubShieldMode::FrameLift => {
-                    item_kv.push("video-align-y=-0.65".to_string());
-                    item_kv.push("sub-border-style=opaque-box".to_string());
-                    item_kv.push("sub-back-color=0.04/0.04/0.06/0.94".to_string());
-                    item_kv.push("sub-margin-y=18".to_string());
+                    item_kv.push("video-zoom=-0.16".to_string());
+                    item_kv.push("video-align-y=-1.0".to_string());
+                    item_kv.push("sub-use-margins=yes".to_string());
+                    item_kv.push("sub-ass-force-margins=yes".to_string());
+                    item_kv.push("sub-border-style=outline-and-shadow".to_string());
+                    item_kv.push("sub-border-size=2.4".to_string());
+                    item_kv.push("sub-shadow-offset=1.0".to_string());
+                    item_kv.push("sub-margin-y=6".to_string());
                     item_kv.push("sub-pos=99".to_string());
                     item_kv.push("sub-ass-override=force".to_string());
                 }
                 HardsubShieldMode::TopEdge => {
+                    item_kv.push("sub-use-margins=no".to_string());
+                    item_kv.push("sub-ass-force-margins=no".to_string());
                     item_kv.push("sub-border-style=outline-and-shadow".to_string());
                     item_kv.push("sub-border-size=2.6".to_string());
                     item_kv.push("sub-shadow-offset=1.0".to_string());
@@ -2065,12 +2131,17 @@ mod tests {
         let shield_args = build_mpv_direct_args(&o_ar, "https://vmpx.online/master.m3u8", None);
         assert!(shield_args.contains(&"--secondary-sid=no".to_string()));
         assert!(shield_args.contains(&"--sub-auto=no".to_string()));
-        assert!(shield_args.iter().any(|a| a.starts_with("--glsl-shaders=") && a.contains("/tmp/anime4k.glsl") && a.contains("solus_hs_blur_72_97.glsl")));
+        assert!(shield_args.iter().any(|a| a.starts_with("--glsl-shaders=") && a.contains("/tmp/anime4k.glsl") && a.contains("solus_hs_blur_70_100.glsl")));
+        assert!(shield_args.contains(&"--sub-use-margins=no".to_string()));
+        assert!(shield_args.contains(&"--sub-pos=89".to_string()));
         assert!(shield_args.contains(&"--sub-border-style=outline-and-shadow".to_string()));
 
         o_ar.hardsub_shield = HardsubShieldMode::FrameLift;
         let lift_args = build_mpv_direct_args(&o_ar, "https://vmpx.online/master.m3u8", None);
-        assert!(lift_args.contains(&"--video-align-y=-0.65".to_string()));
-        assert!(lift_args.contains(&"--sub-border-style=opaque-box".to_string()));
+        assert!(lift_args.contains(&"--video-zoom=-0.16".to_string()));
+        assert!(lift_args.contains(&"--video-align-y=-1.0".to_string()));
+        assert!(lift_args.contains(&"--sub-use-margins=yes".to_string()));
+        assert!(lua_text.contains("ctrl_skip_op") && lua_text.contains("ctrl_skip_ed") && lua_text.contains("ctrl_next_ep"));
+        assert!(lua_text.contains("utf8_truncate"));
     }
 }

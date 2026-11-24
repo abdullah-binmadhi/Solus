@@ -480,7 +480,7 @@ pub fn ensure_hardsub_shader_file(engine_slug: &str, band_top: f32, band_bot: f3
     }
     let dir = ensure_shaders_installed().ok()?;
     let top_i = (band_top.clamp(0.55, 0.94) * 100.0).round() as u32;
-    let bot_i = (band_bot.clamp(0.85, 0.995) * 100.0).round() as u32;
+    let bot_i = (band_bot.clamp(0.85, 0.999) * 100.0).round() as u32;
     let path = dir.join(format!("solus_hs_{engine_slug}_{top_i}_{bot_i}.glsl"));
 
     let glsl = match engine_slug {
@@ -493,11 +493,11 @@ vec4 hook() {{
     vec4 orig = HOOKED_tex(HOOKED_pos);
     float top = {band_top:.3};
     float bot = {band_bot:.3};
-    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.04 || HOOKED_pos.x > 0.96) {{
+    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.03 || HOOKED_pos.x > 0.97) {{
         return orig;
     }}
-    float w_v = smoothstep(top, top + 0.022, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.015, bot, HOOKED_pos.y));
-    float w_h = smoothstep(0.04, 0.09, HOOKED_pos.x) * (1.0 - smoothstep(0.91, 0.96, HOOKED_pos.x));
+    float w_v = smoothstep(top, top + 0.020, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.002, bot, HOOKED_pos.y));
+    float w_h = smoothstep(0.03, 0.07, HOOKED_pos.x) * (1.0 - smoothstep(0.93, 0.97, HOOKED_pos.x));
     float w = w_v * w_h;
     vec2 step_px = HOOKED_pt * 4.5;
     vec3 acc = vec3(0.0);
@@ -509,54 +509,90 @@ vec4 hook() {{
             norm += wt;
         }}
     }}
-    vec3 blurred = (acc / norm) * 0.20;
-    return vec4(mix(orig.rgb, blurred, w * 0.96), orig.a);
+    vec3 blurred = (acc / norm) * 0.18;
+    return vec4(mix(orig.rgb, blurred, w * 0.97), orig.a);
 }}
 "#),
         "inpaint" => format!(
 r#"//!HOOK MAIN
 //!BIND HOOKED
+//!SAVE HS_MASK
+//!COMPONENTS 1
+//!DESC Solus Hardsub Eradicator — Text Mask Pass ({top_i}..{bot_i})
+
+vec4 hook() {{
+    float top = {band_top:.3};
+    float bot = {band_bot:.3};
+    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.03 || HOOKED_pos.x > 0.97) {{
+        return vec4(0.0);
+    }}
+    vec3 orig = HOOKED_tex(HOOKED_pos).rgb;
+    float luma = dot(orig, vec3(0.299, 0.587, 0.114));
+    float sat = max(orig.r, max(orig.g, orig.b)) - min(orig.r, min(orig.g, orig.b));
+    vec2 px = HOOKED_pt;
+    float lmax = luma;
+    float lmin = luma;
+    for (int dy = -2; dy <= 2; ++dy) {{
+        for (int dx = -2; dx <= 2; ++dx) {{
+            vec3 s = HOOKED_tex(HOOKED_pos + vec2(float(dx) * 2.0, float(dy) * 2.0) * px).rgb;
+            float sl = dot(s, vec3(0.299, 0.587, 0.114));
+            lmax = max(lmax, sl);
+            lmin = min(lmin, sl);
+        }}
+    }}
+    float contrast = lmax - lmin;
+    float white_core = smoothstep(0.54, 0.72, luma) * (1.0 - smoothstep(0.22, 0.36, sat));
+    float stroke_edge = smoothstep(0.22, 0.40, contrast) * smoothstep(0.52, 0.74, lmax);
+    float m = max(white_core, stroke_edge);
+    return vec4(clamp(m, 0.0, 1.0), 0.0, 0.0, 1.0);
+}}
+
+//!HOOK MAIN
+//!BIND HOOKED
+//!BIND HS_MASK
 //!DESC Solus Hardsub Eradicator — Smart Text Inpainter ({top_i}..{bot_i})
 
 vec4 hook() {{
     vec4 orig = HOOKED_tex(HOOKED_pos);
     float top = {band_top:.3};
     float bot = {band_bot:.3};
-    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.08 || HOOKED_pos.x > 0.92) {{
+    if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.03 || HOOKED_pos.x > 0.97) {{
         return orig;
     }}
-    float luma = dot(orig.rgb, vec3(0.299, 0.587, 0.114));
-    float mx = max(orig.r, max(orig.g, orig.b));
-    float mn = min(orig.r, min(orig.g, orig.b));
-    float sat = mx - mn;
-
-    float local_max = luma;
-    float local_min = luma;
-    vec3 bg_acc = vec3(0.0);
-    float bg_wt = 0.0;
     vec2 px = HOOKED_pt;
+    float dilated = 0.0;
     for (int dy = -3; dy <= 3; ++dy) {{
         for (int dx = -3; dx <= 3; ++dx) {{
-            vec3 s = HOOKED_tex(HOOKED_pos + vec2(float(dx) * 2.5, float(dy) * 2.5) * px).rgb;
-            float sl = dot(s, vec3(0.299, 0.587, 0.114));
-            float smx = max(s.r, max(s.g, s.b));
-            float smn = min(s.r, min(s.g, s.b));
-            local_max = max(local_max, sl);
-            local_min = min(local_min, sl);
-            bool is_stroke = (sl > 0.72 && (smx - smn) < 0.24) || (sl < 0.14 && abs(dx) <= 1 && abs(dy) <= 1);
-            if (!is_stroke && (abs(dx) + abs(dy)) >= 2) {{
-                bg_acc += s;
-                bg_wt += 1.0;
-            }}
+            float d = HS_MASK_tex(HOOKED_pos + vec2(float(dx) * 2.5, float(dy) * 2.5) * px).r;
+            dilated = max(dilated, d);
         }}
     }}
-    bool is_sub_core = (luma > 0.70 && sat < 0.24 && (local_max - local_min) > 0.42);
-    bool is_sub_halo = (local_max > 0.72 && luma < 0.22);
-    if ((is_sub_core || is_sub_halo) && bg_wt > 0.5) {{
-        vec3 filled = (bg_acc / bg_wt) * 0.72;
-        return vec4(filled, orig.a);
+    float w_v = smoothstep(top, top + 0.018, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.002, bot, HOOKED_pos.y));
+    float w_h = smoothstep(0.03, 0.07, HOOKED_pos.x) * (1.0 - smoothstep(0.93, 0.97, HOOKED_pos.x));
+    float w_zone = w_v * w_h;
+    dilated *= w_zone;
+    if (dilated < 0.02) {{
+        return orig;
     }}
-    return orig;
+    vec3 bg = vec3(0.0);
+    float wt = 0.0;
+    for (int ring = 1; ring <= 3; ++ring) {{
+        float rdist = float(ring) * 10.0;
+        for (int a = 0; a < 8; ++a) {{
+            float ang = float(a) * 0.78539816;
+            vec2 off = vec2(cos(ang) * rdist * 1.4, sin(ang) * rdist) * px;
+            vec2 sp = clamp(HOOKED_pos + off, vec2(0.002), vec2(0.998));
+            float sm = HS_MASK_tex(sp).r;
+            float clean = pow(max(0.0, 1.0 - sm), 3.0);
+            float w = clean / (1.0 + float(ring) * 0.6);
+            bg += HOOKED_tex(sp).rgb * w;
+            wt += w;
+        }}
+    }}
+    vec3 above = HOOKED_tex(vec2(HOOKED_pos.x, max(0.01, top - 0.015))).rgb;
+    vec3 fill = (wt > 0.05) ? (bg / wt) : above;
+    vec3 scrimmed = fill * 0.70;
+    return vec4(mix(orig.rgb, scrimmed, smoothstep(0.04, 0.42, dilated)), orig.a);
 }}
 "#),
         _ => format!(
@@ -571,11 +607,11 @@ vec4 hook() {{
     if (HOOKED_pos.y < top || HOOKED_pos.y > bot || HOOKED_pos.x < 0.03 || HOOKED_pos.x > 0.97) {{
         return orig;
     }}
-    float w_v = smoothstep(top, top + 0.015, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.010, bot, HOOKED_pos.y));
+    float w_v = smoothstep(top, top + 0.015, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.002, bot, HOOKED_pos.y));
     float w_h = smoothstep(0.03, 0.07, HOOKED_pos.x) * (1.0 - smoothstep(0.93, 0.97, HOOKED_pos.x));
     float w = w_v * w_h;
     vec3 matte = vec3(0.015, 0.015, 0.024);
-    return vec4(mix(orig.rgb, matte, w * 0.98), orig.a);
+    return vec4(mix(orig.rgb, matte, w * 0.99), orig.a);
 }}
 "#),
     };
@@ -830,13 +866,17 @@ mod tests {
     #[test]
     fn test_hardsub_eradicator_glsl_shaders_generated_cleanly() {
         for slug in ["blur", "inpaint", "matte"] {
-            let p = ensure_hardsub_shader_file(slug, 0.78, 0.97).expect("shader generated");
+            let p = ensure_hardsub_shader_file(slug, 0.77, 0.998).expect("shader generated");
             let content = std::fs::read_to_string(&p).unwrap();
             assert!(content.contains("//!HOOK MAIN"));
             assert!(content.contains("//!BIND HOOKED"));
             assert!(content.contains("vec4 hook()"));
+            if slug == "inpaint" {
+                assert!(content.contains("//!SAVE HS_MASK"));
+                assert!(content.contains("//!BIND HS_MASK"));
+            }
         }
-        assert!(ensure_hardsub_shader_file("unknown", 0.78, 0.97).is_none());
+        assert!(ensure_hardsub_shader_file("unknown", 0.77, 0.998).is_none());
     }
 
     #[test]

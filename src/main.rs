@@ -707,14 +707,21 @@ async fn main() -> anyhow::Result<()> {
                     let provider_id = state.active_provider_id.clone().unwrap_or_default();
                     let referer = state.active_stream_referer.clone();
                     let ref_sync = state.active_ref_sync_source.clone();
+                    let is_dub_audio = state
+                        .last_play_options
+                        .as_ref()
+                        .map(|o| o.dub)
+                        .unwrap_or(state.pending_dub);
+                    let target_lang = if is_dub_audio { Some("eng") } else { Some("jpn") };
                     let force_ipv4 = cfg.force_ipv4;
                     state.sub_sync_in_progress = true;
-                    state.show_toast("◈ Running Reference-Audio & Speech-VAD alignment...", unix_now());
+                    state.show_toast("◈ Running Reference-Audio & Speech-VAD v4 alignment...", unix_now());
                     let tx_sync = tx.clone();
                     tokio::spawn(async move {
                         let client = api::subtitles::build_http_client(force_ipv4, 8);
+                        let prov_hint = if provider_id.is_empty() { None } else { Some(provider_id.as_str()) };
                         let local_sub = if sub_path.starts_with("http://") || sub_path.starts_with("https://") {
-                            let (cached_path, _) = services::subsync::ensure_synchronized_subtitle(
+                            let (cached_path, _) = services::subsync::ensure_synchronized_subtitle_for_provider(
                                 &client,
                                 &sub_path,
                                 None,
@@ -722,6 +729,7 @@ async fn main() -> anyhow::Result<()> {
                                 anime_id,
                                 episode_num,
                                 &sub_code,
+                                prov_hint,
                             )
                             .await;
                             cached_path
@@ -732,7 +740,7 @@ async fn main() -> anyhow::Result<()> {
                             Some((u, r, s)) => (Some(u), r, s),
                             None => (None, None, None),
                         };
-                        let result = services::subsync::sync_subtitle_with_reference_or_vad(
+                        let result = services::subsync::sync_subtitle_with_reference_or_vad_for_lang(
                             &client,
                             &stream_url,
                             referer.as_deref(),
@@ -741,6 +749,7 @@ async fn main() -> anyhow::Result<()> {
                             ref_url.as_deref(),
                             ref_ref.as_deref(),
                             ref_sub.as_deref(),
+                            target_lang,
                         )
                         .await;
                         let _ = tx_sync
@@ -10084,7 +10093,20 @@ fn resolve_sync_stream_url(
         raw.to_string()
     };
 
-    if let Some(first_audio) = opts.audio_urls.first().filter(|u| !u.trim().is_empty()) {
+    let preferred_audio = if opts.dub {
+        opts.audio_urls.iter().find(|u| {
+            let low = u.to_ascii_lowercase();
+            low.contains("/en/") || low.contains("english") || low.contains("lang=en")
+        })
+    } else {
+        opts.audio_urls.iter().find(|u| {
+            let low = u.to_ascii_lowercase();
+            low.contains("/ja/") || low.contains("jpn") || low.contains("japanese") || low.contains("lang=ja")
+        })
+    }
+    .or_else(|| opts.audio_urls.first());
+
+    if let Some(first_audio) = preferred_audio.filter(|u| !u.trim().is_empty()) {
         return Some(wrap_if_needed(first_audio, false));
     }
 
@@ -10143,16 +10165,22 @@ fn resolve_clean_ref_sync_source(
         }
     };
 
+    let is_native_synced = |s: &api::subtitles::SubtitleOption| -> bool {
+        !s.url.trim().is_empty()
+            && !s.stream_label.contains("[Auto-Synced]")
+            && !s.url.contains("opensubtitles")
+            && !s.url.contains("strem.io")
+    };
     let ref_sub = clean
         .subtitles
         .iter()
         .find(|s| {
-            !s.url.trim().is_empty()
+            is_native_synced(s)
                 && (s.code == "eng"
                     || s.code == "en"
                     || s.name.to_ascii_lowercase().contains("english"))
         })
-        .or_else(|| clean.subtitles.iter().find(|s| !s.url.trim().is_empty()))
+        .or_else(|| clean.subtitles.iter().find(|s| is_native_synced(s)))
         .map(|s| s.url.clone());
 
     Some((ref_url, referer, ref_sub))
@@ -10479,10 +10507,11 @@ async fn start_playback(
                 });
 
             let stream_ref = opts.stream_url.as_deref().or(state.pending_master_url.as_deref());
+            let prov_hint = state.active_provider_id.as_deref();
 
             if let Ok((cached_path, sync_res)) = tokio::time::timeout(
                 Duration::from_secs(5),
-                services::subsync::ensure_synchronized_subtitle(
+                services::subsync::ensure_synchronized_subtitle_for_provider(
                     &client,
                     sub_u,
                     ref_sub_url,
@@ -10490,6 +10519,7 @@ async fn start_playback(
                     anime_id,
                     episode,
                     code,
+                    prov_hint,
                 ),
             )
             .await
@@ -10592,6 +10622,7 @@ async fn start_playback(
                 let anchor_pos = opts.start_pos.filter(|&p| p >= 185.0).unwrap_or(0.0);
                 let prov_id_bg = state.active_provider_id.clone().unwrap_or_default();
                 let ref_sync_bg = state.active_ref_sync_source.clone();
+                let target_lang_bg = if opts.dub { Some("eng") } else { Some("jpn") };
                 let force_ipv4_bg = cfg.force_ipv4;
                 let tx_bg = tx.clone();
                 tokio::spawn(async move {
@@ -10601,7 +10632,7 @@ async fn start_playback(
                         Some((u, r, s)) => (Some(u), r, s),
                         None => (None, None, None),
                     };
-                    let result = services::subsync::sync_subtitle_with_reference_or_vad(
+                    let result = services::subsync::sync_subtitle_with_reference_or_vad_for_lang(
                         &client,
                         &s_url_bg,
                         ref_bg.as_deref(),
@@ -10610,6 +10641,7 @@ async fn start_playback(
                         ref_u.as_deref(),
                         ref_r.as_deref(),
                         ref_s.as_deref(),
+                        target_lang_bg,
                     )
                     .await;
                     if result.applied && result.offset_seconds.abs() >= 0.45 {
