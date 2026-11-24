@@ -538,13 +538,13 @@ vec4 hook() {{
             band_hit = max(band_hit, HS_MASK_tex(vec2(probe_x, probe_y)).r);
         }}
     }}
-    float active = smoothstep(0.18, 0.45, band_hit);
-    if (active < 0.02) {{
+    float hs_alpha = smoothstep(0.18, 0.45, band_hit);
+    if (hs_alpha < 0.02) {{
         return orig;
     }}
     float w_v = smoothstep(top, top + 0.020, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.002, bot, HOOKED_pos.y));
     float w_h = smoothstep(0.03, 0.07, HOOKED_pos.x) * (1.0 - smoothstep(0.93, 0.97, HOOKED_pos.x));
-    float w = w_v * w_h * active;
+    float w = w_v * w_h * hs_alpha;
     vec2 step_px = HOOKED_pt * 4.5;
     vec3 acc = vec3(0.0);
     float norm = 0.0;
@@ -685,13 +685,13 @@ vec4 hook() {{
             band_hit = max(band_hit, HS_MASK_tex(vec2(probe_x, probe_y)).r);
         }}
     }}
-    float active = smoothstep(0.18, 0.45, band_hit);
-    if (active < 0.02) {{
+    float hs_alpha = smoothstep(0.18, 0.45, band_hit);
+    if (hs_alpha < 0.02) {{
         return orig;
     }}
     float w_v = smoothstep(top, top + 0.015, HOOKED_pos.y) * (1.0 - smoothstep(bot - 0.002, bot, HOOKED_pos.y));
     float w_h = smoothstep(0.03, 0.07, HOOKED_pos.x) * (1.0 - smoothstep(0.93, 0.97, HOOKED_pos.x));
-    float w = w_v * w_h * active;
+    float w = w_v * w_h * hs_alpha;
     vec3 matte = vec3(0.015, 0.015, 0.024);
     return vec4(mix(orig.rgb, matte, w * 0.99), orig.a);
 }}
