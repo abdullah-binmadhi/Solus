@@ -60,10 +60,11 @@ pub struct LastSeenBuild {
 }
 
 const BUILTIN_CURRENT_RELEASE_NOTES: &[&str] = &[
-    "[NEW] Direct MyAnimeList Sign-In (Zero Setup Required): Connect your MyAnimeList account directly inside Solus using just your username and password for full two-way syncing, or pull any public list by username alone. How to use: Press 'L' from the Home screen, press 'Tab' to focus MyAnimeList, then press 'p' for Password Login or 'u' for Username Sync.",
-    "[FIXED] Full AniList & MyAnimeList Library Sync: My Watchlist now pulls every anime from your connected AniList and MyAnimeList accounts across all 5 categories (Watching, Plan to Watch, Completed, On-Hold, and Dropped) so zero shows are left behind. How to use: Press 'R' on the Home screen (or 'r' inside 'L') to refresh your lists.",
-    "[NEW] Status Labels on Watchlist Cards: Every anime in My Watchlist now shows its status tag ( Watch, 󰃰 Plan, 󰄬 Done, 󰏤 Hold, 󰅖 Drop) right next to its rating and show type. How to use: Press '2' on the Home screen to jump directly to My Watchlist.",
-    "[NEW] Status & List Picker Popup: Label or move any anime between Watching, Plan to Watch, Completed, On-Hold, Dropped, or Remove across AniList, MyAnimeList, Both, or Local in one step. How to use: Highlight any anime and press '+' -> use 'Tab' or '←/→' to choose where to save, then press '1'–'6' (or '↑/↓' + 'Enter') to apply.",
+    "[NEW] 4-Stage Video Mastering & Unified Player Engines: Solus now powers mpv, mpv.net, and Celluloid with unified 4:4:4 chroma upscaling, Anime4K era restoration, debanding, and smooth motion interpolation. How to use: Open Settings ('s') or press 'a' (Shaders), 'd' (Deband), 'm' (Motion), and 'g' (Performance) during playback.",
+    "[NEW] Multi-Provider Stream Discovery & Clean/Hardsub Indicators: Automatically probes verified providers (ZokoAnime, MegaPlay Direct/Hardsub, Vidmoly, AnimeHeaven, AnimeGG, and HiAnime) with Clean [CLN] vs Hardsub [EN] tags and demuxed audio tracks. How to use: Press 'Enter' on an episode to pick a server and subtitle track cleanly (hardsubbed videos use their embedded subtitles only).",
+    "[NEW] Voice-Synced Subtitles (Audio Alignment + VAD): Automatically aligns external subtitles to dialogue using reference timing and voice-activity matching, and remembers clean provider offsets per anime. How to use: Press 'y' in the player to snap subtitles to speech immediately, or open the HUD ('i' / 'S') for manual delay steps.",
+    "[IMPROVED] Interactive Player HUD Controls: Skip Intro, Skip Outro, and Next Episode buttons live neatly inside the Solus HUD right under the SubSync bar for on-demand control without intrusive popups. How to use: Press 'i' or 'Shift+I' in the player to toggle or pin the HUD, or press 'Tab' to skip intro/outro and 'n' / 'N' for Next Episode.",
+    "[FIXED] Crisper Loading Screen & Thumbnail Persistence: Locked the launch loading bar alignment cleanly inside the Y2K card and fixed episode thumbnails disappearing after playback or overlays. How to use: Launch any episode with 'Enter'; your episode artwork stays intact when returning to menus.",
 ];
 
 /// Return plain-English release highlights for the currently running Solus build.
@@ -257,6 +258,24 @@ fn translate_note_lines(raw_line: &str) -> Vec<String> {
     {
         matched.push(format!(
             "{} Picture-in-Picture (PiP) Mode: Watch anime in a small floating corner window on top of other apps. How to use: Press 'p' in the player to toggle PiP, 'Shift+P' to move corners/resize, or toggle it in the Episode Launch Menu ('w'/'W') or Settings ('s').",
+            badge
+        ));
+    }
+    if s_lower.contains("libmpv") || s_lower.contains("mastering") || s_lower.contains("4:4:4") || s_lower.contains("anime4k") {
+        matched.push(format!(
+            "{} 4-Stage Video Mastering & Unified Player Engines: Solus now powers mpv, mpv.net, and Celluloid with unified 4:4:4 chroma upscaling, Anime4K era restoration, debanding, and smooth motion interpolation. How to use: Open Settings ('s') or press 'a' (Shaders), 'd' (Deband), 'm' (Motion), and 'g' (Performance) during playback.",
+            badge
+        ));
+    }
+    if s_lower.contains("provider") || s_lower.contains("megaplay") || s_lower.contains("animeheaven") || s_lower.contains("hardsub") {
+        matched.push(format!(
+            "{} Multi-Provider Stream Discovery & Clean/Hardsub Indicators: Automatically probes verified providers (ZokoAnime, MegaPlay Direct/Hardsub, Vidmoly, AnimeHeaven, AnimeGG, and HiAnime) with Clean [CLN] vs Hardsub [EN] tags and demuxed audio tracks. How to use: Press 'Enter' on an episode to pick a server and subtitle track cleanly (hardsubbed videos use their embedded subtitles only).",
+            badge
+        ));
+    }
+    if s_lower.contains("subsync") || s_lower.contains("alass") || s_lower.contains("earshot") || s_lower.contains("vad") {
+        matched.push(format!(
+            "{} Voice-Synced Subtitles (Audio Alignment + VAD): Automatically aligns external subtitles to dialogue using reference timing and voice-activity matching, and remembers clean provider offsets per anime. How to use: Press 'y' in the player to snap subtitles to speech immediately, or open the HUD ('i' / 'S') for manual delay steps.",
             badge
         ));
     }
@@ -996,11 +1015,12 @@ Automated build for commit `abcdef1`: feat(settings): add auto_fullscreen toggle
     #[test]
     fn test_default_release_notes_and_pip_hud_commit_translation() {
         let notes = default_current_release_notes();
-        assert_eq!(notes.len(), 4);
-        assert!(notes.iter().any(|n| n.contains("MyAnimeList") && n.contains("Password Login") && n.contains("How to use:")));
-        assert!(notes.iter().any(|n| n.contains("AniList") && n.contains("5 categories") && n.contains("How to use:")));
-        assert!(notes.iter().any(|n| n.contains("Status Labels on Watchlist Cards") && n.contains("Watch") && n.contains("How to use:")));
-        assert!(notes.iter().any(|n| n.contains("Status & List Picker Popup") && n.contains("'+'") && n.contains("How to use:")));
+        assert_eq!(notes.len(), 5);
+        assert!(notes.iter().any(|n| n.contains("4-Stage Video Mastering") && n.contains("How to use:")));
+        assert!(notes.iter().any(|n| n.contains("Multi-Provider Stream Discovery") && n.contains("How to use:")));
+        assert!(notes.iter().any(|n| n.contains("Voice-Synced Subtitles") && n.contains("How to use:")));
+        assert!(notes.iter().any(|n| n.contains("Interactive Player HUD Controls") && n.contains("How to use:")));
+        assert!(notes.iter().any(|n| n.contains("Loading Screen & Thumbnail Persistence") && n.contains("How to use:")));
         for n in &notes {
             let lower = n.to_ascii_lowercase();
             assert!(!lower.contains("plain english"), "should not mention plain english: {n}");
@@ -1008,8 +1028,9 @@ Automated build for commit `abcdef1`: feat(settings): add auto_fullscreen toggle
         }
 
         let combined = simplify_release_notes(
-            "Automated build for commit `25ed768`: Sync all 5 tracker statuses into Watchlist with Solus status labels and Bento picker",
+            "Automated build for commit `955e836`: feat(subsync,shaders,ui): alass-core+earshot VAD v5 and unified libmpv mastering",
         );
-        assert!(combined.iter().any(|n| n.contains("Status & List Picker Popup")));
+        assert!(combined.iter().any(|n| n.contains("Voice-Synced Subtitles")));
+        assert!(combined.iter().any(|n| n.contains("4-Stage Video Mastering")));
     }
 }
