@@ -45,97 +45,6 @@ impl DependencyStatus {
 }
 
 /// Options passed to the playback engine when launching an episode.
-/// Hardsub visual overlap protection mode when pairing non-English subtitles
-/// (e.g. Arabic) with providers that have burned-in English frames.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HardsubShieldMode {
-    #[default]
-    #[serde(alias = "opaque-mask")]
-    FrostedBlur,
-    SmartInpaint,
-    TotalMatte,
-    FrameLift,
-    TopEdge,
-    Off,
-}
-
-impl HardsubShieldMode {
-    pub fn next(self) -> Self {
-        match self {
-            Self::FrostedBlur => Self::SmartInpaint,
-            Self::SmartInpaint => Self::TotalMatte,
-            Self::TotalMatte => Self::FrameLift,
-            Self::FrameLift => Self::TopEdge,
-            Self::TopEdge => Self::Off,
-            Self::Off => Self::FrostedBlur,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::FrostedBlur => "Frosted Blur",
-            Self::SmartInpaint => "Smart Inpaint",
-            Self::TotalMatte => "Total Blackout",
-            Self::FrameLift => "Frame Lift",
-            Self::TopEdge => "Top Edge",
-            Self::Off => "Off",
-        }
-    }
-
-    pub fn shader_slug(self) -> Option<&'static str> {
-        match self {
-            Self::FrostedBlur => Some("blur"),
-            Self::SmartInpaint => Some("inpaint"),
-            Self::TotalMatte => Some("matte"),
-            Self::FrameLift | Self::TopEdge | Self::Off => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HardsubBandHeight {
-    Compact,
-    #[default]
-    Standard,
-    Tall,
-}
-
-impl HardsubBandHeight {
-    pub fn next(self) -> Self {
-        match self {
-            Self::Compact => Self::Standard,
-            Self::Standard => Self::Tall,
-            Self::Tall => Self::Compact,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Compact => "Compact (12%)",
-            Self::Standard => "Standard (19%)",
-            Self::Tall => "Tall (25%)",
-        }
-    }
-
-    pub fn bounds(self) -> (f32, f32) {
-        match self {
-            Self::Compact => (0.855, 0.995),
-            Self::Standard => (0.790, 0.995),
-            Self::Tall => (0.710, 0.995),
-        }
-    }
-
-    pub fn sub_alignment(self) -> (u8, u8) {
-        match self {
-            Self::Compact => (98, 6),
-            Self::Standard => (96, 6),
-            Self::Tall => (94, 6),
-        }
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PlayOptions {
     /// Title to pass to ani-cli as the search query
@@ -206,12 +115,6 @@ pub struct PlayOptions {
     /// Embedded/hardcoded subtitle status reported by the selected provider
     #[serde(default)]
     pub embedded_sub: crate::api::subtitles::EmbeddedSubtitleKind,
-    /// Visual protection mode for non-English subtitles over baked English streams
-    #[serde(default)]
-    pub hardsub_shield: HardsubShieldMode,
-    /// Band height preset for GPU hardsub eradication shaders
-    #[serde(default)]
-    pub hardsub_band: HardsubBandHeight,
 }
 
 /// Build the `ani-cli` command arguments for legacy fallback scraping.
@@ -984,132 +887,6 @@ end
 mp.add_forced_key_binding("i", "solus-toggle-hud", pin_info_hud)
 mp.add_forced_key_binding("I", "solus-pin-hud", pin_info_hud)
 
--- Hardsub Eradicator runtime toggler ([h] mode, [H] shader band height)
-local hs_shader_dir = "__SOLUS_HS_SHADER_DIR__"
-local shield_modes = {
-    { name = "Frosted Blur",   slug = "blur" },
-    { name = "Smart Inpaint",  slug = "inpaint" },
-    { name = "Total Blackout", slug = "matte" },
-    { name = "Frame Lift",     slug = nil },
-    { name = "Top Edge",       slug = nil },
-    { name = "Off",            slug = nil },
-}
-local band_sizes = {
-    { label = "Compact (12%)",  tag = "86_100", sub_pos = 98, margin_y = 6 },
-    { label = "Standard (19%)", tag = "79_100", sub_pos = 96, margin_y = 6 },
-    { label = "Tall (25%)",     tag = "71_100", sub_pos = 94, margin_y = 6 },
-}
-local shield_idx = 1
-local band_idx = 2
-
-local function solus_detect_initial_shield()
-    local shaders = mp.get_property_native("glsl-shaders") or {}
-    local found_hs = false
-    for _, p in ipairs(shaders) do
-        local s = tostring(p)
-        if s:find("solus_hs_", 1, true) then
-            found_hs = true
-            if s:find("solus_hs_inpaint_", 1, true) then shield_idx = 2
-            elseif s:find("solus_hs_matte_", 1, true) then shield_idx = 3
-            else shield_idx = 1 end
-            if s:find("_86_100.glsl", 1, true) then band_idx = 1
-            elseif s:find("_71_100.glsl", 1, true) then band_idx = 3
-            else band_idx = 2 end
-            break
-        end
-    end
-    if not found_hs then
-        local vay = mp.get_property_number("video-align-y", 0)
-        local vzoom = mp.get_property_number("video-zoom", 0)
-        local spos = mp.get_property_number("sub-pos", 100)
-        if vay < -0.2 or vzoom < -0.05 then shield_idx = 4
-        elseif spos <= 15 then shield_idx = 5
-        elseif mp.get_property("sub-border-style", "") == "outline-and-shadow" and spos >= 95 then shield_idx = 6 end
-    end
-end
-mp.register_event("file-loaded", solus_detect_initial_shield)
-
-local function solus_apply_hardsub_shield(announce)
-    local mode = shield_modes[shield_idx]
-    local band = band_sizes[band_idx]
-    local cur_shaders = mp.get_property_native("glsl-shaders") or {}
-    local next_shaders = {}
-    for _, p in ipairs(cur_shaders) do
-        if not tostring(p):find("solus_hs_", 1, true) then
-            table.insert(next_shaders, p)
-        end
-    end
-    if mode.slug ~= nil then
-        table.insert(next_shaders, hs_shader_dir .. "/solus_hs_" .. mode.slug .. "_" .. band.tag .. ".glsl")
-    end
-    mp.set_property_native("glsl-shaders", next_shaders)
-
-    if mode.name == "Frame Lift" then
-        mp.set_property_number("video-zoom", -0.16)
-        mp.set_property_number("video-align-y", -1.0)
-        mp.set_property("sub-use-margins", "yes")
-        mp.set_property("sub-ass-force-margins", "yes")
-        mp.set_property("sub-border-style", "outline-and-shadow")
-        mp.set_property_number("sub-border-size", 2.4)
-        mp.set_property_number("sub-shadow-offset", 1.0)
-        mp.set_property_number("sub-margin-y", 6)
-        mp.set_property_number("sub-pos", 99)
-        mp.set_property("sub-ass-override", "force")
-    elseif mode.name == "Top Edge" then
-        mp.set_property_number("video-zoom", 0)
-        mp.set_property_number("video-align-y", 0)
-        mp.set_property("sub-use-margins", "no")
-        mp.set_property("sub-ass-force-margins", "no")
-        mp.set_property("sub-border-style", "outline-and-shadow")
-        mp.set_property_number("sub-border-size", 2.6)
-        mp.set_property_number("sub-shadow-offset", 1.0)
-        mp.set_property_number("sub-margin-y", 18)
-        mp.set_property_number("sub-pos", 7)
-        mp.set_property("sub-ass-override", "force")
-    elseif mode.slug ~= nil then
-        mp.set_property_number("video-zoom", 0)
-        mp.set_property_number("video-align-y", 0)
-        mp.set_property("sub-use-margins", "no")
-        mp.set_property("sub-ass-force-margins", "no")
-        mp.set_property("sub-border-style", "outline-and-shadow")
-        mp.set_property_number("sub-border-size", 2.6)
-        mp.set_property_number("sub-shadow-offset", 1.0)
-        mp.set_property_number("sub-margin-y", band.margin_y)
-        mp.set_property_number("sub-pos", band.sub_pos)
-        mp.set_property("sub-ass-override", "force")
-    else
-        mp.set_property_number("video-zoom", 0)
-        mp.set_property_number("video-align-y", 0)
-        mp.set_property("sub-use-margins", "yes")
-        mp.set_property("sub-ass-force-margins", "no")
-        mp.set_property("sub-border-style", "outline-and-shadow")
-        mp.set_property_number("sub-margin-y", 38)
-        mp.set_property_number("sub-pos", 100)
-    end
-    if announce then
-        local msg = "◈ Hardsub Eradicator: " .. mode.name
-        if mode.slug ~= nil then
-            msg = msg .. " [" .. band.label .. "]"
-        end
-        mp.osd_message(msg, 2.4)
-    end
-end
-
-local function solus_cycle_hardsub_shield()
-    shield_idx = (shield_idx % #shield_modes) + 1
-    solus_apply_hardsub_shield(true)
-end
-
-local function solus_cycle_hardsub_band()
-    band_idx = (band_idx % #band_sizes) + 1
-    if shield_modes[shield_idx].slug == nil then
-        shield_idx = 1
-    end
-    solus_apply_hardsub_shield(true)
-end
-mp.add_forced_key_binding("h", "solus-hardsub-shield", solus_cycle_hardsub_shield)
-mp.add_forced_key_binding("H", "solus-hardsub-band", solus_cycle_hardsub_band)
-
 -- =============================================================================
 -- 5. Crunchyroll/Netflix Clickable Buttons ([Skip Intro/Outro], [Next Ep])
 --    & Elevated Sub Sync Bar ([S] / [i] / [-5s][-1s][-0.2s][◈ AUTO-SYNC][+0.2s][+1s][+5s])
@@ -1481,31 +1258,17 @@ mp.add_forced_key_binding("y", "solus-snap-sub-voice", snap_sub_to_voice)
 "##;
 
 pub fn ensure_solus_audio_lua() -> Option<PathBuf> {
-    // Pre-warm all 9 Hardsub Eradicator GLSL presets so runtime [h]/[H] cycling is instant.
-    for slug in ["blur", "inpaint", "matte"] {
-        for band in [
-            HardsubBandHeight::Compact,
-            HardsubBandHeight::Standard,
-            HardsubBandHeight::Tall,
-        ] {
-            let (top, bot) = band.bounds();
-            let _ = crate::services::shaders::ensure_hardsub_shader_file(slug, top, bot);
-        }
-    }
+    let _ = crate::services::shaders::ensure_shaders_installed();
     let dir = crate::config::Config::cache_dir()
         .unwrap_or_else(|_| env::temp_dir().join("solus-cache"));
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
-    let shader_dir_str = crate::services::shaders::get_shaders_dir()
-        .to_string_lossy()
-        .replace('\\', "/");
-    let rendered_lua = SOLUS_AUDIO_LUA.replace("__SOLUS_HS_SHADER_DIR__", &shader_dir_str);
     let path = dir.join("solus-audio.lua");
     let needs_write = std::fs::read_to_string(&path)
-        .map(|cur| cur != rendered_lua)
+        .map(|cur| cur != SOLUS_AUDIO_LUA)
         .unwrap_or(true);
-    if needs_write && std::fs::write(&path, &rendered_lua).is_err() {
+    if needs_write && std::fs::write(&path, SOLUS_AUDIO_LUA).is_err() {
         return None;
     }
     Some(path)
@@ -1637,6 +1400,7 @@ pub fn shared_mpv_kv_flags(
     // Per-item options
     let mut item_kv = vec![format!("force-media-title={} Episode {}", opts.title, opts.episode)];
     let subs_disabled = opts.subtitles_disabled
+        || opts.embedded_sub.has_baked_english()
         || opts
             .sub_lang
             .as_deref()
@@ -1683,62 +1447,6 @@ pub fn shared_mpv_kv_flags(
     if let Some(ref style) = opts.sub_style {
         for flag in style.to_mpv_flags() {
             item_kv.push(flag.trim_start_matches("--").to_string());
-        }
-    }
-    let wants_non_english = opts.sub_lang.as_deref().is_some_and(|l| {
-        let low = l.trim().to_ascii_lowercase();
-        !low.is_empty() && low != "none" && low != "off" && !low.starts_with("eng") && low != "en"
-    });
-    if !subs_disabled && opts.embedded_sub.has_baked_english() && wants_non_english {
-        if let Some(slug) = opts.hardsub_shield.shader_slug() {
-            let (top, bot) = opts.hardsub_band.bounds();
-            let (sub_pos, margin_y) = opts.hardsub_band.sub_alignment();
-            if let Some(hs_path) = crate::services::shaders::ensure_hardsub_shader_file(slug, top, bot) {
-                let hs_str = hs_path.to_string_lossy().into_owned();
-                if let Some(existing) = item_kv.iter_mut().find(|k| k.starts_with("glsl-shaders=")) {
-                    existing.push_str(crate::services::shaders::shader_path_separator());
-                    existing.push_str(&hs_str);
-                } else {
-                    item_kv.push(format!("glsl-shaders={hs_str}"));
-                }
-            }
-            item_kv.push("sub-use-margins=no".to_string());
-            item_kv.push("sub-ass-force-margins=no".to_string());
-            item_kv.push("sub-border-style=outline-and-shadow".to_string());
-            item_kv.push("sub-border-size=2.6".to_string());
-            item_kv.push("sub-shadow-offset=1.0".to_string());
-            item_kv.push(format!("sub-margin-y={margin_y}"));
-            item_kv.push(format!("sub-pos={sub_pos}"));
-            item_kv.push("sub-ass-override=force".to_string());
-        } else {
-            match opts.hardsub_shield {
-                HardsubShieldMode::FrameLift => {
-                    item_kv.push("video-zoom=-0.16".to_string());
-                    item_kv.push("video-align-y=-1.0".to_string());
-                    item_kv.push("sub-use-margins=yes".to_string());
-                    item_kv.push("sub-ass-force-margins=yes".to_string());
-                    item_kv.push("sub-border-style=outline-and-shadow".to_string());
-                    item_kv.push("sub-border-size=2.4".to_string());
-                    item_kv.push("sub-shadow-offset=1.0".to_string());
-                    item_kv.push("sub-margin-y=6".to_string());
-                    item_kv.push("sub-pos=99".to_string());
-                    item_kv.push("sub-ass-override=force".to_string());
-                }
-                HardsubShieldMode::TopEdge => {
-                    item_kv.push("sub-use-margins=no".to_string());
-                    item_kv.push("sub-ass-force-margins=no".to_string());
-                    item_kv.push("sub-border-style=outline-and-shadow".to_string());
-                    item_kv.push("sub-border-size=2.6".to_string());
-                    item_kv.push("sub-shadow-offset=1.0".to_string());
-                    item_kv.push("sub-margin-y=18".to_string());
-                    item_kv.push("sub-pos=7".to_string());
-                    item_kv.push("sub-ass-override=force".to_string());
-                }
-                HardsubShieldMode::FrostedBlur
-                | HardsubShieldMode::SmartInpaint
-                | HardsubShieldMode::TotalMatte
-                | HardsubShieldMode::Off => {}
-            }
         }
     }
 
@@ -2007,8 +1715,6 @@ mod tests {
             audio_urls: Vec::new(),
             has_demuxed_audio: false,
             embedded_sub: crate::api::subtitles::EmbeddedSubtitleKind::None,
-            hardsub_shield: HardsubShieldMode::FrostedBlur,
-            hardsub_band: HardsubBandHeight::Standard,
         }
     }
 
@@ -2122,27 +1828,20 @@ mod tests {
         assert!(demux_args.contains(&"--audio-file=https://fetch.nexabloom.top/a/audio/ja/index.m3u8".to_string()));
         assert!(demux_args.contains(&"--audio-file=https://fetch.nexabloom.top/a/audio/en/index.m3u8".to_string()));
 
-        // Verify strict soft-track isolation and GPU Hardsub Eradicator for Arabic on baked English
+        // Verify strict soft-track isolation and disabled external subtitles for hardsubbed streams
         let mut o_ar = opts("Chainsmoker Cat", 1, "900p", false);
         o_ar.sub_lang = Some("Arabic".to_string());
         o_ar.sub_url = Some("/tmp/ar.vtt".to_string());
         o_ar.embedded_sub = crate::api::subtitles::EmbeddedSubtitleKind::HardsubEn;
-        o_ar.hardsub_shield = HardsubShieldMode::FrostedBlur;
-        o_ar.hardsub_band = HardsubBandHeight::Tall;
         o_ar.glsl_shaders = Some("/tmp/anime4k.glsl".to_string());
-        let shield_args = build_mpv_direct_args(&o_ar, "https://vmpx.online/master.m3u8", None);
-        assert!(shield_args.contains(&"--secondary-sid=no".to_string()));
-        assert!(shield_args.contains(&"--sub-auto=no".to_string()));
-        assert!(shield_args.iter().any(|a| a.starts_with("--glsl-shaders=") && a.contains("/tmp/anime4k.glsl") && a.contains("solus_hs_blur_71_100.glsl")));
-        assert!(shield_args.contains(&"--sub-use-margins=no".to_string()));
-        assert!(shield_args.contains(&"--sub-pos=94".to_string()));
-        assert!(shield_args.contains(&"--sub-border-style=outline-and-shadow".to_string()));
-
-        o_ar.hardsub_shield = HardsubShieldMode::FrameLift;
-        let lift_args = build_mpv_direct_args(&o_ar, "https://vmpx.online/master.m3u8", None);
-        assert!(lift_args.contains(&"--video-zoom=-0.16".to_string()));
-        assert!(lift_args.contains(&"--video-align-y=-1.0".to_string()));
-        assert!(lift_args.contains(&"--sub-use-margins=yes".to_string()));
+        let hsub_args = build_mpv_direct_args(&o_ar, "https://vmpx.online/master.m3u8", None);
+        assert!(hsub_args.contains(&"--secondary-sid=no".to_string()));
+        assert!(hsub_args.contains(&"--sub-auto=no".to_string()));
+        assert!(hsub_args.contains(&"--sid=no".to_string()));
+        assert!(hsub_args.contains(&"--sub-visibility=no".to_string()));
+        assert!(!hsub_args.iter().any(|a| a.starts_with("--sub-file=")));
+        assert!(!hsub_args.iter().any(|a| a.contains("solus_hs_")));
+        assert!(!lua_text.contains("solus_hs_"));
         assert!(lua_text.contains("ctrl_skip_op") && lua_text.contains("ctrl_skip_ed") && lua_text.contains("ctrl_next_ep"));
         assert!(lua_text.contains("utf8_truncate"));
     }

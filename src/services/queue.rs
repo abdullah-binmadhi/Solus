@@ -942,8 +942,16 @@ pub async fn resolve_item_prefetch(
         _ => return None,
     };
 
+    let first_embedded = stream_info
+        .providers
+        .first()
+        .map(|p| p.embedded_sub)
+        .unwrap_or_default();
     let pref_lower = item.sub_lang.trim().to_lowercase();
-    let subs_disabled = pref_lower == "none" || pref_lower == "off" || pref_lower == "no subtitles";
+    let subs_disabled = first_embedded.has_baked_english()
+        || pref_lower == "none"
+        || pref_lower == "off"
+        || pref_lower == "no subtitles";
     let (chosen_sub, sub_lang, mut sub_url) = if subs_disabled {
         (None, Some("none".to_string()), None)
     } else {
@@ -1041,13 +1049,7 @@ pub async fn resolve_item_prefetch(
         referer: stream_info.providers.first().and_then(|p| p.referer.clone()),
         audio_urls: chosen_audio_urls,
         has_demuxed_audio: chosen_demuxed,
-        embedded_sub: stream_info
-            .providers
-            .first()
-            .map(|p| p.embedded_sub)
-            .unwrap_or_default(),
-        hardsub_shield: crate::api::player::HardsubShieldMode::FrostedBlur,
-        hardsub_band: crate::api::player::HardsubBandHeight::Standard,
+        embedded_sub: first_embedded,
     };
 
     Some(ResolvedPrefetch {
@@ -1055,7 +1057,11 @@ pub async fn resolve_item_prefetch(
         resolved_at,
         sub_synced,
         master_url: stream_info.master_url,
-        subtitles: stream_info.subtitles,
+        subtitles: if first_embedded.has_baked_english() {
+            Vec::new()
+        } else {
+            stream_info.subtitles
+        },
         audio_tracks: stream_info.audio_tracks,
         dub_available: stream_info.dub_available,
         ladder: stream_info.ladder,
@@ -1111,8 +1117,6 @@ mod tests {
                 audio_urls: Vec::new(),
                 has_demuxed_audio: false,
                 embedded_sub: Default::default(),
-                hardsub_shield: crate::api::player::HardsubShieldMode::FrostedBlur,
-                hardsub_band: crate::api::player::HardsubBandHeight::Standard,
             },
             resolved_at,
             sub_synced: false,

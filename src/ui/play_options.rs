@@ -661,8 +661,23 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
     let sub_inner = sub_block.inner(layout.subtitle_rect);
     frame.render_widget(sub_block, layout.subtitle_rect);
 
+    let active_prov_hardsub = state
+        .playback_providers
+        .get(state.playback_provider_cursor)
+        .is_some_and(|p| p.embedded_sub.has_baked_english());
     let sub_budget = (sub_inner.width as usize).saturating_sub(7).max(4);
-    let (sub_items, sub_sel): (Vec<ListItem>, usize) = if state.is_loading_subs && state.playback_sub_languages.len() <= 2 {
+    let (sub_items, sub_sel): (Vec<ListItem>, usize) = if active_prov_hardsub {
+        (
+            vec![ListItem::new(Line::from(vec![
+                Span::styled(" [●] ", Style::default().fg(Color::Rgb(248, 189, 56)).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    clamp_label("Embedded EN (Hardsub only)", sub_budget),
+                    Style::default().fg(Color::Rgb(248, 189, 56)).add_modifier(Modifier::BOLD),
+                ),
+            ]))],
+            0,
+        )
+    } else if state.is_loading_subs && state.playback_sub_languages.len() <= 2 {
         (
             vec![
                 ListItem::new(Line::from(vec![
@@ -707,53 +722,8 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
         (items, sel)
     };
 
-    let active_prov_hardsub = state
-        .playback_providers
-        .get(state.playback_provider_cursor)
-        .is_some_and(|p| p.embedded_sub.has_baked_english());
-    let chosen_non_english = state
-        .playback_sub_languages
-        .get(state.playback_sub_cursor)
-        .is_some_and(|s| !s.is_none() && !s.code.starts_with("eng"));
-    let show_hardsub_banner = active_prov_hardsub && chosen_non_english && sub_inner.height >= 5;
-
-    let (sub_list_area, shield_area) = if show_hardsub_banner {
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(2)])
-            .split(sub_inner);
-        (split[0], Some(split[1]))
-    } else {
-        (sub_inner, None)
-    };
-
     let mut sub_state = ListState::default().with_selected(Some(sub_sel));
-    frame.render_stateful_widget(List::new(sub_items), sub_list_area, &mut sub_state);
-
-    if let Some(s_area) = shield_area {
-        let band_hint = if state.hardsub_shield_mode.shader_slug().is_some() {
-            format!(" [B] Band: {}", state.hardsub_band_height.label())
-        } else {
-            String::new()
-        };
-        let shield_msg = Paragraph::new(vec![
-            Line::from(Span::styled(
-                clamp_label(" ⚠ Stream has Baked EN Sub", (s_area.width as usize).saturating_sub(1)),
-                Style::default().fg(Color::Rgb(248, 189, 56)).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(vec![
-                Span::styled(" [b] ", Style::default().fg(Color::Black).bg(Color::Rgb(248, 189, 56)).add_modifier(Modifier::BOLD)),
-                Span::styled(
-                    clamp_label(
-                        &format!(" {}{}", state.hardsub_shield_mode.label(), band_hint),
-                        (s_area.width as usize).saturating_sub(6),
-                    ),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-        ]);
-        frame.render_widget(shield_msg, s_area);
-    }
+    frame.render_stateful_widget(List::new(sub_items), sub_inner, &mut sub_state);
 
     // ── Footer: Keymap Bar ───────────────────────────────────────────────
     let enter_label = match state.playback_options_purpose {

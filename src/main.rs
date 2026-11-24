@@ -976,14 +976,22 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    let (chosen_idx, used_eng_fallback) =
+                    let chosen_embedded = chosen_prov
+                        .as_ref()
+                        .map(|p| p.embedded_sub)
+                        .unwrap_or_default();
+                    let (chosen_idx, used_eng_fallback) = if chosen_embedded.has_baked_english() {
+                        (0, false)
+                    } else {
                         api::subtitles::SubtitleOption::select_index_with_english_fallback(
                             &state.playback_sub_languages,
                             &pref_sub_lang,
-                        );
+                        )
+                    };
                     state.playback_sub_cursor = chosen_idx;
                     let chosen_sub = state.playback_sub_languages.get(chosen_idx).cloned();
-                    let subtitles_disabled = chosen_sub.as_ref().is_some_and(|s| s.is_none());
+                    let subtitles_disabled = chosen_embedded.has_baked_english()
+                        || chosen_sub.as_ref().is_some_and(|s| s.is_none());
 
                     if used_eng_fallback {
                         state.show_toast(
@@ -1047,12 +1055,7 @@ async fn main() -> anyhow::Result<()> {
                         referer: prov_referer,
                         audio_urls: chosen_audio_urls,
                         has_demuxed_audio: chosen_has_demuxed,
-                        embedded_sub: chosen_prov
-                            .as_ref()
-                            .map(|p| p.embedded_sub)
-                            .unwrap_or_default(),
-                        hardsub_shield: state.hardsub_shield_mode,
-                        hardsub_band: state.hardsub_band_height,
+                        embedded_sub: chosen_embedded,
                     };
                     wrap_opts_with_hls_proxy_if_needed(&mut state, &cfg, &mut opts, needs_hls_proxy).await;
                     start_playback(&mut state, opts, title, episode, &tx, &pool, &cfg).await;
@@ -1499,12 +1502,18 @@ async fn main() -> anyhow::Result<()> {
                         state.playback_sub_cursor = sub_idx;
 
                         state.sync_active_provider();
-                        let (post_sub_idx, _) =
-                            api::subtitles::SubtitleOption::select_index_with_english_fallback(
-                                &state.playback_sub_languages,
-                                &pref_sub,
-                            );
-                        state.playback_sub_cursor = post_sub_idx;
+                        let active_is_hardsub = state
+                            .playback_providers
+                            .get(state.playback_provider_cursor)
+                            .is_some_and(|p| p.embedded_sub.has_baked_english());
+                        if !active_is_hardsub {
+                            let (post_sub_idx, _) =
+                                api::subtitles::SubtitleOption::select_index_with_english_fallback(
+                                    &state.playback_sub_languages,
+                                    &pref_sub,
+                                );
+                            state.playback_sub_cursor = post_sub_idx;
+                        }
                         sync_provider_delay_for_cursor(&mut state, &pool).await;
                         if let Some(ref ladder) = info.ladder {
                             state
@@ -2110,6 +2119,18 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 AppMessage::RemoteSubtitleSelectionChanged(selection) => {
+                    if state
+                        .last_play_options
+                        .as_ref()
+                        .is_some_and(|o| o.embedded_sub.has_baked_english())
+                    {
+                        if let Some(ref mut opts) = state.last_play_options {
+                            opts.subtitles_disabled = true;
+                            opts.sub_url = None;
+                            opts.sub_lang = Some("none".to_string());
+                        }
+                        continue;
+                    }
                     let code = match selection {
                         api::subtitles::SubtitleSelection::None => "none".to_string(),
                         api::subtitles::SubtitleSelection::Track { code, .. } => code,
@@ -4788,12 +4809,20 @@ fn queue_episodes_for_download(
                 .or(stream_info.master_url);
 
             if let Some(s_url) = stream_url {
-                let sub_url = stream_info
-                    .subtitles
-                    .iter()
-                    .find(|s| s.code.eq_ignore_ascii_case(&preferred_sub) || s.stream_label.contains(&preferred_sub))
-                    .or_else(|| stream_info.subtitles.first())
-                    .map(|s| s.url.clone());
+                let first_hardsub = stream_info
+                    .providers
+                    .first()
+                    .is_some_and(|p| p.embedded_sub.has_baked_english());
+                let sub_url = if first_hardsub {
+                    None
+                } else {
+                    stream_info
+                        .subtitles
+                        .iter()
+                        .find(|s| s.code.eq_ignore_ascii_case(&preferred_sub) || s.stream_label.contains(&preferred_sub))
+                        .or_else(|| stream_info.subtitles.first())
+                        .map(|s| s.url.clone())
+                };
 
                 tasks.push(services::downloader::DownloadTask {
                     anime_id: anime.id,
@@ -5097,20 +5126,6 @@ async fn handle_playback_options(
         KeyCode::Char('I') => {
             toggle_info_hud_action(state, true);
         }
-        KeyCode::Char('b') => {
-            state.cycle_hardsub_shield_mode();
-            state.show_toast(
-                format!("◈ Hardsub Eradicator: {}", state.hardsub_shield_mode.label()),
-                unix_now(),
-            );
-        }
-        KeyCode::Char('B') => {
-            state.cycle_hardsub_band_height();
-            state.show_toast(
-                format!("◈ Hardsub Band Height: {}", state.hardsub_band_height.label()),
-                unix_now(),
-            );
-        }
         KeyCode::Char('e') | KeyCode::Enter => {
             let force_enqueue = matches!(key.code, KeyCode::Char('e'));
             if let Some(anime) = state.selected_anime.clone() {
@@ -5139,8 +5154,11 @@ async fn handle_playback_options(
                 let _ = db::user::set_audio_mode(pool, anime.id, audio.clone(), unix_now()).await;
 
                 let chosen_provider = state.playback_providers.get(state.playback_provider_cursor);
+                let is_hardsub_provider = chosen_provider
+                    .is_some_and(|p| p.embedded_sub.has_baked_english());
                 let chosen_sub = state.playback_sub_languages.get(state.playback_sub_cursor);
-                let subtitles_disabled = chosen_sub.is_some_and(|s| s.is_none());
+                let subtitles_disabled =
+                    is_hardsub_provider || chosen_sub.is_some_and(|s| s.is_none());
                 let sub_lang = if subtitles_disabled {
                     Some("none".to_string())
                 } else {
@@ -5320,8 +5338,6 @@ async fn handle_playback_options(
                                 .as_ref()
                                 .map(|p| p.embedded_sub)
                                 .unwrap_or_default(),
-                            hardsub_shield: state.hardsub_shield_mode,
-                            hardsub_band: state.hardsub_band_height,
                             referer: chosen_prov.and_then(|p| p.referer),
                             audio_urls,
                             has_demuxed_audio,
@@ -8012,8 +8028,6 @@ async fn play_queue_item(
             audio_urls: Vec::new(),
             has_demuxed_audio: false,
             embedded_sub: Default::default(),
-            hardsub_shield: state.hardsub_shield_mode,
-            hardsub_band: state.hardsub_band_height,
         });
 
     opts.ipc_socket = None;
@@ -8026,8 +8040,6 @@ async fn play_queue_item(
     opts.performance_mode = cfg.performance_mode;
     opts.deband_mode = cfg.deband_mode;
     opts.motion_mode = cfg.motion_mode;
-    opts.hardsub_shield = state.hardsub_shield_mode;
-    opts.hardsub_band = state.hardsub_band_height;
     opts.sub_style = Some(cfg.subtitle_style.clone());
     opts.sub_delay_ms = state.subtitle_delay_ms;
     if state.anime4k_mode != config::Anime4KMode::Off {
@@ -9380,20 +9392,6 @@ async fn handle_playback(
         KeyCode::Char('I') => {
             toggle_info_hud_action(state, true);
         }
-        KeyCode::Char('b') => {
-            state.cycle_hardsub_shield_mode();
-            state.show_toast(
-                format!("◈ Hardsub Eradicator: {}", state.hardsub_shield_mode.label()),
-                unix_now(),
-            );
-        }
-        KeyCode::Char('B') => {
-            state.cycle_hardsub_band_height();
-            state.show_toast(
-                format!("◈ Hardsub Band Height: {}", state.hardsub_band_height.label()),
-                unix_now(),
-            );
-        }
         _ => {}
     }
 }
@@ -10491,7 +10489,13 @@ async fn start_playback(
         services::remote::broadcast_state(&remote_state_init).await;
     });
 
-    // 4. Smart Subtitle Sync & Local Caching for ALL remote subtitles (both [Auto-Synced] and native .vtt)
+    if opts.embedded_sub.has_baked_english() {
+        opts.subtitles_disabled = true;
+        opts.sub_url = None;
+        opts.sub_lang = Some("none".to_string());
+    }
+
+    // 4. Smart Subtitle Sync & Local Caching for ALL remote subtitles on non-hardsub streams
     // so (a) subtle lags like +1.2s are fixed via Onset-Weighted / Voice-Lead alignment, and
     // (b) in-player `[ ⚡ SNAP TO VOICE (y) ]` can parse exact dialogue cues locally.
     let needs_sub_prep = !opts.subtitles_disabled

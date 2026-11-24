@@ -375,12 +375,6 @@ pub struct AppState {
     /// Playback options purpose (LaunchNow, EnqueueSingle, or EditQueueItem)
     pub playback_options_purpose: PlaybackOptionsPurpose,
 
-    /// Visual overlap shield for non-English subtitles over baked-in English streams
-    pub hardsub_shield_mode: crate::api::player::HardsubShieldMode,
-
-    /// Band height for GPU hardsub eradication shaders
-    pub hardsub_band_height: crate::api::player::HardsubBandHeight,
-
     /// Playback: oneshot sender to stop the background player task
     pub player_stop:      Option<tokio::sync::oneshot::Sender<()>>,
 
@@ -928,8 +922,6 @@ impl AppState {
             pending_playback_query: None,
             pending_dub: false,
             playback_options_purpose: PlaybackOptionsPurpose::LaunchNow,
-            hardsub_shield_mode: crate::api::player::HardsubShieldMode::FrostedBlur,
-            hardsub_band_height: crate::api::player::HardsubBandHeight::Standard,
             player_stop:      None,
             now_playing:      None,
             playback_logs:    Vec::new(),
@@ -1230,16 +1222,6 @@ impl AppState {
         self.episode_thumbnails.clear();
         self.episode_fallback_thumbnails.clear();
         self.thumbnail_geometry_key = None;
-    }
-
-    /// Cycle Hardsub Eradicator protection (`Frosted Blur` -> `Smart Inpaint` -> `Total Blackout` -> `Frame Lift` -> `Top Edge` -> `Off`).
-    pub fn cycle_hardsub_shield_mode(&mut self) {
-        self.hardsub_shield_mode = self.hardsub_shield_mode.next();
-    }
-
-    /// Cycle GPU Hardsub Eradicator band height (`Compact 12%` -> `Standard 19%` -> `Tall 25%`).
-    pub fn cycle_hardsub_band_height(&mut self) {
-        self.hardsub_band_height = self.hardsub_band_height.next();
     }
 
     /// Show a toast notification (auto-dismissed after 4 seconds).
@@ -1739,7 +1721,11 @@ impl AppState {
                 }
             }
 
-            if !prov.subtitles.is_empty() {
+            if prov.embedded_sub.has_baked_english() {
+                self.playback_sub_languages =
+                    vec![crate::api::subtitles::SubtitleOption::none_option()];
+                self.playback_sub_cursor = 0;
+            } else if !prov.subtitles.is_empty() {
                 self.playback_sub_languages = prov.subtitles.clone();
                 crate::api::subtitles::SubtitleOption::ensure_none_option_first(
                     &mut self.playback_sub_languages,

@@ -1566,7 +1566,11 @@ pub async fn fetch_stream_info_with_identity(
                     },
                     master_url: Some(m_url.clone()),
                     qualities: z_info.qualities.clone(),
-                    subtitles: all_subtitles.clone(),
+                    subtitles: if zoko_hsub {
+                        Vec::new()
+                    } else {
+                        all_subtitles.clone()
+                    },
                     supports_sub: true,
                     supports_dub: zoko_dub || dub_avail,
                     is_verified: true,
@@ -1599,7 +1603,11 @@ pub async fn fetch_stream_info_with_identity(
         if hi_prov.qualities.is_empty() {
             hi_prov.qualities = hi_info.qualities.clone();
         }
-        hi_prov.subtitles = all_subtitles.clone();
+        hi_prov.subtitles = if hi_prov.embedded_sub.has_baked_english() {
+            Vec::new()
+        } else {
+            all_subtitles.clone()
+        };
         hi_prov.is_verified = true;
         hi_prov.verified_res = hi_prov.qualities.first().map(|q| q.label.clone());
         verified_providers.push(hi_prov);
@@ -1609,7 +1617,11 @@ pub async fn fetch_stream_info_with_identity(
         if ah_prov.master_url.as_deref().is_some_and(|u| !u.is_empty())
             && seen_ids.insert(ah_prov.id.clone())
         {
-            ah_prov.subtitles = all_subtitles.clone();
+            ah_prov.subtitles = if ah_prov.embedded_sub.has_baked_english() {
+                Vec::new()
+            } else {
+                all_subtitles.clone()
+            };
             ah_prov.is_verified = true;
             verified_providers.push(ah_prov);
         }
@@ -1619,10 +1631,20 @@ pub async fn fetch_stream_info_with_identity(
         if agg_prov.master_url.as_deref().is_some_and(|u| !u.is_empty())
             && seen_ids.insert(agg_prov.id.clone())
         {
-            agg_prov.subtitles = all_subtitles.clone();
+            agg_prov.subtitles = if agg_prov.embedded_sub.has_baked_english() {
+                Vec::new()
+            } else {
+                all_subtitles.clone()
+            };
             agg_prov.is_verified = true;
             verified_providers.push(agg_prov);
         }
+    }
+
+    if !verified_providers.is_empty()
+        && verified_providers.iter().all(|p| p.embedded_sub.has_baked_english())
+    {
+        info.subtitles = Vec::new();
     }
 
     verified_providers.sort_by_key(|p| provider_rank_priority(&p.id));
@@ -1783,7 +1805,11 @@ async fn fetch_all_hianime_providers_identity(
                     server_label: pname,
                     master_url: st_info.master_url.clone(),
                     qualities: st_info.qualities.clone(),
-                    subtitles: st_info.subtitles.clone(),
+                    subtitles: if embed_kind.has_baked_english() {
+                        Vec::new()
+                    } else {
+                        st_info.subtitles.clone()
+                    },
                     supports_sub: has_sub_srv,
                     supports_dub: has_dub_srv,
                     is_verified: true,
@@ -3163,7 +3189,11 @@ async fn fetch_megaplay_direct_providers(
                 server_label: pname.to_string(),
                 master_url: Some(master.to_string()),
                 qualities: st_info.qualities.clone(),
-                subtitles: st_info.subtitles.clone(),
+                subtitles: if mode == "hsub" {
+                    Vec::new()
+                } else {
+                    st_info.subtitles.clone()
+                },
                 supports_sub: !is_dub,
                 supports_dub: is_dub,
                 is_verified: true,
