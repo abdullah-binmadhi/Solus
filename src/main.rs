@@ -245,9 +245,10 @@ enum AppMessage {
     },
     /// Background Speech-VAD audio cross-correlation finished
     AutoSyncSubCompleted {
-        anime_id:    i64,
-        provider_id: String,
-        result:      services::subsync::SpeechVadSyncResult,
+        anime_id:        i64,
+        provider_id:     String,
+        cached_sub_path: Option<String>,
+        result:          services::subsync::SpeechVadSyncResult,
     },
     /// Async episode or audio stream switch resolution completed
     StreamSwitchReady {
@@ -706,6 +707,18 @@ async fn main() -> anyhow::Result<()> {
                         .and_then(|o| o.sub_lang.clone())
                         .unwrap_or_else(|| "sub".to_string());
                     let provider_id = state.active_provider_id.clone().unwrap_or_default();
+                    let sub_mirrors: Vec<String> = state
+                        .playback_sub_languages
+                        .iter()
+                        .filter(|s| {
+                            s.url != sub_path
+                                && (s.code.eq_ignore_ascii_case(&sub_code)
+                                    || s.lang_keyword().eq_ignore_ascii_case(&sub_code))
+                                && (s.url.starts_with("http://") || s.url.starts_with("https://"))
+                        })
+                        .map(|s| s.url.clone())
+                        .collect();
+                    let mal_id_opt = state.anime_mal_ids.get(&anime_id).copied();
                     let referer = state.active_stream_referer.clone();
                     let ref_sync = state.active_ref_sync_source.clone();
                     let is_dub_audio = state
@@ -716,32 +729,59 @@ async fn main() -> anyhow::Result<()> {
                     let target_lang = if is_dub_audio { Some("eng") } else { Some("jpn") };
                     let force_ipv4 = cfg.force_ipv4;
                     state.sub_sync_in_progress = true;
-                    state.show_toast("◈ Running Reference-Audio & Speech-VAD v4 alignment...", unix_now());
+                    state.show_toast("◈ Running Zero-Delay Alass + Speech-VAD v6 alignment...", unix_now());
                     let tx_sync = tx.clone();
                     tokio::spawn(async move {
                         let client = api::subtitles::build_http_client(force_ipv4, 8);
                         let prov_hint = if provider_id.is_empty() { None } else { Some(provider_id.as_str()) };
-                        let local_sub = if sub_path.starts_with("http://") || sub_path.starts_with("https://") {
-                            let (cached_path, _) = services::subsync::ensure_synchronized_subtitle_for_provider(
-                                &client,
-                                &sub_path,
-                                None,
-                                None,
-                                anime_id,
-                                episode_num,
-                                &sub_code,
-                                prov_hint,
+                        let local_sub_res = services::subsync::cache_remote_subtitle_with_mirrors(
+                            &client,
+                            &sub_path,
+                            &sub_mirrors,
+                            anime_id,
+                            episode_num,
+                            &sub_code,
+                            prov_hint,
+                        )
+                        .await;
+                        let local_sub = match local_sub_res {
+                            Ok(p) => p,
+                            Err(reason) => {
+                                let _ = tx_sync
+                                    .send(AppMessage::AutoSyncSubCompleted {
+                                        anime_id,
+                                        provider_id,
+                                        cached_sub_path: None,
+                                        result: services::subsync::SpeechVadSyncResult {
+                                            reason,
+                                            ..Default::default()
+                                        },
+                                    })
+                                    .await;
+                                return;
+                            }
+                        };
+                        let skip_ranges: Vec<(f64, f64)> = if let Some(mid) = mal_id_opt {
+                            tokio::time::timeout(
+                                Duration::from_millis(1200),
+                                api::aniskip::fetch_skip_times(mid, episode_num),
                             )
-                            .await;
-                            cached_path
+                            .await
+                            .ok()
+                            .map(|v| {
+                                v.into_iter()
+                                    .map(|s| (s.interval.start_time, s.interval.end_time))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
                         } else {
-                            sub_path
+                            Vec::new()
                         };
                         let (ref_url, ref_ref, ref_sub) = match ref_sync {
                             Some((u, r, s)) => (Some(u), r, s),
                             None => (None, None, None),
                         };
-                        let result = services::subsync::sync_subtitle_with_reference_or_vad_for_lang(
+                        let result = services::subsync::sync_subtitle_with_reference_or_vad_for_lang_with_skips(
                             &client,
                             &stream_url,
                             referer.as_deref(),
@@ -751,22 +791,43 @@ async fn main() -> anyhow::Result<()> {
                             ref_ref.as_deref(),
                             ref_sub.as_deref(),
                             target_lang,
+                            &skip_ranges,
                         )
                         .await;
+                        let new_cached = (local_sub != sub_path).then_some(local_sub);
                         let _ = tx_sync
                             .send(AppMessage::AutoSyncSubCompleted {
                                 anime_id,
                                 provider_id,
+                                cached_sub_path: new_cached,
                                 result,
                             })
                             .await;
                     });
                 }
-                AppMessage::AutoSyncSubCompleted { anime_id, provider_id, result } => {
+                AppMessage::AutoSyncSubCompleted {
+                    anime_id,
+                    provider_id: _,
+                    cached_sub_path,
+                    result,
+                } => {
                     state.sub_sync_in_progress = false;
+                    let mut switched_remote_to_local = false;
+                    if let Some(ref new_path) = cached_sub_path {
+                        if state
+                            .active_sub_path
+                            .as_deref()
+                            .is_some_and(|p| p != new_path.as_str())
+                        {
+                            state.active_sub_path = Some(new_path.clone());
+                            if let Some(ref mut opts) = state.last_play_options {
+                                opts.sub_url = Some(new_path.clone());
+                            }
+                            switched_remote_to_local = true;
+                        }
+                    }
                     if result.applied {
-                        let is_piecewise = result.reason.contains("Piecewise");
-                        let clamped_ms = if is_piecewise {
+                        let clamped_ms = if result.did_rewrite_file || result.reason.contains("Piecewise") {
                             0
                         } else {
                             (result.offset_seconds * 1000.0).round() as i32
@@ -779,31 +840,28 @@ async fn main() -> anyhow::Result<()> {
                                 opts.sub_delay_ms = clamped_ms;
                             }
                         }
-                        let safe_to_persist = clamped_ms.abs() <= 25_000
-                            || result.reason.contains("Reference-Audio")
-                            || result.reason.contains("Alass")
-                            || result.z_score >= 3.6;
-                        if safe_to_persist && clamped_ms.abs() < 90_000 {
-                            let pool2 = pool.clone();
-                            let pid = state.active_profile_id.clone();
-                            let prov_id = provider_id.clone();
-                            let now = unix_now();
+                        let sock = services::ipc::get_active_socket_path()
+                            .unwrap_or_else(|| "/tmp/solus-mpv.sock".to_string());
+                        if let Some(new_path) = cached_sub_path.filter(|_| switched_remote_to_local) {
                             tokio::spawn(async move {
-                                let _ = db::user::save_anime_provider_subtitle_delay_ms(
-                                    &pool2,
-                                    &pid,
-                                    anime_id,
-                                    &prov_id,
-                                    clamped_ms,
-                                    now,
+                                let _ = services::remote::send_mpv_json_command(
+                                    &sock,
+                                    serde_json::json!({ "command": ["sub-add", new_path, "select"] }),
+                                )
+                                .await;
+                                let _ = services::remote::send_mpv_json_command(
+                                    &sock,
+                                    serde_json::json!({ "command": ["set_property", "sub-delay", delay_secs] }),
                                 )
                                 .await;
                             });
-                        }
-                        if is_piecewise {
-                            let sock = services::ipc::get_active_socket_path()
-                                .unwrap_or_else(|| "/tmp/solus-mpv.sock".to_string());
+                        } else if result.did_rewrite_file || result.reason.contains("Piecewise") {
                             tokio::spawn(async move {
+                                let _ = services::remote::send_mpv_json_command(
+                                    &sock,
+                                    serde_json::json!({ "command": ["set_property", "sub-delay", 0.0] }),
+                                )
+                                .await;
                                 let _ = services::remote::send_mpv_json_command(
                                     &sock,
                                     serde_json::json!({ "command": ["sub-reload"] }),
@@ -819,8 +877,8 @@ async fn main() -> anyhow::Result<()> {
                             }
                             services::remote::broadcast_state(&r_state).await;
                         });
-                        let msg = if is_piecewise {
-                            format!("{} ({}% confidence)", result.reason, result.confidence_pct)
+                        let msg = if result.did_rewrite_file || result.reason.contains("Piecewise") {
+                            result.reason.clone()
                         } else {
                             format!(
                                 "Alass-Locked {:+.2}s ({}% confidence)",
@@ -956,18 +1014,8 @@ async fn main() -> anyhow::Result<()> {
 
                     let chosen_pid = chosen_prov.as_ref().map(|p| p.id.clone()).unwrap_or_default();
                     state.active_provider_id = (!chosen_pid.is_empty()).then_some(chosen_pid.clone());
-                    if let Some(saved_prov_delay) = db::user::get_anime_provider_subtitle_delay_ms(
-                        &pool,
-                        &state.active_profile_id,
-                        anime.id,
-                        &chosen_pid,
-                    )
-                    .await
-                    {
-                        state.subtitle_delay_ms = saved_prov_delay;
-                    } else if !chosen_pid.is_empty() {
-                        state.subtitle_delay_ms = 0;
-                    }
+                    // Start fresh episodes at 0ms; Zero-Delay v6 bakes per-episode sync directly into cached files.
+                    state.subtitle_delay_ms = 0;
 
                     if stream_url.is_none() && was_direct_stream {
                         state.show_toast(
@@ -4919,10 +4967,7 @@ async fn persist_profile_playback_settings_fields(state: &AppState, pool: &sqlx:
     let _ = db::user::save_profile_playback_settings(pool, &settings, unix_now()).await;
 }
 
-async fn sync_provider_delay_for_cursor(state: &mut AppState, pool: &sqlx::SqlitePool) {
-    let Some(anime_id) = state.selected_anime.as_ref().map(|a| a.id) else {
-        return;
-    };
+async fn sync_provider_delay_for_cursor(state: &mut AppState, _pool: &sqlx::SqlitePool) {
     let Some(prov_id) = state
         .playback_providers
         .get(state.playback_provider_cursor)
@@ -4930,19 +4975,9 @@ async fn sync_provider_delay_for_cursor(state: &mut AppState, pool: &sqlx::Sqlit
     else {
         return;
     };
-    state.active_provider_id = Some(prov_id.clone());
-    if let Some(saved_ms) = db::user::get_anime_provider_subtitle_delay_ms(
-        pool,
-        &state.active_profile_id,
-        anime_id,
-        &prov_id,
-    )
-    .await
-    {
-        state.subtitle_delay_ms = saved_ms;
-    } else {
-        state.subtitle_delay_ms = 0;
-    }
+    state.active_provider_id = Some(prov_id);
+    // Avoid applying stale cross-episode delays (Zero-Delay v6 bakes exact episode offsets into cached files at 0ms).
+    state.subtitle_delay_ms = 0;
 }
 
 async fn adjust_subtitle_delay(
@@ -5302,18 +5337,7 @@ async fn handle_playback_options(
                             .cloned();
                         let chosen_pid = chosen_prov.as_ref().map(|p| p.id.clone()).unwrap_or_default();
                         state.active_provider_id = (!chosen_pid.is_empty()).then_some(chosen_pid.clone());
-                        if let Some(saved_prov_delay) = db::user::get_anime_provider_subtitle_delay_ms(
-                            pool,
-                            &state.active_profile_id,
-                            anime.id,
-                            &chosen_pid,
-                        )
-                        .await
-                        {
-                            state.subtitle_delay_ms = if saved_prov_delay.abs() >= 90_000 { 0 } else { saved_prov_delay };
-                        } else if !chosen_pid.is_empty() {
-                            state.subtitle_delay_ms = 0;
-                        }
+                        state.subtitle_delay_ms = 0;
                         let chosen_q_info = state.playback_qualities.get(state.playback_quality_cursor).cloned();
                         let needs_proxy = chosen_q_info.as_ref().is_some_and(|q| q.needs_hls_proxy)
                             || chosen_prov.as_ref().is_some_and(|p| p.needs_hls_proxy);
@@ -10530,38 +10554,25 @@ async fn start_playback(
         if let Some(ref sub_u) = opts.sub_url {
             let code = opts.sub_lang.as_deref().unwrap_or("sub");
             let client = api::subtitles::build_http_client(cfg.force_ipv4, 8);
-
-            let ref_sub_url = state
+            let sub_mirrors: Vec<String> = state
                 .playback_sub_languages
                 .iter()
-                .find(|s| {
+                .filter(|s| {
                     s.url != *sub_u
-                        && !s.stream_label.contains("[Auto-Synced]")
+                        && (s.code.eq_ignore_ascii_case(code)
+                            || s.lang_keyword().eq_ignore_ascii_case(code))
                         && (s.url.starts_with("http://") || s.url.starts_with("https://"))
                 })
-                .map(|s| s.url.as_str())
-                .or_else(|| {
-                    state
-                        .playback_sub_languages
-                        .iter()
-                        .find(|s| {
-                            s.url != *sub_u
-                                && s.code.starts_with("eng")
-                                && (s.url.starts_with("http://") || s.url.starts_with("https://"))
-                        })
-                        .map(|s| s.url.as_str())
-                });
-
-            let stream_ref = opts.stream_url.as_deref().or(state.pending_master_url.as_deref());
+                .map(|s| s.url.clone())
+                .collect();
             let prov_hint = state.active_provider_id.as_deref();
 
-            if let Ok((cached_path, sync_res)) = tokio::time::timeout(
+            if let Ok(Ok(cached_path)) = tokio::time::timeout(
                 Duration::from_secs(9),
-                services::subsync::ensure_synchronized_subtitle_for_provider(
+                services::subsync::cache_remote_subtitle_with_mirrors(
                     &client,
                     sub_u,
-                    ref_sub_url,
-                    stream_ref,
+                    &sub_mirrors,
                     anime_id,
                     episode,
                     code,
@@ -10571,15 +10582,6 @@ async fn start_playback(
             .await
             {
                 opts.sub_url = Some(cached_path);
-
-                if let Some(res) = sync_res {
-                    if res.applied {
-                        state.show_toast(
-                            format!("❖ Auto-Synced {} sub (offset: {:+.2}s)", code, res.offset_seconds),
-                            unix_now(),
-                        );
-                    }
-                }
             }
         }
     }
@@ -10651,17 +10653,17 @@ async fn start_playback(
     state.active_ref_sync_source = resolve_clean_ref_sync_source(state, state.active_provider_id.as_deref());
     state.sub_sync_in_progress = false;
 
-    // Non-blocking background Reference-Audio + Speech-VAD auto-sync for cross-provider streams
+    // Non-blocking background Zero-Delay v6 Sync across ALL clean streams (bakes directly into cached file at 0ms delay)
     if has_mpv_ipc
         && !is_offline_local
-        && opts.sub_delay_ms == 0
-        && state
-            .active_provider_id
-            .as_deref()
-            .is_some_and(|id| id == "animegg" || id == "animeheaven")
+        && !opts.subtitles_disabled
+        && !opts.embedded_sub.has_baked_english()
     {
         if let (Some(ref s_url), Some(ref sub_p)) = (&state.active_stream_url_for_sync, &sub_path_for_ctx) {
-            if !sub_p.starts_with("http://") && !sub_p.starts_with("https://") {
+            if !sub_p.starts_with("http://")
+                && !sub_p.starts_with("https://")
+                && !services::subsync::has_sub_v6_synced_marker(sub_p)
+            {
                 let s_url_bg = s_url.clone();
                 let ref_bg = opts.referer.clone();
                 let sub_p_bg = sub_p.clone();
@@ -10672,13 +10674,29 @@ async fn start_playback(
                 let force_ipv4_bg = cfg.force_ipv4;
                 let tx_bg = tx.clone();
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    let skip_ranges: Vec<(f64, f64)> = if let Some(mid) = mal_id_opt {
+                        tokio::time::timeout(
+                            Duration::from_millis(1200),
+                            api::aniskip::fetch_skip_times(mid, episode),
+                        )
+                        .await
+                        .ok()
+                        .map(|v| {
+                            v.into_iter()
+                                .map(|s| (s.interval.start_time, s.interval.end_time))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     let client = api::subtitles::build_http_client(force_ipv4_bg, 8);
                     let (ref_u, ref_r, ref_s) = match ref_sync_bg {
                         Some((u, r, s)) => (Some(u), r, s),
                         None => (None, None, None),
                     };
-                    let result = services::subsync::sync_subtitle_with_reference_or_vad_for_lang(
+                    let result = services::subsync::sync_subtitle_with_reference_or_vad_for_lang_with_skips(
                         &client,
                         &s_url_bg,
                         ref_bg.as_deref(),
@@ -10688,13 +10706,15 @@ async fn start_playback(
                         ref_r.as_deref(),
                         ref_s.as_deref(),
                         target_lang_bg,
+                        &skip_ranges,
                     )
                     .await;
-                    if result.applied && result.offset_seconds.abs() >= 0.45 {
+                    if result.applied && (result.did_rewrite_file || result.offset_seconds.abs() >= 0.12) {
                         let _ = tx_bg
                             .send(AppMessage::AutoSyncSubCompleted {
                                 anime_id,
                                 provider_id: prov_id_bg,
+                                cached_sub_path: None,
                                 result,
                             })
                             .await;

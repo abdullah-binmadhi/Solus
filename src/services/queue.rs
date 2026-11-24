@@ -976,8 +976,7 @@ pub async fn resolve_item_prefetch(
     let mut sub_synced = false;
 
     let needs_subsync = chosen_sub.is_some_and(|s| {
-        s.stream_label.contains("[Auto-Synced]")
-            && (s.url.starts_with("http://") || s.url.starts_with("https://"))
+        s.url.starts_with("http://") || s.url.starts_with("https://")
     });
 
     if needs_subsync {

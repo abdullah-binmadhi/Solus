@@ -398,6 +398,7 @@ pub struct SpeechVadSyncResult {
     pub z_score: f64,
     pub prominence: f64,
     pub applied: bool,
+    pub did_rewrite_file: bool,
     pub reason: String,
 }
 
@@ -410,6 +411,7 @@ impl Default for SpeechVadSyncResult {
             z_score: 0.0,
             prominence: 0.0,
             applied: false,
+            did_rewrite_file: false,
             reason: "Insufficient speech signal".to_string(),
         }
     }
@@ -680,6 +682,7 @@ pub fn calculate_speech_vad_alignment(
         z_score,
         prominence,
         applied,
+        did_rewrite_file: false,
         reason,
     }
 }
@@ -754,6 +757,59 @@ pub fn pcm_s16le_to_vocal_envelope(pcm_bytes: &[u8]) -> Vec<f32> {
     env
 }
 
+fn configure_seek_and_filter_args(
+    cmd: &mut tokio::process::Command,
+    stream_url: &str,
+    start_secs: f64,
+    duration_secs: f64,
+    af_base: &str,
+    map_spec: &Option<String>,
+    accurate_copyts: bool,
+) {
+    let clamped_start = start_secs.max(0.0);
+    let clamped_dur = duration_secs.clamp(5.0, 150.0);
+    if accurate_copyts && clamped_start > 1.0 {
+        let pre_seek = (clamped_start - 10.0).max(0.0);
+        cmd.args([
+            "-ss", &format!("{pre_seek:.2}"),
+            "-copyts",
+            "-start_at_zero",
+            "-i", stream_url,
+            "-ss", &format!("{clamped_start:.2}"),
+            "-t", &format!("{clamped_dur:.2}"),
+        ]);
+    } else if accurate_copyts {
+        cmd.args([
+            "-copyts",
+            "-start_at_zero",
+            "-i", stream_url,
+            "-ss", &format!("{clamped_start:.2}"),
+            "-t", &format!("{clamped_dur:.2}"),
+        ]);
+    } else {
+        cmd.args([
+            "-ss", &format!("{clamped_start:.2}"),
+            "-t", &format!("{clamped_dur:.2}"),
+            "-i", stream_url,
+        ]);
+    }
+    if let Some(ref m) = map_spec {
+        cmd.args(["-map", m]);
+    }
+    let full_af = if accurate_copyts {
+        format!("aresample=async=1:first_pts=0,{af_base}")
+    } else {
+        af_base.to_string()
+    };
+    cmd.args([
+        "-vn", "-sn", "-dn",
+        "-af", &full_af,
+        "-ac", "1",
+        "-f", "s16le",
+        "pipe:1",
+    ]);
+}
+
 /// Extract 10 Hz vocal-band (`300 Hz - 3000 Hz`) PCM envelope via `ffmpeg` (`s16le pipe:1`),
 /// supporting `.ts.jpg` HLS via `-extension_picky 0` and optional audio stream language selection.
 pub async fn extract_vocal_envelope_ffmpeg(
@@ -808,88 +864,90 @@ pub async fn extract_vocal_envelope_ffmpeg_for_lang(
     map_attempts.push(None);
 
     let mut last_err = String::from("ffmpeg failed to decode audio");
+
     'outer: for map_spec in &map_attempts {
         for use_picky_flag in [true, false] {
             if !is_hls && use_picky_flag {
                 continue;
             }
-            let mut cmd = tokio::process::Command::new(ffmpeg_cmd);
-            cmd.arg("-hide_banner").arg("-nostats").arg("-loglevel").arg("error");
-            if is_http {
-                cmd.args([
-                    "-reconnect", "1",
-                    "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "2",
-                    "-rw_timeout", "10000000",
-                    "-analyzeduration", "2000000",
-                    "-probesize", "1000000",
-                ]);
-                if !is_local_proxy {
-                    if let Some(ref hdrs) = headers_val {
-                        cmd.args(["-headers", hdrs]);
-                    }
-                }
-                if is_hls {
-                    if use_picky_flag {
-                        cmd.args(["-extension_picky", "0"]);
-                    }
+            for accurate_copyts in [true, false] {
+                let mut cmd = tokio::process::Command::new(ffmpeg_cmd);
+                cmd.arg("-hide_banner").arg("-nostats").arg("-loglevel").arg("error");
+                if is_http {
                     cmd.args([
-                        "-allowed_extensions", "ALL",
-                        "-allowed_segment_extensions", "ALL",
+                        "-reconnect", "1",
+                        "-reconnect_streamed", "1",
+                        "-reconnect_delay_max", "2",
+                        "-rw_timeout", "10000000",
+                        "-analyzeduration", "2000000",
+                        "-probesize", "1000000",
                     ]);
+                    if !is_local_proxy {
+                        if let Some(ref hdrs) = headers_val {
+                            cmd.args(["-headers", hdrs]);
+                        }
+                    }
+                    if is_hls {
+                        if use_picky_flag {
+                            cmd.args(["-extension_picky", "0"]);
+                        }
+                        cmd.args([
+                            "-allowed_extensions", "ALL",
+                            "-allowed_segment_extensions", "ALL",
+                        ]);
+                    }
                 }
-            }
-            cmd.args([
-                "-ss", &format!("{:.1}", start_secs.max(0.0)),
-                "-t", &format!("{:.1}", duration_secs.clamp(30.0, 150.0)),
-                "-i", stream_url,
-            ]);
-            if let Some(ref m) = map_spec {
-                cmd.args(["-map", m]);
-            }
-            cmd.args([
-                "-vn", "-sn", "-dn",
-                "-af", "highpass=f=300,lowpass=f=3000,aresample=8000",
-                "-ac", "1",
-                "-f", "s16le",
-                "pipe:1",
-            ]);
+                configure_seek_and_filter_args(
+                    &mut cmd,
+                    stream_url,
+                    start_secs,
+                    duration_secs,
+                    "highpass=f=300,lowpass=f=3000,aresample=8000",
+                    map_spec,
+                    accurate_copyts,
+                );
 
-            let out = match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
-                Ok(Ok(o)) => o,
-                Ok(Err(e)) => {
-                    last_err = format!("ffmpeg launch failed: {e}");
-                    break 'outer;
-                }
-                Err(_) => {
-                    last_err = format!("Audio analysis timed out after {timeout_secs}s");
+                let out = match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
+                    Ok(Ok(o)) => o,
+                    Ok(Err(e)) => {
+                        last_err = format!("ffmpeg launch failed: {e}");
+                        break 'outer;
+                    }
+                    Err(_) => {
+                        last_err = format!("Audio analysis timed out after {timeout_secs}s");
+                        if !accurate_copyts {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if use_picky_flag && stderr.contains("Unrecognized option 'extension_picky'") {
                     break;
                 }
-            };
-
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if use_picky_flag && stderr.contains("Unrecognized option 'extension_picky'") {
-                continue;
-            }
-            if map_spec.is_some() && !out.status.success() {
-                break; // Try default untagged audio stream
-            }
-            let env = pcm_s16le_to_vocal_envelope(&out.stdout);
-            if !env.is_empty() {
-                if let Ok(mut guard) = vocal_env_cache().lock() {
-                    if guard.len() > 32 {
-                        guard.clear();
-                    }
-                    guard.insert(cache_key, env.clone());
+                if map_spec.is_some() && !out.status.success() {
+                    break; // Try default untagged audio stream
                 }
-                return Ok(env);
+                let env = pcm_s16le_to_vocal_envelope(&out.stdout);
+                if !env.is_empty() {
+                    if let Ok(mut guard) = vocal_env_cache().lock() {
+                        if guard.len() > 32 {
+                            guard.clear();
+                        }
+                        guard.insert(cache_key, env.clone());
+                    }
+                    return Ok(env);
+                }
+                if !stderr.trim().is_empty() {
+                    last_err = stderr.lines().last().unwrap_or("No audio stream found").trim().to_string();
+                } else if out.stdout.is_empty() {
+                    last_err = "No audio stream decoded from media source".to_string();
+                }
             }
-            if !stderr.trim().is_empty() {
-                last_err = stderr.lines().last().unwrap_or("No audio stream found").trim().to_string();
-            } else if out.stdout.is_empty() {
-                last_err = "No audio stream decoded from media source".to_string();
+            if !is_hls {
+                break;
             }
-            break;
         }
     }
 
@@ -898,7 +956,23 @@ pub async fn extract_vocal_envelope_ffmpeg_for_lang(
 
 /// Select up to 4 dialogue-dense 75s audio windows spanning the episode (avoiding OP/ED gaps).
 pub fn select_dialogue_windows(sub_cues: &[(f64, f64)], cur_pos_secs: f64) -> Vec<(f64, f64)> {
+    select_dialogue_windows_excluding(sub_cues, cur_pos_secs, &[])
+}
+
+pub fn select_dialogue_windows_excluding(
+    sub_cues: &[(f64, f64)],
+    cur_pos_secs: f64,
+    excluded_ranges: &[(f64, f64)],
+) -> Vec<(f64, f64)> {
     const WIN_DUR: f64 = 75.0;
+    let overlaps_excluded = |w_start: f64| -> bool {
+        let w_end = w_start + WIN_DUR;
+        let ov: f64 = excluded_ranges
+            .iter()
+            .map(|&(es, ee)| (w_end.min(ee) - w_start.max(es)).max(0.0))
+            .sum();
+        ov >= 16.0
+    };
     let max_cue_t = sub_cues.iter().map(|c| c.1).fold(0.0_f64, f64::max);
     if max_cue_t <= 15.0 {
         return vec![(cur_pos_secs.max(0.0), WIN_DUR)];
@@ -911,7 +985,7 @@ pub fn select_dialogue_windows(sub_cues: &[(f64, f64)], cur_pos_secs: f64) -> Ve
         .iter()
         .filter(|&&(s, e)| e >= cur_start && s <= cur_start + WIN_DUR)
         .count();
-    if cur_pos_secs >= 180.0 && cur_cues >= 6 {
+    if cur_pos_secs >= 180.0 && cur_cues >= 6 && !overlaps_excluded(cur_start) {
         windows.push((cur_start, WIN_DUR));
     }
 
@@ -919,12 +993,14 @@ pub fn select_dialogue_windows(sub_cues: &[(f64, f64)], cur_pos_secs: f64) -> Ve
     let mut t = 180.0_f64;
     let upper = (max_cue_t - 40.0).max(200.0);
     while t <= upper {
-        let count = sub_cues
-            .iter()
-            .filter(|&&(s, e)| e >= t && s <= t + WIN_DUR)
-            .count();
-        if count >= 5 {
-            scored.push((t, count));
+        if !overlaps_excluded(t) {
+            let count = sub_cues
+                .iter()
+                .filter(|&&(s, e)| e >= t && s <= t + WIN_DUR)
+                .count();
+            if count >= 5 {
+                scored.push((t, count));
+            }
         }
         t += 45.0;
     }
@@ -1307,6 +1383,7 @@ fn correlate_envelope_with_curve(
         z_score,
         prominence,
         applied,
+        did_rewrite_file: false,
         reason,
     };
     (res, coarse)
@@ -1433,17 +1510,124 @@ pub fn correlate_audio_envelopes(
     Some(((refined_off * 100.0).round() / 100.0, z, conf))
 }
 
-/// Run pure-Rust `earshot` WebRTC neural/Mel VAD over 16 kHz mono `s16le` PCM (`256`-sample / `16ms` frames)
-/// and return `(speech_spans, env_10hz)` simultaneously from one decoded stream.
-pub fn pcm_s16le_16k_to_earshot_spans_and_env(
+/// Build a 50 Hz (20ms/bin) speech-gated positive vocal-onset envelope directly from 16 kHz PCM + earshot probabilities.
+fn pcm_s16le_16k_to_fine_onset_env(samples: &[i16], probs: &[f32]) -> Vec<f32> {
+    const FINE_SAMPLES_PER_BIN: usize = 320; // 20ms (50 Hz) at 16 kHz
+    const VAD_FRAME_SAMPLES: usize = 256;
+    let fine_frames = samples.len() / FINE_SAMPLES_PER_BIN;
+    if fine_frames < 25 || probs.is_empty() {
+        return Vec::new();
+    }
+    let mut raw_energy = Vec::with_capacity(fine_frames);
+    for ff in 0..fine_frames {
+        let b0 = ff * FINE_SAMPLES_PER_BIN;
+        let mut sum_sq = 0.0_f64;
+        for &s in &samples[b0..b0 + FINE_SAMPLES_PER_BIN] {
+            let sf = s as f64;
+            sum_sq += sf * sf;
+        }
+        let rms = (sum_sq / FINE_SAMPLES_PER_BIN as f64).sqrt();
+        let vad_idx0 = (b0 / VAD_FRAME_SAMPLES).min(probs.len().saturating_sub(1));
+        let vad_idx1 = ((b0 + FINE_SAMPLES_PER_BIN) / VAD_FRAME_SAMPLES).min(probs.len());
+        let max_p = if vad_idx1 > vad_idx0 {
+            probs[vad_idx0..vad_idx1].iter().copied().fold(0.0_f32, f32::max)
+        } else {
+            probs[vad_idx0]
+        };
+        let gate = if max_p >= 0.45 { 1.0 } else { 0.12 };
+        raw_energy.push(((1.0 + rms).ln() as f32) * gate);
+    }
+
+    let mut out = Vec::with_capacity(fine_frames);
+    let mut prev = raw_energy[0];
+    for &cur in &raw_energy {
+        let onset = (cur - prev).max(0.0);
+        out.push(cur + 1.6 * onset);
+        prev = cur;
+    }
+    let mut sorted = out.clone();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let floor = sorted[sorted.len() / 4];
+    for v in &mut out {
+        *v = (*v - floor).max(0.0);
+    }
+    out
+}
+
+/// Refine a coarse `base_delta` within ±0.60s at 20ms resolution against 50 Hz speech-onset bins.
+pub fn refine_offset_acoustic_20ms(
+    win_fine_envs: &[(f64, Vec<f32>)],
+    cues: &[(f64, f64)],
+    base_delta: f64,
+) -> f64 {
+    const FINE_BIN: f64 = 0.02;
+    if win_fine_envs.is_empty() || cues.is_empty() {
+        return (base_delta * 100.0).round() / 100.0;
+    }
+    let mut best_delta = base_delta;
+    let mut best_score = f64::NEG_INFINITY;
+
+    for step in -30..=30 {
+        let cand = base_delta + step as f64 * FINE_BIN;
+        let mut sc = 0.0_f64;
+        let mut used = 0usize;
+        for &(win_start, ref env) in win_fine_envs {
+            let n = env.len();
+            if n < 50 {
+                continue;
+            }
+            for &(cs, ce) in cues {
+                let ss = cs + cand - win_start;
+                let ee = ce + cand - win_start;
+                if ss < 0.35 || ee > (n as f64) * FINE_BIN - 0.1 {
+                    continue;
+                }
+                let sb = (ss / FINE_BIN).round() as isize;
+                let eb = (ee / FINE_BIN).round() as isize;
+                // Onset window [cue_start - 40ms .. cue_start + 80ms]
+                let on0 = (sb - 2).max(0) as usize;
+                let on1 = (sb + 4).min(n as isize - 1) as usize;
+                let onset_peak = (on0..=on1).map(|b| env[b] as f64).fold(0.0_f64, f64::max);
+                // Pre-cue gap [cue_start - 260ms .. cue_start - 80ms]
+                let gap0 = (sb - 13).max(0) as usize;
+                let gap1 = (sb - 4).max(0) as usize;
+                let pre_gap = if gap1 >= gap0 {
+                    (gap0..=gap1).map(|b| env[b] as f64).sum::<f64>() / (gap1 - gap0 + 1) as f64
+                } else {
+                    0.0
+                };
+                // Active voice body inside cue
+                let b0 = sb.max(0) as usize;
+                let b1 = eb.min(n as isize - 1) as usize;
+                let inside = if b1 >= b0 {
+                    (b0..=b1).map(|b| env[b] as f64).sum::<f64>() / (b1 - b0 + 1) as f64
+                } else {
+                    0.0
+                };
+                sc += 2.5 * onset_peak + inside - 1.3 * pre_gap;
+                used += 1;
+            }
+        }
+        // Subtle tie-breaker toward base_delta when flat
+        let tie = -0.005 * (step as f64).abs();
+        let total = sc + tie;
+        if used >= 2 && total > best_score {
+            best_score = total;
+            best_delta = cand;
+        }
+    }
+    (best_delta * 100.0).round() / 100.0
+}
+
+fn pcm_s16le_16k_to_earshot_spans_env_and_fine(
     pcm_bytes: &[u8],
     win_start_secs: f64,
-) -> (Vec<(f64, f64)>, Vec<f32>) {
+) -> (Vec<(f64, f64)>, Vec<f32>, Vec<f32>) {
     const VAD_FRAME_SAMPLES: usize = 256; // 16ms at 16 kHz
     const ENV_SAMPLES_PER_BIN: usize = 1600; // 100ms (10 Hz) at 16 kHz
     let sample_count = pcm_bytes.len() / 2;
     if sample_count < VAD_FRAME_SAMPLES * 4 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
 
     let mut samples = Vec::with_capacity(sample_count);
@@ -1459,6 +1643,7 @@ pub fn pcm_s16le_16k_to_earshot_spans_and_env(
         let p = vad.predict_i16(&samples[base..base + VAD_FRAME_SAMPLES]);
         probs.push(p);
     }
+    let fine_env = pcm_s16le_16k_to_fine_onset_env(&samples, &probs);
 
     // Hysteresis speech detection + bridge pauses <= 240ms (15 frames)
     let mut raw_active = vec![false; probs.len()];
@@ -1541,17 +1726,27 @@ pub fn pcm_s16le_16k_to_earshot_spans_and_env(
         }
     }
 
+    (spans, env, fine_env)
+}
+
+/// Run pure-Rust `earshot` WebRTC neural/Mel VAD over 16 kHz mono `s16le` PCM (`256`-sample / `16ms` frames)
+/// and return `(speech_spans, env_10hz)` simultaneously from one decoded stream.
+pub fn pcm_s16le_16k_to_earshot_spans_and_env(
+    pcm_bytes: &[u8],
+    win_start_secs: f64,
+) -> (Vec<(f64, f64)>, Vec<f32>) {
+    let (spans, env, _) = pcm_s16le_16k_to_earshot_spans_env_and_fine(pcm_bytes, win_start_secs);
     (spans, env)
 }
 
-/// Extract 16 kHz mono `s16le` audio window via `ffmpeg` and run `earshot` WebRTC VAD.
-pub async fn extract_webrtc_vad_ffmpeg_for_lang(
+/// Extract 16 kHz mono `s16le` audio window via `ffmpeg` (`-copyts` accurate seek) and run `earshot` WebRTC VAD.
+pub async fn extract_webrtc_vad_with_fine_ffmpeg_for_lang(
     stream_url: &str,
     referer: Option<&str>,
     start_secs: f64,
     duration_secs: f64,
     target_lang: Option<&str>,
-) -> Result<(Vec<(f64, f64)>, Vec<f32>), String> {
+) -> Result<(Vec<(f64, f64)>, Vec<f32>, Vec<f32>), String> {
     let ffmpeg_cmd = if std::path::Path::new("/opt/homebrew/bin/ffmpeg").exists() {
         "/opt/homebrew/bin/ffmpeg"
     } else if std::path::Path::new("/usr/local/bin/ffmpeg").exists() {
@@ -1563,7 +1758,7 @@ pub async fn extract_webrtc_vad_ffmpeg_for_lang(
     let is_http = stream_url.starts_with("http://") || stream_url.starts_with("https://");
     let is_local_proxy = stream_url.starts_with("http://127.0.0.1:");
     let is_hls = stream_url.contains(".m3u8") || stream_url.contains("/m3u8");
-    let timeout_secs = if !is_http || is_local_proxy { 12 } else { 24 };
+    let timeout_secs = if !is_http || is_local_proxy { 14 } else { 26 };
     let headers_val = referer
         .filter(|r| !r.trim().is_empty())
         .map(|r| {
@@ -1584,81 +1779,102 @@ pub async fn extract_webrtc_vad_ffmpeg_for_lang(
             if !is_hls && use_picky_flag {
                 continue;
             }
-            let mut cmd = tokio::process::Command::new(ffmpeg_cmd);
-            cmd.arg("-hide_banner").arg("-nostats").arg("-loglevel").arg("error");
-            if is_http {
-                cmd.args([
-                    "-reconnect", "1",
-                    "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "2",
-                    "-rw_timeout", "10000000",
-                    "-analyzeduration", "2000000",
-                    "-probesize", "1000000",
-                ]);
-                if !is_local_proxy {
-                    if let Some(ref hdrs) = headers_val {
-                        cmd.args(["-headers", hdrs]);
-                    }
-                }
-                if is_hls {
-                    if use_picky_flag {
-                        cmd.args(["-extension_picky", "0"]);
-                    }
+            for accurate_copyts in [true, false] {
+                let mut cmd = tokio::process::Command::new(ffmpeg_cmd);
+                cmd.arg("-hide_banner").arg("-nostats").arg("-loglevel").arg("error");
+                if is_http {
                     cmd.args([
-                        "-allowed_extensions", "ALL",
-                        "-allowed_segment_extensions", "ALL",
+                        "-reconnect", "1",
+                        "-reconnect_streamed", "1",
+                        "-reconnect_delay_max", "2",
+                        "-rw_timeout", "10000000",
+                        "-analyzeduration", "2000000",
+                        "-probesize", "1000000",
                     ]);
+                    if !is_local_proxy {
+                        if let Some(ref hdrs) = headers_val {
+                            cmd.args(["-headers", hdrs]);
+                        }
+                    }
+                    if is_hls {
+                        if use_picky_flag {
+                            cmd.args(["-extension_picky", "0"]);
+                        }
+                        cmd.args([
+                            "-allowed_extensions", "ALL",
+                            "-allowed_segment_extensions", "ALL",
+                        ]);
+                    }
                 }
-            }
-            cmd.args([
-                "-ss", &format!("{:.1}", start_secs.max(0.0)),
-                "-t", &format!("{:.1}", duration_secs.clamp(30.0, 150.0)),
-                "-i", stream_url,
-            ]);
-            if let Some(ref m) = map_spec {
-                cmd.args(["-map", m]);
-            }
-            cmd.args([
-                "-vn", "-sn", "-dn",
-                "-af", "highpass=f=80,lowpass=f=4500,aresample=16000",
-                "-ac", "1",
-                "-f", "s16le",
-                "pipe:1",
-            ]);
+                configure_seek_and_filter_args(
+                    &mut cmd,
+                    stream_url,
+                    start_secs,
+                    duration_secs,
+                    "highpass=f=80,lowpass=f=4500,aresample=16000",
+                    map_spec,
+                    accurate_copyts,
+                );
 
-            let out = match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
-                Ok(Ok(o)) => o,
-                Ok(Err(e)) => {
-                    last_err = format!("ffmpeg launch failed: {e}");
-                    break 'outer;
-                }
-                Err(_) => {
-                    last_err = format!("Audio VAD analysis timed out after {timeout_secs}s");
+                let out = match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
+                    Ok(Ok(o)) => o,
+                    Ok(Err(e)) => {
+                        last_err = format!("ffmpeg launch failed: {e}");
+                        break 'outer;
+                    }
+                    Err(_) => {
+                        last_err = format!("Audio VAD analysis timed out after {timeout_secs}s");
+                        if !accurate_copyts {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if use_picky_flag && stderr.contains("Unrecognized option 'extension_picky'") {
                     break;
                 }
-            };
-
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if use_picky_flag && stderr.contains("Unrecognized option 'extension_picky'") {
-                continue;
+                if map_spec.is_some() && !out.status.success() {
+                    break;
+                }
+                let (spans, env, fine) =
+                    pcm_s16le_16k_to_earshot_spans_env_and_fine(&out.stdout, start_secs.max(0.0));
+                if !env.is_empty() {
+                    return Ok((spans, env, fine));
+                }
+                if !stderr.trim().is_empty() {
+                    last_err = stderr.lines().last().unwrap_or("No audio stream found").trim().to_string();
+                } else if out.stdout.is_empty() {
+                    last_err = "No audio stream decoded from media source".to_string();
+                }
             }
-            if map_spec.is_some() && !out.status.success() {
+            if !is_hls {
                 break;
             }
-            let (spans, env) = pcm_s16le_16k_to_earshot_spans_and_env(&out.stdout, start_secs.max(0.0));
-            if !env.is_empty() {
-                return Ok((spans, env));
-            }
-            if !stderr.trim().is_empty() {
-                last_err = stderr.lines().last().unwrap_or("No audio stream found").trim().to_string();
-            } else if out.stdout.is_empty() {
-                last_err = "No audio stream decoded from media source".to_string();
-            }
-            break;
         }
     }
 
     Err(last_err)
+}
+
+/// Extract 16 kHz mono `s16le` audio window via `ffmpeg` and run `earshot` WebRTC VAD.
+pub async fn extract_webrtc_vad_ffmpeg_for_lang(
+    stream_url: &str,
+    referer: Option<&str>,
+    start_secs: f64,
+    duration_secs: f64,
+    target_lang: Option<&str>,
+) -> Result<(Vec<(f64, f64)>, Vec<f32>), String> {
+    let (spans, env, _) = extract_webrtc_vad_with_fine_ffmpeg_for_lang(
+        stream_url,
+        referer,
+        start_secs,
+        duration_secs,
+        target_lang,
+    )
+    .await?;
+    Ok((spans, env))
 }
 
 fn to_alass_spans(intervals: &[(f64, f64)]) -> Vec<alass_core::TimeSpan> {
@@ -1814,14 +2030,72 @@ fn measure_span_overlap_ratio(speech_spans: &[(f64, f64)], cues: &[(f64, f64)], 
     }
 }
 
-/// Automated `Alass-Core` DP + `earshot` WebRTC VAD Synchronizer v5 (global no-split + piecewise split fallback).
+pub fn sub_v6_marker_path(sub_path: &str) -> String {
+    format!("{sub_path}.v6synced")
+}
+
+pub fn has_sub_v6_synced_marker(sub_path: &str) -> bool {
+    std::path::Path::new(&sub_v6_marker_path(sub_path)).is_file()
+}
+
+fn load_pristine_sub_text(sub_path: &str) -> Result<String, String> {
+    let raw_path = format!("{sub_path}.raw");
+    if let Ok(raw) = std::fs::read_to_string(&raw_path) {
+        if is_valid_subtitle_content(&raw) {
+            return Ok(raw);
+        }
+    }
+    let current = std::fs::read_to_string(sub_path)
+        .map_err(|_| "Active subtitle file not cached locally".to_string())?;
+    if is_valid_subtitle_content(&current) {
+        let _ = std::fs::write(&raw_path, &current);
+    }
+    Ok(current)
+}
+
+fn bake_global_shift_into_file(
+    sub_path: &str,
+    pristine_text: &str,
+    offset_seconds: f64,
+    scale_factor: f64,
+) -> bool {
+    let shifted = if offset_seconds.abs() >= 0.015 || (scale_factor - 1.0).abs() > 1e-4 {
+        apply_subtitle_shift(pristine_text, offset_seconds, scale_factor)
+    } else {
+        pristine_text.to_string()
+    };
+    let styled = crate::services::substyler::apply_signage_collision_avoidance(&shifted);
+    if !is_valid_subtitle_content(&styled) {
+        return false;
+    }
+    if std::fs::write(sub_path, &styled).is_ok() {
+        let _ = std::fs::write(
+            sub_v6_marker_path(sub_path),
+            format!("offset={offset_seconds:.3}\n"),
+        );
+        return true;
+    }
+    false
+}
+
+/// Automated Zero-Delay `Alass-Core` DP + `earshot` WebRTC VAD Synchronizer v6
+/// with -copyts accurate decode, multi-cut piecewise detection, 20ms speech-onset polish,
+/// and direct file baking so player sub-delay stays at 0ms.
 pub async fn auto_sync_subtitle_to_audio(
     stream_url: &str,
     referer: Option<&str>,
     sub_path: &str,
     cur_pos_secs: f64,
 ) -> SpeechVadSyncResult {
-    auto_sync_subtitle_to_audio_for_lang(stream_url, referer, sub_path, cur_pos_secs, None).await
+    auto_sync_subtitle_to_audio_for_lang_with_skips(
+        stream_url,
+        referer,
+        sub_path,
+        cur_pos_secs,
+        None,
+        &[],
+    )
+    .await
 }
 
 pub async fn auto_sync_subtitle_to_audio_for_lang(
@@ -1831,11 +2105,30 @@ pub async fn auto_sync_subtitle_to_audio_for_lang(
     cur_pos_secs: f64,
     target_lang: Option<&str>,
 ) -> SpeechVadSyncResult {
-    let sub_text = match std::fs::read_to_string(sub_path) {
+    auto_sync_subtitle_to_audio_for_lang_with_skips(
+        stream_url,
+        referer,
+        sub_path,
+        cur_pos_secs,
+        target_lang,
+        &[],
+    )
+    .await
+}
+
+pub async fn auto_sync_subtitle_to_audio_for_lang_with_skips(
+    stream_url: &str,
+    referer: Option<&str>,
+    sub_path: &str,
+    cur_pos_secs: f64,
+    target_lang: Option<&str>,
+    skip_ranges: &[(f64, f64)],
+) -> SpeechVadSyncResult {
+    let sub_text = match load_pristine_sub_text(sub_path) {
         Ok(t) => t,
-        Err(_) => {
+        Err(reason) => {
             return SpeechVadSyncResult {
-                reason: "Active subtitle file not cached locally".to_string(),
+                reason,
                 ..Default::default()
             };
         }
@@ -1848,23 +2141,29 @@ pub async fn auto_sync_subtitle_to_audio_for_lang(
         };
     }
 
-    let windows = select_dialogue_windows(&sub_cues, cur_pos_secs);
+    let windows = select_dialogue_windows_excluding(&sub_cues, cur_pos_secs, skip_ranges);
     let vad_futs = windows.iter().map(|&(w_start, w_dur)| {
-        extract_webrtc_vad_ffmpeg_for_lang(stream_url, referer, w_start, w_dur, target_lang)
+        extract_webrtc_vad_with_fine_ffmpeg_for_lang(stream_url, referer, w_start, w_dur, target_lang)
     });
     let vad_results = futures_util::future::join_all(vad_futs).await;
 
     let mut all_vad_spans: Vec<(f64, f64)> = Vec::new();
+    let mut win_spans: Vec<(f64, f64, Vec<(f64, f64)>)> = Vec::new();
     let mut win_envs: Vec<(f64, Vec<f32>)> = Vec::new();
+    let mut win_fines: Vec<(f64, Vec<f32>)> = Vec::new();
     let mut win_bounds: Vec<(f64, f64)> = Vec::new();
     let mut last_err = String::from("WebRTC-VAD audio extraction failed");
 
     for (&(w_start, w_dur), res) in windows.iter().zip(vad_results.into_iter()) {
         match res {
-            Ok((spans, env)) => {
-                all_vad_spans.extend(spans);
+            Ok((spans, env, fine)) => {
+                all_vad_spans.extend(spans.iter().copied());
+                win_spans.push((w_start, w_start + w_dur, spans));
                 win_bounds.push((w_start, w_start + w_dur));
                 win_envs.push((w_start, env));
+                if !fine.is_empty() {
+                    win_fines.push((w_start, fine));
+                }
             }
             Err(e) => {
                 last_err = e;
@@ -1885,37 +2184,88 @@ pub async fn auto_sync_subtitle_to_audio_for_lang(
         .map(|(ws, e)| (*ws, e.as_slice()))
         .collect();
 
-    // 1. Global Alass No-Split Dynamic Programming over all extracted WebRTC VAD spans
-    let (delta_nosplit, _alass_score) = align_cues_with_alass_nosplit(&all_vad_spans, &sub_cues);
-    if delta_nosplit.abs() <= 150.0 {
-        let fit = evaluate_structural_fit(&env_refs, &sub_cues, delta_nosplit);
-        let vad_hit = measure_span_overlap_ratio(&all_vad_spans, &sub_cues, delta_nosplit, &win_bounds);
-        if fit.passes() && vad_hit >= 0.42 {
-            let c_term = ((fit.inside_vs_gap_contrast - 1.45) / 2.2).clamp(0.0, 1.0);
-            let o_term = ((fit.onset_hit_rate - 0.45) / 0.45).clamp(0.0, 1.0);
-            let v_term = ((vad_hit - 0.42) / 0.48).clamp(0.0, 1.0);
-            let conf = (62.0 + 37.0 * (0.35 * c_term + 0.30 * o_term + 0.35 * v_term))
-                .round()
-                .clamp(62.0, 99.0) as u8;
-            return SpeechVadSyncResult {
-                offset_seconds: delta_nosplit,
-                scale_factor: 1.0,
-                confidence_pct: conf,
-                z_score: 4.5,
-                prominence: 1.8,
-                applied: true,
-                reason: format!(
-                    "Alass+WebRTC VAD Locked ({conf}%, {:.0}% cues matched, {:.1}x contrast)",
-                    vad_hit * 100.0,
-                    fit.inside_vs_gap_contrast
-                ),
-            };
+    // Detect TV vs Blu-ray / multi-cut divergence across separate acts (e.g. Tokyo Ghoul)
+    let mut prefer_piecewise = false;
+    if win_spans.len() >= 2 {
+        let (ws0, we0, ref sp0) = win_spans[0];
+        let (ws1, we1, ref sp1) = win_spans[1];
+        if sp0.len() >= 4 && sp1.len() >= 4 {
+            let c0: Vec<(f64, f64)> = sub_cues
+                .iter()
+                .copied()
+                .filter(|&(s, e)| e >= ws0 - 95.0 && s <= we0 + 95.0)
+                .collect();
+            let c1: Vec<(f64, f64)> = sub_cues
+                .iter()
+                .copied()
+                .filter(|&(s, e)| e >= ws1 - 95.0 && s <= we1 + 95.0)
+                .collect();
+            if c0.len() >= 4 && c1.len() >= 4 {
+                let (d0, _) = align_cues_with_alass_nosplit(sp0, &c0);
+                let (d1, _) = align_cues_with_alass_nosplit(sp1, &c1);
+                if (d0 - d1).abs() >= 0.45 {
+                    prefer_piecewise = true;
+                }
+            }
         }
     }
 
-    // 2. Piecewise Split Alignment via Alass DP (fixes commercial breaks / OP-length cut differences)
-    let (cue_deltas, _) = align_cues_with_alass_split(&all_vad_spans, &sub_cues, 8.0);
+    // 1. Global Alass No-Split DP + 20ms fine speech-onset polish + direct file baking (0ms delay!)
+    if !prefer_piecewise {
+        let (delta_nosplit, _alass_score) = align_cues_with_alass_nosplit(&all_vad_spans, &sub_cues);
+        if delta_nosplit.abs() <= 150.0 {
+            let refined_delta = refine_offset_acoustic_20ms(&win_fines, &sub_cues, delta_nosplit);
+            let fit = evaluate_structural_fit(&env_refs, &sub_cues, refined_delta);
+            let vad_hit = measure_span_overlap_ratio(&all_vad_spans, &sub_cues, refined_delta, &win_bounds);
+            if fit.passes() && vad_hit >= 0.42 {
+                let baked = bake_global_shift_into_file(sub_path, &sub_text, refined_delta, 1.0);
+                let c_term = ((fit.inside_vs_gap_contrast - 1.45) / 2.2).clamp(0.0, 1.0);
+                let o_term = ((fit.onset_hit_rate - 0.45) / 0.45).clamp(0.0, 1.0);
+                let v_term = ((vad_hit - 0.42) / 0.48).clamp(0.0, 1.0);
+                let conf = (64.0 + 35.0 * (0.35 * c_term + 0.30 * o_term + 0.35 * v_term))
+                    .round()
+                    .clamp(64.0, 99.0) as u8;
+                return SpeechVadSyncResult {
+                    offset_seconds: refined_delta,
+                    scale_factor: 1.0,
+                    confidence_pct: conf,
+                    z_score: 4.6,
+                    prominence: 1.85,
+                    applied: true,
+                    did_rewrite_file: baked,
+                    reason: format!(
+                        "Zero-Delay Alass+VAD ({conf}%, {:+.2}s baked → 0ms, {:.0}% cues)",
+                        refined_delta,
+                        vad_hit * 100.0,
+                    ),
+                };
+            }
+        }
+    }
+
+    // 2. Piecewise Split Alignment via Alass DP (handles OP/bumper/TV-vs-BD mid-episode cuts)
+    let split_penalty = if prefer_piecewise { 6.0 } else { 8.0 };
+    let (mut cue_deltas, _) = align_cues_with_alass_split(&all_vad_spans, &sub_cues, split_penalty);
     if cue_deltas.len() == sub_cues.len() && cue_deltas.iter().all(|d| d.abs() <= 150.0) {
+        // Refine each cut cluster at 20ms precision using local windows
+        let mut refined_clusters: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+        for idx in 0..sub_cues.len() {
+            let key = (cue_deltas[idx] * 2.0).round() as i64;
+            if let Some(&cached_ref) = refined_clusters.get(&key) {
+                cue_deltas[idx] = cached_ref;
+            } else {
+                let cluster_cues: Vec<(f64, f64)> = sub_cues
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| ((cue_deltas[j] * 2.0).round() as i64) == key)
+                    .map(|(_, &c)| c)
+                    .collect();
+                let refined = refine_offset_acoustic_20ms(&win_fines, &cluster_cues, cue_deltas[idx]);
+                refined_clusters.insert(key, refined);
+                cue_deltas[idx] = refined;
+            }
+        }
+
         let shifted_cues: Vec<(f64, f64)> = sub_cues
             .iter()
             .zip(cue_deltas.iter())
@@ -1923,21 +2273,23 @@ pub async fn auto_sync_subtitle_to_audio_for_lang(
             .collect();
         let fit_split = evaluate_structural_fit(&env_refs, &shifted_cues, 0.0);
         let vad_hit_split = measure_span_overlap_ratio(&all_vad_spans, &shifted_cues, 0.0, &win_bounds);
-        if fit_split.passes() && vad_hit_split >= 0.48 {
+        if fit_split.passes() && vad_hit_split >= 0.45 {
             let pairs: Vec<(f64, f64)> = sub_cues
                 .iter()
                 .zip(cue_deltas.iter())
                 .map(|(&(s, _), &d)| (s, d))
                 .collect();
             let rewritten = apply_piecewise_subtitle_shifts(&sub_text, &pairs);
-            if is_valid_subtitle_content(&rewritten) && std::fs::write(sub_path, &rewritten).is_ok() {
+            let styled = crate::services::substyler::apply_signage_collision_avoidance(&rewritten);
+            if is_valid_subtitle_content(&styled) && std::fs::write(sub_path, &styled).is_ok() {
+                let _ = std::fs::write(sub_v6_marker_path(sub_path), "piecewise=1\n");
                 let mut distinct_bins = std::collections::HashSet::new();
                 for &d in &cue_deltas {
                     distinct_bins.insert((d * 2.0).round() as i64);
                 }
-                let conf = (72.0 + 26.0 * ((vad_hit_split - 0.48) / 0.45).clamp(0.0, 1.0))
+                let conf = (74.0 + 25.0 * ((vad_hit_split - 0.45) / 0.45).clamp(0.0, 1.0))
                     .round()
-                    .clamp(72.0, 98.0) as u8;
+                    .clamp(74.0, 99.0) as u8;
                 return SpeechVadSyncResult {
                     offset_seconds: 0.0,
                     scale_factor: 1.0,
@@ -1945,8 +2297,9 @@ pub async fn auto_sync_subtitle_to_audio_for_lang(
                     z_score: 4.8,
                     prominence: 2.0,
                     applied: true,
+                    did_rewrite_file: true,
                     reason: format!(
-                        "Piecewise Cut-Synced via Alass+VAD ({} sections, {conf}%)",
+                        "Piecewise Cut-Synced ({} cuts baked → 0ms, {conf}%)",
                         distinct_bins.len().min(9)
                     ),
                 };
@@ -1961,14 +2314,16 @@ pub async fn auto_sync_subtitle_to_audio_for_lang(
         z_score: 1.5,
         prominence: 1.0,
         applied: false,
+        did_rewrite_file: false,
         reason: "Subtitles do not match episode dialogue cuts — use +/- or try another sub track".to_string(),
     }
 }
 
-/// Unified Tier-A + Tier-B Synchronizer v5:
+/// Unified Tier-A + Tier-B Synchronizer v6:
 /// 1. Only accepts Tier-A Reference-Audio if BOTH audio-to-audio locks AND `alass-core` aligns
-///    the subtitle cleanly against a verified Clean sibling transcript (`delta_video + delta_sub`).
-/// 2. Otherwise falls straight through to `Alass + earshot WebRTC VAD` against the active stream!
+///    the subtitle cleanly against a verified Clean sibling transcript (`delta_video + delta_sub`),
+///    and bakes the exact offset directly into `target_sub_path` (0ms player delay).
+/// 2. Otherwise falls straight through to `Alass + earshot WebRTC VAD` + 20ms polish against live audio.
 pub async fn sync_subtitle_with_reference_or_vad(
     client: &reqwest::Client,
     target_stream_url: &str,
@@ -1979,7 +2334,7 @@ pub async fn sync_subtitle_with_reference_or_vad(
     ref_referer: Option<&str>,
     ref_sub_url: Option<&str>,
 ) -> SpeechVadSyncResult {
-    sync_subtitle_with_reference_or_vad_for_lang(
+    sync_subtitle_with_reference_or_vad_for_lang_with_skips(
         client,
         target_stream_url,
         target_referer,
@@ -1989,6 +2344,7 @@ pub async fn sync_subtitle_with_reference_or_vad(
         ref_referer,
         ref_sub_url,
         None,
+        &[],
     )
     .await
 }
@@ -2004,99 +2360,135 @@ pub async fn sync_subtitle_with_reference_or_vad_for_lang(
     ref_sub_url: Option<&str>,
     target_lang: Option<&str>,
 ) -> SpeechVadSyncResult {
+    sync_subtitle_with_reference_or_vad_for_lang_with_skips(
+        client,
+        target_stream_url,
+        target_referer,
+        target_sub_path,
+        cur_pos_secs,
+        ref_stream_url,
+        ref_referer,
+        ref_sub_url,
+        target_lang,
+        &[],
+    )
+    .await
+}
+
+pub async fn sync_subtitle_with_reference_or_vad_for_lang_with_skips(
+    client: &reqwest::Client,
+    target_stream_url: &str,
+    target_referer: Option<&str>,
+    target_sub_path: &str,
+    cur_pos_secs: f64,
+    ref_stream_url: Option<&str>,
+    ref_referer: Option<&str>,
+    ref_sub_url: Option<&str>,
+    target_lang: Option<&str>,
+    skip_ranges: &[(f64, f64)],
+) -> SpeechVadSyncResult {
     if let (Some(r_url), Some(rs_url)) = (
         ref_stream_url.filter(|u| !u.is_empty() && *u != target_stream_url),
         ref_sub_url.filter(|u| !u.is_empty() && *u != target_sub_path),
     ) {
-        let sub_text = std::fs::read_to_string(target_sub_path).unwrap_or_default();
-        let cues = parse_subtitle_intervals(&sub_text);
-        let max_t = cues.iter().map(|c| c.1).fold(0.0_f64, f64::max);
+        if let Ok(sub_text) = load_pristine_sub_text(target_sub_path) {
+            let cues = parse_subtitle_intervals(&sub_text);
+            let max_t = cues.iter().map(|c| c.1).fold(0.0_f64, f64::max);
 
-        let w1_start = if max_t > 450.0 { 205.0 } else if max_t > 240.0 { 135.0 } else { 20.0 };
-        let has_w2 = max_t > 680.0;
-        let w2_start = (max_t * 0.60).clamp(440.0, (max_t - 110.0).max(440.0));
+            let pick_win = |base: f64| -> f64 {
+                let mut w = base;
+                for &(es, ee) in skip_ranges {
+                    if w < ee && w + 65.0 > es {
+                        w = ee + 3.0;
+                    }
+                }
+                w
+            };
+            let w1_start = pick_win(if max_t > 450.0 { 205.0 } else if max_t > 240.0 { 135.0 } else { 20.0 });
+            let has_w2 = max_t > 680.0;
+            let w2_start = pick_win((max_t * 0.60).clamp(440.0, (max_t - 110.0).max(440.0)));
 
-        let ((r1, t1), (r2, t2), ref_sub_resp) = tokio::join!(
-            async {
-                tokio::join!(
-                    extract_vocal_envelope_ffmpeg_for_lang(r_url, ref_referer, w1_start, 65.0, target_lang),
-                    extract_vocal_envelope_ffmpeg_for_lang(target_stream_url, target_referer, w1_start, 65.0, target_lang),
-                )
-            },
-            async {
-                if has_w2 {
+            let ((r1, t1), (r2, t2), ref_sub_res) = tokio::join!(
+                async {
                     tokio::join!(
-                        extract_vocal_envelope_ffmpeg_for_lang(r_url, ref_referer, w2_start, 65.0, target_lang),
-                        extract_vocal_envelope_ffmpeg_for_lang(target_stream_url, target_referer, w2_start, 65.0, target_lang),
+                        extract_vocal_envelope_ffmpeg_for_lang(r_url, ref_referer, w1_start, 65.0, target_lang),
+                        extract_vocal_envelope_ffmpeg_for_lang(target_stream_url, target_referer, w1_start, 65.0, target_lang),
                     )
-                } else {
-                    (Err(String::new()), Err(String::new()))
+                },
+                async {
+                    if has_w2 {
+                        tokio::join!(
+                            extract_vocal_envelope_ffmpeg_for_lang(r_url, ref_referer, w2_start, 65.0, target_lang),
+                            extract_vocal_envelope_ffmpeg_for_lang(target_stream_url, target_referer, w2_start, 65.0, target_lang),
+                        )
+                    } else {
+                        (Err(String::new()), Err(String::new()))
+                    }
+                },
+                download_subtitle_text_smart(client, rs_url, 5)
+            );
+
+            let c1 = match (r1, t1) {
+                (Ok(re), Ok(te)) => correlate_audio_envelopes(&re, &te, 90.0),
+                _ => None,
+            };
+            let c2 = match (r2, t2) {
+                (Ok(re), Ok(te)) => correlate_audio_envelopes(&re, &te, 90.0),
+                _ => None,
+            };
+
+            let waveform_lock = match (c1, c2) {
+                (Some((d1, z1, _)), Some((d2, z2, _))) if (d1 - d2).abs() <= 0.45 => {
+                    let z = 0.5 * (z1 + z2);
+                    let conf = (((z - 3.0) / 7.5).clamp(0.0, 1.0) * 24.0 + 75.0).round().clamp(75.0, 99.0) as u8;
+                    Some((0.5 * (d1 + d2), z, conf))
                 }
-            },
-            client
-                .get(rs_url)
-                .header("Referer", ref_referer.unwrap_or("https://zokoanime.video/"))
-                .timeout(Duration::from_secs(5))
-                .send()
-        );
-
-        let c1 = match (r1, t1) {
-            (Ok(re), Ok(te)) => correlate_audio_envelopes(&re, &te, 90.0),
-            _ => None,
-        };
-        let c2 = match (r2, t2) {
-            (Ok(re), Ok(te)) => correlate_audio_envelopes(&re, &te, 90.0),
-            _ => None,
-        };
-
-        let waveform_lock = match (c1, c2) {
-            (Some((d1, z1, _)), Some((d2, z2, _))) if (d1 - d2).abs() <= 0.45 => {
-                let z = 0.5 * (z1 + z2);
-                let conf = (((z - 3.0) / 7.5).clamp(0.0, 1.0) * 24.0 + 75.0).round().clamp(75.0, 99.0) as u8;
-                Some((0.5 * (d1 + d2), z, conf))
-            }
-            (Some((d, z, conf)), None) | (None, Some((d, z, conf))) if z >= 4.4 => Some((d, z, conf)),
-            (Some((d1, z1, conf1)), Some((d2, z2, conf2))) => {
-                if z1 >= z2 + 1.2 && z1 >= 4.8 {
-                    Some((d1, z1, conf1))
-                } else if z2 >= z1 + 1.2 && z2 >= 4.8 {
-                    Some((d2, z2, conf2))
-                } else {
-                    None
+                (Some((d, z, conf)), None) | (None, Some((d, z, conf))) if z >= 4.4 => Some((d, z, conf)),
+                (Some((d1, z1, conf1)), Some((d2, z2, conf2))) => {
+                    if z1 >= z2 + 1.2 && z1 >= 4.8 {
+                        Some((d1, z1, conf1))
+                    } else if z2 >= z1 + 1.2 && z2 >= 4.8 {
+                        Some((d2, z2, conf2))
+                    } else {
+                        None
+                    }
                 }
-            }
-            _ => None,
-        };
+                _ => None,
+            };
 
-        if let (Some((delta_video, z, conf)), Ok(resp)) = (waveform_lock, ref_sub_resp) {
-            if resp.status().is_success() {
-                if let Ok(bytes) = resp.bytes().await {
-                    let ref_txt = decode_subtitle_bytes(&bytes);
-                    if is_valid_subtitle_content(&ref_txt) {
-                        let ref_cues = parse_subtitle_intervals(&ref_txt);
-                        if !ref_cues.is_empty() && !cues.is_empty() {
-                            let (delta_sub_vs_ref, score) = align_cues_with_alass_nosplit(&ref_cues, &cues);
-                            let min_cues = ref_cues.len().min(cues.len()) as f64;
-                            if delta_sub_vs_ref.abs() <= 150.0 && score >= (min_cues * 0.25).max(8.0) {
-                                let total_offset = ((delta_video + delta_sub_vs_ref) * 100.0).round() / 100.0;
-                                return SpeechVadSyncResult {
-                                    offset_seconds: total_offset,
-                                    scale_factor: 1.0,
-                                    confidence_pct: conf,
-                                    z_score: z,
-                                    prominence: 2.0,
-                                    applied: true,
-                                    reason: format!("Reference-Audio + Alass Locked ({conf}% confidence, Z={z:.2})"),
-                                };
-                            }
-                        }
+            if let (Some((delta_video, z, conf)), Ok(ref_txt)) = (waveform_lock, ref_sub_res) {
+                let ref_cues = parse_subtitle_intervals(&ref_txt);
+                if !ref_cues.is_empty() && !cues.is_empty() {
+                    let (delta_sub_vs_ref, score) = align_cues_with_alass_nosplit(&ref_cues, &cues);
+                    let min_cues = ref_cues.len().min(cues.len()) as f64;
+                    if delta_sub_vs_ref.abs() <= 150.0 && score >= (min_cues * 0.25).max(8.0) {
+                        let total_offset = ((delta_video + delta_sub_vs_ref) * 100.0).round() / 100.0;
+                        let baked = bake_global_shift_into_file(target_sub_path, &sub_text, total_offset, 1.0);
+                        return SpeechVadSyncResult {
+                            offset_seconds: total_offset,
+                            scale_factor: 1.0,
+                            confidence_pct: conf,
+                            z_score: z,
+                            prominence: 2.0,
+                            applied: true,
+                            did_rewrite_file: baked,
+                            reason: format!("Zero-Delay Ref-Audio + Alass ({conf}% · {total_offset:+.2}s baked → 0ms)"),
+                        };
                     }
                 }
             }
         }
     }
 
-    auto_sync_subtitle_to_audio_for_lang(target_stream_url, target_referer, target_sub_path, cur_pos_secs, target_lang).await
+    auto_sync_subtitle_to_audio_for_lang_with_skips(
+        target_stream_url,
+        target_referer,
+        target_sub_path,
+        cur_pos_secs,
+        target_lang,
+        skip_ranges,
+    )
+    .await
 }
 
 /// Fallback Tier 2: Probe audio lead time via ffmpeg silencedetect (runs in < 1.5s).
@@ -2190,7 +2582,7 @@ fn smart_sub_referer(url: &str) -> Option<&'static str> {
     }
 }
 
-async fn download_subtitle_text_smart(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Option<String> {
+async fn download_subtitle_text_smart(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Result<String, String> {
     const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
     let primary_ref = smart_sub_referer(url);
     let mut attempts: Vec<Option<&'static str>> = vec![primary_ref];
@@ -2198,20 +2590,27 @@ async fn download_subtitle_text_smart(client: &reqwest::Client, url: &str, timeo
         attempts.push(None);
     } else {
         attempts.push(Some("https://zokoanime.video/"));
+        attempts.push(Some("https://megaplay.buzz/"));
     }
 
+    let mut last_err = "Subtitle CDN request failed".to_string();
     for ref_opt in attempts {
         let mut req = client
             .get(url)
             .header("User-Agent", UA)
+            .header("Accept", "text/vtt,application/x-subrip,text/plain,*/*")
             .timeout(Duration::from_secs(timeout_secs));
         if let Some(r) = ref_opt {
-            req = req.header("Referer", r);
+            req = req.header("Referer", r).header("Origin", r.trim_end_matches('/'));
         }
-        if let Ok(resp) = req.send().await {
-            if resp.status().is_success() {
-                if let Ok(bytes) = resp.bytes().await {
-                    if !bytes.is_empty() {
+        match req.send().await {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    last_err = format!("Subtitle CDN HTTP {}", resp.status().as_u16());
+                    continue;
+                }
+                match resp.bytes().await {
+                    Ok(bytes) if !bytes.is_empty() => {
                         let raw_bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
                             use std::io::Read;
                             let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
@@ -2226,20 +2625,125 @@ async fn download_subtitle_text_smart(client: &reqwest::Client, url: &str, timeo
                         };
                         let text = decode_subtitle_bytes(&raw_bytes);
                         if is_valid_subtitle_content(&text) {
-                            return Some(text);
+                            return Ok(text);
                         }
+                        last_err = "Subtitle payload was empty or invalid HTML error".to_string();
+                    }
+                    Ok(_) => last_err = "Subtitle response body was empty".to_string(),
+                    Err(e) => last_err = format!("Subtitle read failed: {e}"),
+                }
+            }
+            Err(e) => {
+                last_err = if e.is_timeout() {
+                    "Subtitle download timed out".to_string()
+                } else {
+                    format!("Subtitle download error: {e}")
+                };
+            }
+        }
+    }
+    Err(last_err)
+}
+
+fn cache_dir_subs() -> Result<std::path::PathBuf, String> {
+    let dir = crate::config::Config::cache_dir()
+        .map(|dir| dir.join("subs"))
+        .unwrap_or_else(|_| std::env::temp_dir().join("solus-subs"));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Subtitle cache dir error: {e}"))?;
+    Ok(dir)
+}
+
+fn subtitle_ext_for_content(content: &str) -> &'static str {
+    let first_non_empty = content
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("");
+    if content.contains("[Script Info]") || content.contains("Dialogue:") {
+        "ass"
+    } else if first_non_empty.starts_with("WEBVTT") {
+        "vtt"
+    } else {
+        "srt"
+    }
+}
+
+pub async fn cache_remote_subtitle_with_mirrors(
+    client: &reqwest::Client,
+    primary_url: &str,
+    mirror_urls: &[String],
+    anime_id: i64,
+    episode: u32,
+    code: &str,
+    provider_id: Option<&str>,
+) -> Result<String, String> {
+    if !primary_url.starts_with("http://") && !primary_url.starts_with("https://") {
+        if std::path::Path::new(primary_url).is_file() {
+            return Ok(primary_url.to_string());
+        }
+        return Err("Active subtitle file not found locally".to_string());
+    }
+
+    let cache_dir = cache_dir_subs()?;
+    let clean_code: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let code_name = if clean_code.is_empty() { "sub" } else { &clean_code };
+    let prov_slug: String = provider_id
+        .unwrap_or("def")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let prov_part = if prov_slug.is_empty() { "def" } else { &prov_slug };
+
+    let mut urls: Vec<&str> = vec![primary_url];
+    for m in mirror_urls {
+        if m != primary_url && (m.starts_with("http://") || m.starts_with("https://")) {
+            urls.push(m.as_str());
+        }
+    }
+
+    let mut last_err = "Subtitle CDN unreachable".to_string();
+    for url in urls {
+        let url_hash = url_fnv1a_hash8(url);
+        for ext in ["ass", "srt", "vtt"] {
+            let p = cache_dir.join(format!(
+                "{}_{}_{}_{}_{}_synced.{}",
+                anime_id, episode, code_name, prov_part, url_hash, ext
+            ));
+            if p.is_file() {
+                if let Ok(cached) = std::fs::read_to_string(&p) {
+                    if is_valid_subtitle_content(&cached) {
+                        return Ok(p.to_string_lossy().into_owned());
                     }
                 }
             }
         }
+        match download_subtitle_text_smart(client, url, 6).await {
+            Ok(raw_text) => {
+                let ext = subtitle_ext_for_content(&raw_text);
+                let synced_path = cache_dir.join(format!(
+                    "{}_{}_{}_{}_{}_synced.{}",
+                    anime_id, episode, code_name, prov_part, url_hash, ext
+                ));
+                let raw_path = format!("{}.raw", synced_path.display());
+                let _ = std::fs::write(&raw_path, &raw_text);
+                let styled = crate::services::substyler::apply_signage_collision_avoidance(&raw_text);
+                if is_valid_subtitle_content(&styled) && std::fs::write(&synced_path, &styled).is_ok() {
+                    return Ok(synced_path.to_string_lossy().into_owned());
+                }
+            }
+            Err(e) => {
+                last_err = e;
+            }
+        }
     }
-    None
+    Err(last_err)
 }
 
 pub async fn ensure_synchronized_subtitle_for_provider(
     client: &reqwest::Client,
     target_sub_url: &str,
-    ref_sub_url: Option<&str>,
+    _ref_sub_url: Option<&str>,
     _stream_url: Option<&str>,
     anime_id: i64,
     episode: u32,
@@ -2250,97 +2754,20 @@ pub async fn ensure_synchronized_subtitle_for_provider(
         return (target_sub_url.to_string(), None);
     }
 
-    let cache_dir = crate::config::Config::cache_dir()
-        .map(|dir| dir.join("subs"))
-        .unwrap_or_else(|_| std::env::temp_dir().join("solus-subs"));
-
-    if std::fs::create_dir_all(&cache_dir).is_err() {
-        return (target_sub_url.to_string(), None);
+    match cache_remote_subtitle_with_mirrors(
+        client,
+        target_sub_url,
+        &[],
+        anime_id,
+        episode,
+        code,
+        provider_id,
+    )
+    .await
+    {
+        Ok(local_path) => (local_path, None),
+        Err(_) => (target_sub_url.to_string(), None),
     }
-
-    let clean_code: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    let code_name = if clean_code.is_empty() { "sub" } else { &clean_code };
-    let prov_slug: String = provider_id
-        .unwrap_or("def")
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
-    let prov_part = if prov_slug.is_empty() { "def" } else { &prov_slug };
-    let url_hash = url_fnv1a_hash8(target_sub_url);
-
-    // Check if valid provider/URL-scoped cached version already exists (.ass, .srt, .vtt)
-    for ext in ["ass", "srt", "vtt"] {
-        let p = cache_dir.join(format!(
-            "{}_{}_{}_{}_{}_synced.{}",
-            anime_id, episode, code_name, prov_part, url_hash, ext
-        ));
-        if p.is_file() {
-            if let Ok(cached_content) = std::fs::read_to_string(&p) {
-                if is_valid_subtitle_content(&cached_content) {
-                    return (p.to_string_lossy().into_owned(), None);
-                } else {
-                    let _ = std::fs::remove_file(&p);
-                }
-            }
-        }
-    }
-
-    // 1. Download target subtitle content with host-aware Referer & fallback
-    let Some(target_text) = download_subtitle_text_smart(client, target_sub_url, 6).await else {
-        return (target_sub_url.to_string(), None);
-    };
-
-    // 2. Tier 1: Align against reference subtitle if available (bounded to 3s so slow refs never block caching)
-    let mut sync_res: Option<SyncResult> = None;
-    let mut final_content = target_text.clone();
-
-    if let Some(ref_url) = ref_sub_url {
-        if ref_url != target_sub_url && (ref_url.starts_with("http://") || ref_url.starts_with("https://")) {
-            if let Ok(Some(ref_text)) = tokio::time::timeout(
-                Duration::from_secs(3),
-                download_subtitle_text_smart(client, ref_url, 3),
-            )
-            .await
-            {
-                let ref_intervals = parse_subtitle_intervals(&ref_text);
-                let target_intervals = parse_subtitle_intervals(&target_text);
-
-                let alignment = calculate_optimal_alignment(&ref_intervals, &target_intervals);
-                if alignment.applied {
-                    final_content = apply_subtitle_shift(&target_text, alignment.offset_seconds, alignment.scale_factor);
-                }
-                sync_res = Some(alignment);
-            }
-        }
-    }
-
-    let final_content = crate::services::substyler::apply_signage_collision_avoidance(&final_content);
-
-    // Determine appropriate extension (.ass, .vtt, or .srt)
-    let first_non_empty = final_content
-        .trim_start_matches('\u{feff}')
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .map(str::trim)
-        .unwrap_or("");
-    let ext = if final_content.contains("[Script Info]") || final_content.contains("Dialogue:") {
-        "ass"
-    } else if first_non_empty.starts_with("WEBVTT") {
-        "vtt"
-    } else {
-        "srt"
-    };
-    let synced_path = cache_dir.join(format!(
-        "{}_{}_{}_{}_{}_synced.{}",
-        anime_id, episode, code_name, prov_part, url_hash, ext
-    ));
-
-    // Write final validated file to cache
-    if is_valid_subtitle_content(&final_content) && std::fs::write(&synced_path, &final_content).is_ok() {
-        return (synced_path.to_string_lossy().into_owned(), sync_res);
-    }
-
-    (target_sub_url.to_string(), sync_res)
 }
 
 #[cfg(test)]
@@ -2880,5 +3307,111 @@ Dialogue: 0,0:01:37.75,0:01:40.91,NHK Dialogue - Border,,0,0,0,,Outline duplicat
         assert_eq!(env.len(), 30);
         // Should never produce garbage outside the 3s range
         assert!(spans.iter().all(|&(s, e)| s >= 0.0 && e <= 3.05));
+    }
+
+    #[test]
+    fn test_refine_offset_acoustic_20ms_and_op_window_exclusion() {
+        // Build 50 Hz (20ms) onset envelope over t = 200..250s with sharp speech bursts at t_true = cue + 0.14s
+        let win_start = 200.0;
+        let mut env_50hz = vec![0.02_f32; 2500];
+        let mut cues = Vec::new();
+        for k in 0..8 {
+            let cue_s = 205.0 + k as f64 * 5.5;
+            let cue_e = cue_s + 1.8;
+            cues.push((cue_s, cue_e));
+            let audio_s = cue_s + 0.14;
+            let audio_e = cue_e + 0.14;
+            let b0 = ((audio_s - win_start) * 50.0).round() as usize;
+            let b1 = ((audio_e - win_start) * 50.0).round() as usize;
+            for b in b0..b1.min(env_50hz.len()) {
+                env_50hz[b] = if b == b0 || b == b0 + 1 { 2.8 } else { 1.2 };
+            }
+        }
+        let refined = refine_offset_acoustic_20ms(&[(win_start, env_50hz)], &cues, 0.0);
+        assert!(
+            (refined - 0.14).abs() <= 0.04,
+            "20ms onset refiner must recover +0.14s within ±40ms, got {refined}"
+        );
+
+        // Verify AniSkip OP exclusion rejects OP singing window [80..170]
+        let op_cues: Vec<(f64, f64)> = (0..35).map(|i| (85.0 + i as f64 * 12.0, 88.0 + i as f64 * 12.0)).collect();
+        let selected = select_dialogue_windows_excluding(&op_cues, 0.0, &[(80.0, 175.0)]);
+        assert!(
+            selected.iter().all(|&(ws, _)| ws + 75.0 <= 96.0 || ws >= 159.0),
+            "Selected dialogue windows must avoid OP interval: {:?}",
+            selected
+        );
+    }
+
+    #[test]
+    fn test_zero_delay_baking_preserves_raw_sidecar_for_idempotent_resync() {
+        let dir = std::env::temp_dir().join("solus_subsync_v6_bake_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sub_path = dir.join("ep5.srt");
+        let orig_srt = "1\n00:01:00,000 --> 00:01:03,000\nLine one\n\n2\n00:02:00,000 --> 00:02:04,000\nLine two\n\n";
+        std::fs::write(&sub_path, orig_srt).unwrap();
+
+        let p_str = sub_path.to_string_lossy().into_owned();
+        let raw_1 = load_pristine_sub_text(&p_str).unwrap();
+        assert!(bake_global_shift_into_file(&p_str, &raw_1, -5.40, 1.0));
+        assert!(has_sub_v6_synced_marker(&p_str));
+
+        // Second sync reads pristine .raw rather than double-shifting the -5.40s file!
+        let raw_2 = load_pristine_sub_text(&p_str).unwrap();
+        assert!(bake_global_shift_into_file(&p_str, &raw_2, -5.40, 1.0));
+        let final_cues = parse_subtitle_intervals(&std::fs::read_to_string(&sub_path).unwrap());
+        assert!((final_cues[0].0 - 54.60).abs() <= 0.02, "Must stay at 54.60s, not 49.20s! got {:?}", final_cues[0]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_ffmpeg_copyts_hls_segment_seek_accuracy() {
+        let dir = std::env::temp_dir().join("solus_hls_copyts_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let m3u8 = dir.join("test.m3u8");
+        let gen = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi",
+                "-i", "aevalsrc='if(between(t,18.4,19.4),0.8*sin(2*PI*440*t),0.004*sin(2*PI*220*t))':s=16000:d=32",
+                "-c:a", "aac", "-f", "hls", "-hls_time", "4", "-hls_list_size", "0",
+                "-output_ts_offset", "14.37",
+            ])
+            .arg(&m3u8)
+            .status()
+            .await;
+        let Ok(st) = gen else { return; };
+        if !st.success() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let (_spans, _env, fine) = extract_webrtc_vad_with_fine_ffmpeg_for_lang(
+            m3u8.to_string_lossy().as_ref(),
+            None,
+            18.0,
+            10.0,
+            None,
+        )
+        .await
+        .expect("ffmpeg copyts HLS extract should succeed");
+        assert!(!fine.is_empty());
+        // Peak of 18.4..19.4s relative to window start 18.0s must fall near bin 20..70 (0.4s..1.4s @ 50Hz), NOT shifted by TS boundaries!
+        let peak_bin = fine
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let peak_t = peak_bin as f64 * 0.02;
+        assert!(
+            (0.30..=1.60).contains(&peak_t),
+            "Expected HLS -copyts burst near 0.4..1.4s inside window, got peak at {:.2}s (bin {})",
+            peak_t,
+            peak_bin
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
