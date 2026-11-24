@@ -138,12 +138,18 @@ pub struct HotSwitchRequest {
     pub sub_delay_ms:       i32,
     pub media_title:        String,
     pub osd_label:          String,
+    pub referer:            Option<String>,
 }
 
 pub fn build_hot_switch_commands(req: &HotSwitchRequest) -> Vec<Value> {
+    let ref_url = req
+        .referer
+        .as_deref()
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or("https://zokoanime.video/");
     let mut cmds = vec![
         serde_json::json!({ "command": ["set_property", "start", format!("{:.2}", req.resume_pos.max(0.0))] }),
-        serde_json::json!({ "command": ["set_property", "referrer", "https://zokoanime.video/"] }),
+        serde_json::json!({ "command": ["set_property", "referrer", ref_url] }),
         serde_json::json!({ "command": ["set_property", "force-media-title", req.media_title] }),
     ];
     if let Some(ref audio) = req.audio_file {
@@ -748,6 +754,7 @@ async fn drive_ipc_stream<S>(
     let mut cache_fw_bytes: u64 = 0;
     let mut cache_speed_bps: f64 = 0.0;
     let mut last_telemetry_emit = tokio::time::Instant::now();
+    let mut next_ep_sent = false;
 
     loop {
         tokio::select! {
@@ -806,10 +813,11 @@ async fn drive_ipc_stream<S>(
                     break;
                 };
 
-                if line.contains("client-message") && line.contains("solus-next-episode") {
-                    let _ = tx
-                        .send(AppMessage::PlaybackLog("__SOLUS_NEXT_EPISODE__".to_string()))
-                        .await;
+                if line.contains("client-message") && line.contains("solus-ipc-next-ep") {
+                    if !next_ep_sent {
+                        next_ep_sent = true;
+                        let _ = tx.send(AppMessage::NextEpisodeRequested).await;
+                    }
                     continue;
                 }
 
@@ -1280,6 +1288,7 @@ mod tests {
             sub_delay_ms: -250,
             media_title: "Frieren Episode 12".into(),
             osd_label: "Auto-ABR: 720p (~1.6 Mbps)".into(),
+            referer: None,
         });
         let joined: Vec<String> = cmds.iter().map(|v| v.to_string()).collect();
         assert!(joined.iter().any(|s| s.contains("\"referrer\",\"https://zokoanime.video/\"")));

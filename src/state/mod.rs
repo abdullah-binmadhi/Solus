@@ -468,6 +468,11 @@ pub struct AppState {
     pub exit_confirm_open:   bool,
     pub exit_confirm_cursor: usize,
 
+    /// Non-blocking episode/stream switch concurrency & debounce guards
+    pub is_switching_episode: bool,
+    pub switch_generation:    u64,
+    pub last_next_ep_at:      Option<std::time::Instant>,
+
     /// Detail screen: set of watched episode numbers for the current anime
     pub watched_episodes: HashSet<u32>,
 
@@ -943,6 +948,9 @@ impl AppState {
             should_quit:      false,
             exit_confirm_open: false,
             exit_confirm_cursor: 0,
+            is_switching_episode: false,
+            switch_generation: 0,
+            last_next_ep_at: None,
             watched_episodes: HashSet::new(),
             last_played:      None,
             last_played_anime_id: None,
@@ -1608,31 +1616,9 @@ impl AppState {
         self.screen = Screen::PlaybackQuery;
     }
 
-    /// Returns the unified `libmpv` players available on the current operating system.
+    /// Returns ALL unified `libmpv` players so users can choose freely across the full roster.
     pub fn host_players() -> Vec<crate::config::Player> {
-        #[cfg(windows)]
-        {
-            vec![
-                crate::config::Player::AutoBest,
-                crate::config::Player::Mpv,
-                crate::config::Player::MpvNet,
-            ]
-        }
-        #[cfg(target_os = "linux")]
-        {
-            vec![
-                crate::config::Player::AutoBest,
-                crate::config::Player::Mpv,
-                crate::config::Player::Celluloid,
-            ]
-        }
-        #[cfg(not(any(windows, target_os = "linux")))]
-        {
-            vec![
-                crate::config::Player::AutoBest,
-                crate::config::Player::Mpv,
-            ]
-        }
+        crate::config::Player::ALL.to_vec()
     }
 
     /// Open the playback options overlay after a query has been chosen.
@@ -2075,17 +2061,17 @@ mod tests {
     fn test_sync_active_provider_updates_qualities_and_subtitles() {
         let mut state = AppState::new();
         state.playback_providers = crate::api::subtitles::default_providers();
-        assert_eq!(state.playback_providers.len(), 4);
+        assert_eq!(state.playback_providers.len(), 3);
 
         // Initially on Provider 0 (ZokoAnime)
         state.playback_provider_cursor = 0;
         state.sync_active_provider();
         assert_eq!(state.playback_qualities[0].label, "1080p");
 
-        // Move to Provider 2 (AnimePahe: uses BD tags like "1080p BD")
+        // Move to Provider 2 (AnimeGG Direct)
         state.playback_provider_cursor = 2;
         state.sync_active_provider();
-        assert_eq!(state.playback_qualities[0].label, "1080p BD");
+        assert_eq!(state.playback_qualities[0].label, "1080p");
         // Quality cursor should have preserved match on 1080p
         assert_eq!(state.playback_quality_cursor, 0);
 
@@ -2309,6 +2295,7 @@ mod tests {
                 url: "https://example.com/en.vtt".into(),
                 stream_label: "Zoko".into(),
             }],
+            referer: None,
         }];
         state.playback_provider_cursor = 0;
         state.sync_active_provider();

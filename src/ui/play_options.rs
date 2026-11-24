@@ -786,6 +786,7 @@ mod tests {
                 master_url: None,
                 qualities: vec![],
                 subtitles: vec![],
+                referer: None,
             }];
             loaded_state.playback_qualities = vec![
                 crate::api::subtitles::QualityOption::simple("1080p", ""),

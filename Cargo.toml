@@ -48,6 +48,8 @@ directories   = "5"
 fuzzy-matcher = "0.3"
 rand          = "0.8"
 base64        = "0.22"
+aes           = "0.8"
+cbc           = { version = "0.1", features = ["std"] }
 flate2        = "1.0"
 qrcode = { version = "0.14.1", default-features = false }
 tokio-tungstenite = "0.30.0"

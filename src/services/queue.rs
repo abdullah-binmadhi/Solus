@@ -911,22 +911,22 @@ pub async fn resolve_item_prefetch(
     let (chosen_sub, sub_lang, mut sub_url) = if subs_disabled {
         (None, Some("none".to_string()), None)
     } else {
-        let chosen = stream_info
-            .subtitles
-            .iter()
-            .filter(|s| !s.is_none())
-            .find(|s| {
-                s.name.to_lowercase().contains(&pref_lower)
-                    || s.code.to_lowercase().starts_with(&pref_lower)
-                    || s.lang_keyword().eq_ignore_ascii_case(&item.sub_lang)
-            })
-            .or_else(|| stream_info.subtitles.iter().find(|s| !s.is_none()))
-            .or_else(|| stream_info.subtitles.first());
+        let mut subs_with_none = stream_info.subtitles.clone();
+        crate::api::subtitles::SubtitleOption::ensure_none_option_first(&mut subs_with_none);
+        let (idx, _) = crate::api::subtitles::SubtitleOption::select_index_with_english_fallback(
+            &subs_with_none,
+            &item.sub_lang,
+        );
+        let chosen = subs_with_none
+            .into_iter()
+            .nth(idx)
+            .filter(|s| !s.is_none());
 
         let lang = chosen
+            .as_ref()
             .map(|s| s.lang_keyword().to_string())
             .or_else(|| Some(item.sub_lang.clone()));
-        let url = chosen.map(|s| s.url.clone()).filter(|u| !u.is_empty());
+        let url = chosen.as_ref().map(|s| s.url.clone()).filter(|u| !u.is_empty());
         (chosen, lang, url)
     };
     let mut sub_synced = false;
@@ -1002,6 +1002,7 @@ pub async fn resolve_item_prefetch(
         performance_mode: crate::config::PerformanceMode::Balanced,
         deband_mode: crate::config::DebandMode::Auto,
         motion_mode: crate::config::MotionMode::Off,
+        referer: stream_info.providers.first().and_then(|p| p.referer.clone()),
     };
 
     Some(ResolvedPrefetch {
@@ -1061,6 +1062,7 @@ mod tests {
                 performance_mode: crate::config::PerformanceMode::Balanced,
                 deband_mode: crate::config::DebandMode::Auto,
                 motion_mode: crate::config::MotionMode::Off,
+                referer: None,
             },
             resolved_at,
             sub_synced: false,

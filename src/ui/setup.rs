@@ -33,20 +33,9 @@ pub fn modal_pct(area: Rect) -> (u16, u16) {
     }
 }
 
-/// Video players exposed for interactive selection on the current OS.
+/// All `libmpv` video players exposed for interactive selection.
 pub fn supported_players() -> &'static [Player] {
-    #[cfg(windows)]
-    {
-        &[Player::AutoBest, Player::Mpv, Player::MpvNet]
-    }
-    #[cfg(target_os = "linux")]
-    {
-        &[Player::AutoBest, Player::Mpv, Player::Celluloid]
-    }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    {
-        &[Player::AutoBest, Player::Mpv]
-    }
+    &Player::ALL
 }
 
 /// Returns whether a given `libmpv`-compatible engine is detected on this machine.

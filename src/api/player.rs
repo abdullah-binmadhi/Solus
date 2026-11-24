@@ -103,6 +103,9 @@ pub struct PlayOptions {
     /// 24fps anime panning cadence & temporal interpolation
     #[serde(default)]
     pub motion_mode: MotionMode,
+    /// HTTP Referer header required by the active stream provider CDN
+    #[serde(default)]
+    pub referer: Option<String>,
 }
 
 /// Build the `ani-cli` command arguments for legacy fallback scraping.
@@ -453,7 +456,8 @@ P script-binding solus-cycle-pip-corner
 i script-binding solus-toggle-hud
 I script-binding solus-pin-hud
 TAB script-binding solus-skip-intro
-N script-binding solus-next-episode
+n script-binding solus-next-ep-key-lower
+N script-binding solus-next-ep-key
 S script-binding solus-toggle-sub-bar
 y script-binding solus-snap-sub-voice
 z add sub-delay -0.1
@@ -869,6 +873,7 @@ local player_ctx = {
     ed_end = nil,
     sub_path = nil,
 }
+local next_ep_dispatched = false
 local hover_active_until = 0
 local hovered_btn_id = nil
 local active_hitboxes = {}
@@ -970,9 +975,11 @@ local function do_skip_intro_or_outro()
 end
 
 local function do_next_episode()
+    if next_ep_dispatched then return end
+    next_ep_dispatched = true
     mp.osd_message("⏭ Loading Next Episode...", 2.5)
-    -- Delivered to Solus over the IPC socket (client-message event); stdout marker kept as comment: __SOLUS_NEXT_EPISODE__
-    mp.commandv("script-message", "solus-next-episode")
+    -- Distinct script-message name (differs from key-binding names) prevents mpv recursion!
+    mp.commandv("script-message", "solus-ipc-next-ep")
 end
 
 local function adjust_sub_delay(delta)
@@ -1017,7 +1024,7 @@ local function render_player_buttons()
     -- 2. Next Episode Pill (ED, >= 88%, final 90s, or hover in final 35%)
     local near_end = dur > 60.0 and ((cur_t / dur) >= 0.88 or (dur - cur_t) <= 90.0 or (hover_alive and (cur_t / dur) >= 0.65))
     if player_ctx.next_ep and (in_ed or near_end) then
-        draw_pill("next_ep", 938, 646, 1236, 692, string.format(">>|  NEXT EPISODE: Ep %d  [N]", player_ctx.next_ep), "&HFA8BA7&")
+        draw_pill("next_ep", 938, 646, 1236, 692, string.format(">>|  NEXT EPISODE: Ep %d  [n/N]", player_ctx.next_ep), "&HFA8BA7&")
     end
 
     -- 3. Interactive Subtitle Sync Bar ([S] Toggle)
@@ -1124,7 +1131,8 @@ local function toggle_sub_bar()
 end
 
 mp.add_forced_key_binding("TAB", "solus-skip-intro", do_skip_intro_or_outro)
-mp.add_forced_key_binding("N", "solus-next-episode", do_next_episode)
+mp.add_forced_key_binding("n", "solus-next-ep-key-lower", do_next_episode)
+mp.add_forced_key_binding("N", "solus-next-ep-key", do_next_episode)
 mp.add_forced_key_binding("S", "solus-toggle-sub-bar", toggle_sub_bar)
 mp.add_forced_key_binding("y", "solus-snap-sub-voice", snap_sub_to_voice)
 "##;
@@ -1202,11 +1210,17 @@ pub fn shared_mpv_kv_flags(
     let dev = detect_device_profile();
     let caps = detect_player_capabilities();
 
+    let ref_url = opts
+        .referer
+        .as_deref()
+        .filter(|r| !r.trim().is_empty())
+        .unwrap_or("https://zokoanime.video/");
+
     let mut global_kv = vec![
         "ytdl=no".to_string(),
         "force-window=immediate".to_string(),
         "keep-open=no".to_string(),
-        "referrer=https://zokoanime.video/".to_string(),
+        format!("referrer={ref_url}"),
         "input-terminal=no".to_string(),
     ];
 
@@ -1546,6 +1560,7 @@ mod tests {
             performance_mode: PerformanceMode::Balanced,
             deband_mode: DebandMode::Auto,
             motion_mode: MotionMode::Off,
+            referer: None,
         }
     }
 
@@ -1623,15 +1638,20 @@ mod tests {
         assert!(yt_text.contains("m script-binding solus-cycle-motion"));
         assert!(yt_text.contains("g script-binding solus-cycle-perf"));
 
+        assert!(yt_text.contains("n script-binding solus-next-ep-key-lower"));
+        assert!(yt_text.contains("N script-binding solus-next-ep-key"));
+
         let lua_path = ensure_solus_audio_lua().unwrap();
         let lua_text = std::fs::read_to_string(lua_path).unwrap();
         assert!(lua_text.contains("solus-toggle-pip"));
         assert!(lua_text.contains("solus-toggle-hud"));
         assert!(lua_text.contains("solus-cycle-motion"));
         assert!(lua_text.contains("solus-skip-intro"));
-        assert!(lua_text.contains("solus-next-episode"));
+        assert!(lua_text.contains("solus-next-ep-key"));
+        assert!(lua_text.contains("solus-ipc-next-ep"));
+        assert!(lua_text.contains("next_ep_dispatched"));
+        assert!(!lua_text.contains(r#""script-message", "solus-next-ep-key""#));
         assert!(lua_text.contains("solus-snap-sub-voice"));
-        assert!(lua_text.contains("__SOLUS_NEXT_EPISODE__"));
         assert!(lua_text.contains("solus-toggle-sub-bar"));
     }
 }

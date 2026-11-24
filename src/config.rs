@@ -21,6 +21,16 @@ pub enum Quality {
 }
 
 impl Quality {
+    pub fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "360p" | "p360" => Self::P360,
+            "480p" | "p480" => Self::P480,
+            "720p" | "p720" => Self::P720,
+            "best" => Self::Best,
+            _ => Self::P1080,
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         match self {
             Quality::P360  => "360p",
@@ -197,6 +207,16 @@ pub enum AudioMode {
     Dub,
 }
 
+impl AudioMode {
+    pub fn from_str_lossy(raw: &str) -> Self {
+        if raw.trim().eq_ignore_ascii_case("dub") {
+            Self::Dub
+        } else {
+            Self::Sub
+        }
+    }
+}
+
 /// Unified `libmpv` video player engine selector (`Auto-Best`, `mpv`, `mpv.net`, `Celluloid`).
 /// Legacy `"iina"` / `"vlc"` config entries transparently migrate to `Player::AutoBest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -224,6 +244,11 @@ impl Player {
             // "auto", "auto-best", "autobest", and legacy "iina" / "vlc"
             _ => Self::AutoBest,
         }
+    }
+
+    /// Legacy-compatible `player` key string readable by older Solus builds (`"mpv"`).
+    pub fn legacy_config_str(&self) -> &'static str {
+        "mpv"
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -312,6 +337,15 @@ impl PerformanceMode {
         PerformanceMode::Reference4K,
     ];
 
+    pub fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "eco" => Self::Eco,
+            "reference4_k" | "reference4k" | "reference_4k" | "ref4k" => Self::Reference4K,
+            _ => Self::Balanced,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "Auto (Thermal)",
@@ -364,6 +398,14 @@ pub enum DebandMode {
 impl DebandMode {
     pub const ALL: [DebandMode; 3] = [DebandMode::Auto, DebandMode::Off, DebandMode::Strong];
 
+    pub fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" => Self::Off,
+            "strong" => Self::Strong,
+            _ => Self::Auto,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "Auto (1-Pass)",
@@ -402,6 +444,14 @@ pub enum MotionMode {
 
 impl MotionMode {
     pub const ALL: [MotionMode; 3] = [MotionMode::Off, MotionMode::Cadence, MotionMode::Smooth];
+
+    pub fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "cadence" => Self::Cadence,
+            "smooth" => Self::Smooth,
+            _ => Self::Off,
+        }
+    }
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -473,6 +523,14 @@ pub enum Anime4KMode {
 }
 
 impl Anime4KMode {
+    pub fn from_str_lossy(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "balanced" | "balanced 2x" => Self::Balanced,
+            "ultra" | "ultra 4k" => Self::Ultra,
+            _ => Self::Off,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Anime4KMode::Off => "off",
@@ -490,8 +548,191 @@ fn default_active_profile() -> String {
     "default".to_string()
 }
 
-/// Root config struct — persisted to ~/.config/ani-tui/config.toml
+fn de_lossy_quality<'de, D>(deserializer: D) -> std::result::Result<Quality, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer).unwrap_or_else(|_| "1080p".to_string());
+    Ok(Quality::from_str_lossy(&s))
+}
+
+fn de_lossy_audio<'de, D>(deserializer: D) -> std::result::Result<AudioMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer).unwrap_or_else(|_| "sub".to_string());
+    Ok(AudioMode::from_str_lossy(&s))
+}
+
+fn de_lossy_player_opt<'de, D>(deserializer: D) -> std::result::Result<Option<Player>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer).ok().flatten();
+    Ok(opt.map(|s| Player::from_str_lossy(&s)))
+}
+
+fn de_lossy_anime4k<'de, D>(deserializer: D) -> std::result::Result<Anime4KMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer).unwrap_or_else(|_| "off".to_string());
+    Ok(Anime4KMode::from_str_lossy(&s))
+}
+
+fn de_lossy_network<'de, D>(deserializer: D) -> std::result::Result<NetworkMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer).unwrap_or_else(|_| "normal".to_string());
+    Ok(NetworkMode::from_str_lossy(&s))
+}
+
+fn de_lossy_perf<'de, D>(deserializer: D) -> std::result::Result<PerformanceMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer).unwrap_or_else(|_| "balanced".to_string());
+    Ok(PerformanceMode::from_str_lossy(&s))
+}
+
+fn de_lossy_deband<'de, D>(deserializer: D) -> std::result::Result<DebandMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer).unwrap_or_else(|_| "auto".to_string());
+    Ok(DebandMode::from_str_lossy(&s))
+}
+
+fn de_lossy_motion<'de, D>(deserializer: D) -> std::result::Result<MotionMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer).unwrap_or_else(|_| "off".to_string());
+    Ok(MotionMode::from_str_lossy(&s))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConfigFile {
+    #[serde(default, deserialize_with = "de_lossy_quality")]
+    pub quality: Quality,
+    #[serde(default, deserialize_with = "de_lossy_audio")]
+    pub audio_mode: AudioMode,
+    #[serde(default)]
+    pub player: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "de_lossy_player_opt")]
+    pub player_engine: Option<Player>,
+    #[serde(default = "default_sub_lang_val")]
+    pub default_sub_lang: String,
+    #[serde(default = "default_auto_skip_intro")]
+    pub auto_skip_intro: bool,
+    #[serde(default = "default_anime4k", deserialize_with = "de_lossy_anime4k")]
+    pub anime4k_mode: Anime4KMode,
+    #[serde(default)]
+    pub ambilight_enabled: bool,
+    #[serde(default)]
+    pub update: UpdateConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
+    #[serde(default)]
+    pub subtitle_style: crate::services::substyler::SubtitleStyleConfig,
+    #[serde(default)]
+    pub remote: RemoteConfig,
+    #[serde(default)]
+    pub cast: CastConfig,
+    #[serde(default)]
+    pub trackers: TrackersConfig,
+    #[serde(default = "default_active_profile")]
+    pub active_profile: String,
+    #[serde(default)]
+    pub config_version: u32,
+    #[serde(default, deserialize_with = "de_lossy_network")]
+    pub network_mode: NetworkMode,
+    #[serde(default)]
+    pub force_ipv4: bool,
+    #[serde(default = "default_true")]
+    pub auto_abr_downshift: bool,
+    #[serde(default)]
+    pub auto_fullscreen: bool,
+    #[serde(default)]
+    pub auto_pip: bool,
+    #[serde(default, deserialize_with = "de_lossy_perf")]
+    pub performance_mode: PerformanceMode,
+    #[serde(default, deserialize_with = "de_lossy_deband")]
+    pub deband_mode: DebandMode,
+    #[serde(default, deserialize_with = "de_lossy_motion")]
+    pub motion_mode: MotionMode,
+}
+
+impl From<Config> for ConfigFile {
+    fn from(c: Config) -> Self {
+        Self {
+            quality: c.quality,
+            audio_mode: c.audio_mode,
+            // Always write a legacy-safe player variant ("mpv") so older binaries never fail TOML parsing,
+            // while persisting the exact libmpv selector in `player_engine`.
+            player: c.player.legacy_config_str().to_string(),
+            player_engine: Some(c.player),
+            default_sub_lang: c.default_sub_lang,
+            auto_skip_intro: c.auto_skip_intro,
+            anime4k_mode: c.anime4k_mode,
+            ambilight_enabled: c.ambilight_enabled,
+            update: c.update,
+            cache: c.cache,
+            subtitle_style: c.subtitle_style,
+            remote: c.remote,
+            cast: c.cast,
+            trackers: c.trackers,
+            active_profile: c.active_profile,
+            config_version: c.config_version,
+            network_mode: c.network_mode,
+            force_ipv4: c.force_ipv4,
+            auto_abr_downshift: c.auto_abr_downshift,
+            auto_fullscreen: c.auto_fullscreen,
+            auto_pip: c.auto_pip,
+            performance_mode: c.performance_mode,
+            deband_mode: c.deband_mode,
+            motion_mode: c.motion_mode,
+        }
+    }
+}
+
+impl From<ConfigFile> for Config {
+    fn from(f: ConfigFile) -> Self {
+        let player = f
+            .player_engine
+            .unwrap_or_else(|| Player::from_str_lossy(&f.player));
+        Self {
+            quality: f.quality,
+            audio_mode: f.audio_mode,
+            player,
+            default_sub_lang: f.default_sub_lang,
+            auto_skip_intro: f.auto_skip_intro,
+            anime4k_mode: f.anime4k_mode,
+            ambilight_enabled: f.ambilight_enabled,
+            update: f.update,
+            cache: f.cache,
+            subtitle_style: f.subtitle_style,
+            remote: f.remote,
+            cast: f.cast,
+            trackers: f.trackers,
+            active_profile: f.active_profile,
+            config_version: f.config_version,
+            network_mode: f.network_mode,
+            force_ipv4: f.force_ipv4,
+            auto_abr_downshift: f.auto_abr_downshift,
+            auto_fullscreen: f.auto_fullscreen,
+            auto_pip: f.auto_pip,
+            performance_mode: f.performance_mode,
+            deband_mode: f.deband_mode,
+            motion_mode: f.motion_mode,
+        }
+    }
+}
+
+/// Root config struct — persisted to ~/.config/solus/config.toml
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "ConfigFile", into = "ConfigFile")]
 pub struct Config {
     pub quality:          Quality,
     pub audio_mode:       AudioMode,
@@ -565,7 +806,7 @@ impl Default for Config {
             cast:             CastConfig::default(),
             trackers:         TrackersConfig::default(),
             active_profile:   default_active_profile(),
-            config_version:   2,
+            config_version:   3,
             network_mode:     NetworkMode::Normal,
             force_ipv4:       false,
             auto_abr_downshift: true,
@@ -797,9 +1038,9 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Upgrade legacy v1 defaults once cleanly while preserving explicit future user choices.
+    /// Upgrade legacy v1/v2 defaults once cleanly while preserving explicit future user choices.
     pub fn migrate_legacy_defaults(&mut self) -> bool {
-        if self.config_version >= 2 {
+        if self.config_version >= 3 {
             return false;
         }
         if self.config_version == 0 {
@@ -810,9 +1051,13 @@ impl Config {
                 self.update.check_interval = 0;
             }
         }
-        // Keep Detail screen consistent with the user's chosen `[T]` palette unless explicitly re-enabled
-        self.ambilight_enabled = false;
-        self.config_version = 2;
+        if self.config_version < 2 {
+            // Keep Detail screen consistent with the user's chosen `[T]` palette unless explicitly re-enabled
+            self.ambilight_enabled = false;
+        }
+        // Default auto-skip OFF so users rely on the interactive Skip Intro pill unless explicitly toggled ON
+        self.auto_skip_intro = false;
+        self.config_version = 3;
         true
     }
 
@@ -1458,7 +1703,8 @@ detail_ttl = 3600
         assert!(cfg.update.auto_install);
         assert_eq!(cfg.update.check_interval, 0);
         assert!(!cfg.ambilight_enabled);
-        assert_eq!(cfg.config_version, 2);
+        assert!(!cfg.auto_skip_intro);
+        assert_eq!(cfg.config_version, 3);
 
         // User opting back out after migration must not be overridden on subsequent loads.
         cfg.update.auto_install = false;
@@ -1470,6 +1716,43 @@ detail_ttl = 3600
         assert!(cfg.auto_abr_downshift);
         assert_eq!(cfg.remote.theme_id, "lain-wired");
         assert_eq!(cfg.remote.art_mode, "companion");
+    }
+
+    #[test]
+    fn test_config_serializes_legacy_safe_player_and_preserves_engine() {
+        for engine in Player::ALL {
+            let mut cfg = Config::default();
+            cfg.player = engine;
+            let raw = toml::to_string_pretty(&cfg).unwrap();
+            assert!(
+                raw.contains("player = \"mpv\""),
+                "player field must stay legacy-safe for {:?}: {}",
+                engine,
+                raw
+            );
+            let parsed: Config = toml::from_str(&raw).unwrap();
+            assert_eq!(parsed.player, engine);
+        }
+    }
+
+    #[test]
+    fn test_config_deserializes_unknown_enum_values_gracefully() {
+        let odd_toml = r#"
+quality = "4k-ultra-future"
+audio_mode = "unknown"
+player = "unknown-player"
+player_engine = "iina"
+performance_mode = "future_tier"
+deband_mode = "future_deband"
+motion_mode = "future_motion"
+"#;
+        let cfg: Config = toml::from_str(odd_toml).unwrap();
+        assert_eq!(cfg.player, Player::AutoBest);
+        assert_eq!(cfg.quality, Quality::P1080);
+        assert_eq!(cfg.audio_mode, AudioMode::Sub);
+        assert_eq!(cfg.performance_mode, PerformanceMode::Balanced);
+        assert_eq!(cfg.deband_mode, DebandMode::Auto);
+        assert_eq!(cfg.motion_mode, MotionMode::Off);
     }
 
     #[test]
