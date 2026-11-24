@@ -106,6 +106,12 @@ pub struct PlayOptions {
     /// HTTP Referer header required by the active stream provider CDN
     #[serde(default)]
     pub referer: Option<String>,
+    /// Explicit demuxed HLS audio rendition URLs (ordered Sub/Dub first)
+    #[serde(default)]
+    pub audio_urls: Vec<String>,
+    /// True if the video URL is video-only demuxed HLS requiring external `--audio-file`
+    #[serde(default)]
+    pub has_demuxed_audio: bool,
 }
 
 /// Build the `ani-cli` command arguments for legacy fallback scraping.
@@ -421,15 +427,23 @@ fi
 #[cfg_attr(not(windows), allow(dead_code))]
 fn derive_master_playlist_url(video_link: &str) -> Option<String> {
     let trimmed = video_link.split('?').next().unwrap_or(video_link);
-    if !trimmed.ends_with("/index.m3u8") {
-        return None;
+    if trimmed.ends_with("/index.m3u8") {
+        let without_file = trimmed.strip_suffix("/index.m3u8")?;
+        let (parent_of_parent, _) = without_file.rsplit_once('/')?;
+        if !parent_of_parent.contains("://") || parent_of_parent.ends_with(":/") {
+            return None;
+        }
+        return Some(format!("{parent_of_parent}/master.m3u8"));
     }
-    let without_file = trimmed.strip_suffix("/index.m3u8")?;
-    let (parent_of_parent, _) = without_file.rsplit_once('/')?;
-    if !parent_of_parent.contains("://") || parent_of_parent.ends_with(":/") {
-        return None;
+    if let Some((parent, file_name)) = trimmed.rsplit_once('/') {
+        if file_name.starts_with("index-f") && file_name.ends_with(".m3u8") {
+            if !parent.contains("://") || parent.ends_with(":/") {
+                return None;
+            }
+            return Some(format!("{parent}/master.m3u8"));
+        }
     }
-    Some(format!("{parent_of_parent}/master.m3u8"))
+    None
 }
 
 const YOUTUBE_INPUT_CONF: &str = r#"# Solus Unified libmpv Keybindings (mpv / mpv.net / Celluloid)
@@ -717,7 +731,22 @@ local function render_info_hud()
     local vh = mp.get_property_number("height", 0) or 0
     local fps = mp.get_property_number("estimated-vf-fps", 0) or 0
     local disp_fps = mp.get_property_number("display-fps", 0) or 0
-    local vcodec = esc_ass(mp.get_property("video-codec", "—")):upper()
+    local raw_codec = mp.get_property("video-codec-name", mp.get_property("video-codec", "")) or ""
+    local vcodec_u = esc_ass(raw_codec):upper()
+    if vcodec_u:find("H264") or vcodec_u:find("AVC") then
+        vcodec_u = "H.264"
+    elseif vcodec_u:find("HEVC") or vcodec_u:find("H265") or vcodec_u:find("HVC") then
+        vcodec_u = "H.265/HEVC"
+    elseif vcodec_u:find("AV1") or vcodec_u:find("AV01") then
+        vcodec_u = "AV1"
+    elseif vcodec_u:find("VP9") or vcodec_u:find("VP09") then
+        vcodec_u = "VP9"
+    elseif vcodec_u == "" then
+        vcodec_u = "—"
+    elseif #vcodec_u > 16 then
+        vcodec_u = string.sub(vcodec_u, 1, 14) .. ".."
+    end
+    local vcodec = vcodec_u
     local vbit = mp.get_property_number("video-bitrate", 0) or 0
     local hwdec = esc_ass(mp.get_property("hwdec-current", ""))
     local drops = (mp.get_property_number("decoder-frame-drop-count", 0) or 0) + (mp.get_property_number("frame-drop-count", 0) or 0)
@@ -790,7 +819,7 @@ local function render_info_hud()
         "{\\an7\\pos(860,200)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}VideoOut: {\\1c&H24BFFB&}%s\n" ..
         "{\\an7\\pos(860,224)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}Dropped : {\\1c%s}%d frames\n" ..
         "{\\an7\\pos(860,248)\\bord0\\shad0\\fs16\\1c&HC8B8A4&}A/V Sync: {\\1c&H99D334&}%+.1f ms\n" ..
-        "{\\an7\\pos(66,288)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}⚡ DEMUXER CACHE   {\\1c&HFAF4F0&\\b0}%.1fs ahead  ·  %.1f MiB  %s  ·  {\\1c%s}%s\n" ..
+        "{\\an7\\pos(66,288)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}◈ DEMUXER CACHE   {\\1c&HFAF4F0&\\b0}%.1fs ahead  ·  %.1f MiB  %s  ·  {\\1c%s}%s\n" ..
         "{\\an7\\pos(66,314)\\bord0\\shad0\\1c&H2B2420&\\p1}m 0 0 l 520 0 l 520 10 l 0 10{\\p0}\n" ..
         "{\\an7\\pos(66,314)\\bord0\\shad0\\1c%s\\p1}m 0 0 l %d 0 l %d 10 l 0 10{\\p0}\n" ..
         "{\\an7\\pos(66,340)\\bord0\\shad0\\fs15\\1c&HC8B8A4&}Keys: {\\1c&HF8BD38&}[Tab] Skip  [N] Next  [y] Snap Sub  {\\1c&H99D334&}[p/P] PiP  {\\1c&H24BFFB&}[a] Shaders [d] Deband [m] Motion  {\\1c&HFA8BA7&}[i/I] HUD [F1] Raw",
@@ -857,7 +886,7 @@ mp.add_forced_key_binding("I", "solus-pin-hud", pin_info_hud)
 
 -- =============================================================================
 -- 5. Crunchyroll/Netflix Clickable Buttons ([Skip Intro/Outro], [Next Ep])
---    & Interactive Subtitle Sync Bar ([S] / [-0.5][-0.1][⚡ SNAP][+0.1][+0.5])
+--    & Elevated Sub Sync Bar ([S] / [i] / [-5s][-1s][-0.2s][◈ AUTO-SYNC][+0.2s][+1s][+5s])
 -- =============================================================================
 local utils = require 'mp.utils'
 local btn_ov = mp.create_osd_overlay("ass-events")
@@ -877,6 +906,9 @@ local next_ep_dispatched = false
 local hover_active_until = 0
 local hovered_btn_id = nil
 local active_hitboxes = {}
+local sync_in_progress = false
+local sync_status_msg = "Press [y] or click AUTO-SYNC VOICE for automated Speech-VAD alignment"
+local sync_status_col = "&HC8B8A4&"
 
 local function active_sub_file_path()
     if player_ctx.sub_path and player_ctx.sub_path ~= "" then
@@ -905,88 +937,85 @@ local function parse_sub_ts(s)
     return nil
 end
 
-local function collect_cue_starts(path)
-    local f = io.open(path, "r")
-    if not f then return {} end
-    local cues = {}
+local function find_active_cue_preview(delay_secs)
+    local live_txt = esc_ass(mp.get_property("sub-text", "") or "")
+    local cur_t = (mp.get_property_number("time-pos", 0) or 0) - (delay_secs or 0)
+    if live_txt ~= "" then
+        if #live_txt > 62 then live_txt = string.sub(live_txt, 1, 59) .. "..." end
+        return string.format("Live Subtitle: \"%s\"", live_txt)
+    end
+    local spath = active_sub_file_path()
+    if not spath or spath:match("^https?://") then
+        return "No local cue preview — subtitles will preview live when cached"
+    end
+    local f = io.open(spath, "r")
+    if not f then return "Cue preview unavailable" end
+    local nearest_ts, nearest_txt, nearest_dist = nil, nil, 999999
+    local prev_start = nil
     for line in f:lines() do
-        local start_s = line:match("^%s*([%d:%.]+)%s*%-%->")
-        if start_s then
-            local ts = parse_sub_ts(start_s)
-            if ts then table.insert(cues, ts) end
+        local s_ts = line:match("^%s*([%d:%.]+)%s*%-%->")
+        if s_ts then
+            prev_start = parse_sub_ts(s_ts)
         elseif line:match("^Dialogue:") then
-            local s_ts = line:match("^Dialogue:%s*%d+,([^,]+),")
-            local ts = parse_sub_ts(s_ts)
-            if ts then table.insert(cues, ts) end
+            local a_ts, a_txt = line:match("^Dialogue:%s*%d+,([^,]+),[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,(.*)$")
+            local ts = parse_sub_ts(a_ts)
+            if ts and a_txt then
+                local clean = esc_ass(a_txt:gsub("{[^}]*}", ""):gsub("\\N", " "))
+                local d = math.abs(ts - cur_t)
+                if clean ~= "" and d < nearest_dist then
+                    nearest_dist, nearest_ts, nearest_txt = d, ts, clean
+                end
+            end
+        elseif prev_start ~= nil and not line:match("^%s*$") and not line:match("^%d+$") then
+            local clean = esc_ass(line:gsub("<[^>]*>", ""))
+            local d = math.abs(prev_start - cur_t)
+            if clean ~= "" and d < nearest_dist then
+                nearest_dist, nearest_ts, nearest_txt = d, prev_start, clean
+            end
+            prev_start = nil
         end
     end
     f:close()
-    return cues
-end
-
-local function snap_sub_to_voice()
-    local cur_t = mp.get_property_number("time-pos", nil)
-    if not cur_t then return end
-    local spath = active_sub_file_path()
-    if not spath or spath:match("^https?://") then
-        mp.osd_message("⚡ Snap requires cached subtitle track (use [z]/[x] -/+100ms)", 2.5)
-        return
+    if nearest_ts and nearest_txt then
+        if #nearest_txt > 52 then nearest_txt = string.sub(nearest_txt, 1, 49) .. "..." end
+        return string.format("Nearest Cue @ %s: \"%s\"", fmt_clock(nearest_ts + (delay_secs or 0)), nearest_txt)
     end
-    local cues = collect_cue_starts(spath)
-    if #cues == 0 then
-        mp.osd_message("⚡ No subtitle timestamps found — use [z]/[x] -/+100ms", 2.5)
-        return
-    end
-    local cur_delay = mp.get_property_number("sub-delay", 0.0) or 0.0
-    -- Look for nearest subtitle cue relative to video time within +-15s
-    local best_cue = nil
-    local best_dist = 15.0
-    for _, ts in ipairs(cues) do
-        local dist = math.abs(ts - cur_t)
-        if dist < best_dist then
-            best_dist = dist
-            best_cue = ts
-        end
-    end
-    if not best_cue then
-        mp.osd_message("⚡ Speak while hovering a dialogue scene (+-15s) to snap", 2.5)
-        return
-    end
-    local new_delay = math.max(-30.0, math.min(30.0, cur_t - best_cue))
-    mp.set_property_number("sub-delay", new_delay)
-    mp.osd_message(string.format("⚡ Snapped Subtitle to Voice (%+.2fs, was %+.2fs)", new_delay, cur_delay), 2.8)
+    return "No dialogue cues found in file"
 end
 
 local function do_skip_intro_or_outro()
     local cur_t = mp.get_property_number("time-pos", 0) or 0
     if player_ctx.op_start and player_ctx.op_end and cur_t >= (player_ctx.op_start - 2.0) and cur_t < (player_ctx.op_end - 1.0) then
         mp.commandv("seek", player_ctx.op_end, "absolute")
-        mp.osd_message("⏭ Skipped Intro (AniSkip)", 2.2)
+        mp.osd_message(">>| Skipped Intro (AniSkip)", 2.2)
     elseif player_ctx.ed_start and player_ctx.ed_end and cur_t >= (player_ctx.ed_start - 2.0) and cur_t < (player_ctx.ed_end - 1.0) then
         mp.commandv("seek", player_ctx.ed_end, "absolute")
-        mp.osd_message("⏭ Skipped Outro (AniSkip)", 2.2)
+        mp.osd_message(">>| Skipped Outro (AniSkip)", 2.2)
     elseif cur_t < 155.0 then
         mp.commandv("seek", cur_t + 85.0, "absolute")
-        mp.osd_message("⏭ Skipped Intro (+85s)", 2.2)
+        mp.osd_message(">>| Skipped Intro (+85s)", 2.2)
     else
         mp.commandv("seek", 85.0, "relative")
-        mp.osd_message("⏭ Jumped +85s", 1.8)
+        mp.osd_message(">>| Jumped +85s", 1.8)
     end
 end
 
 local function do_next_episode()
     if next_ep_dispatched then return end
     next_ep_dispatched = true
-    mp.osd_message("⏭ Loading Next Episode...", 2.5)
+    mp.osd_message(">>| Loading Next Episode...", 2.5)
     -- Distinct script-message name (differs from key-binding names) prevents mpv recursion!
     mp.commandv("script-message", "solus-ipc-next-ep")
 end
 
 local function adjust_sub_delay(delta)
     local cur = mp.get_property_number("sub-delay", 0.0) or 0.0
-    local nxt = math.max(-30.0, math.min(30.0, cur + delta))
+    local nxt = math.max(-120.0, math.min(120.0, cur + delta))
     mp.set_property_number("sub-delay", nxt)
+    sync_status_msg = string.format("Manual offset adjusted (%+.2fs)", nxt)
+    sync_status_col = "&H24BFFB&"
     mp.osd_message(string.format("◈ Subtitle Delay: %+.2fs", nxt), 2.0)
+    if hud_visible then render_info_hud() end
 end
 
 local function render_player_buttons()
@@ -1007,39 +1036,50 @@ local function render_player_buttons()
         table.insert(lines, string.format("{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c%s\\p1}m %d %d l %d %d l %d %d l %d %d{\\p0}", border_col, x1, y1, x2, y1, x2, y2, x1, y2))
         local cx = math.floor((x1 + x2) / 2)
         local cy = math.floor((y1 + y2) / 2)
-        table.insert(lines, string.format("{\\an5\\pos(%d,%d)\\bord0\\shad0\\fs17\\b1\\1c%s}%s", cx, cy, text_col, label))
+        table.insert(lines, string.format("{\\an5\\pos(%d,%d)\\bord0\\shad0\\fs16\\b1\\1c%s}%s", cx, cy, text_col, label))
         table.insert(active_hitboxes, { id = id, x1 = x1, y1 = y1, x2 = x2, y2 = y2 })
     end
 
-    -- 1. Skip Intro / Skip Outro Pill
+    -- 1. Skip Intro / Skip Outro Pill (elevated safely above OSC)
     local in_op = player_ctx.op_start and player_ctx.op_end and cur_t >= (player_ctx.op_start - 1.0) and cur_t < (player_ctx.op_end - 1.5)
     local in_ed = player_ctx.ed_start and player_ctx.ed_end and cur_t >= (player_ctx.ed_start - 1.0) and cur_t < (player_ctx.ed_end - 1.5)
     local op_fallback = (not player_ctx.op_end) and hover_alive and cur_t >= 2.0 and cur_t <= 150.0
     if in_op or op_fallback then
-        draw_pill("skip_op", 978, 592, 1236, 636, ">>|  SKIP INTRO  [Tab]", "&HF8BD38&")
+        draw_pill("skip_op", 978, 540, 1236, 584, ">>|  SKIP INTRO  [Tab]", "&HF8BD38&")
     elseif in_ed then
-        draw_pill("skip_ed", 978, 592, 1236, 636, ">>|  SKIP OUTRO  [Tab]", "&HF8BD38&")
+        draw_pill("skip_ed", 978, 540, 1236, 584, ">>|  SKIP OUTRO  [Tab]", "&HF8BD38&")
     end
 
     -- 2. Next Episode Pill (ED, >= 88%, final 90s, or hover in final 35%)
     local near_end = dur > 60.0 and ((cur_t / dur) >= 0.88 or (dur - cur_t) <= 90.0 or (hover_alive and (cur_t / dur) >= 0.65))
     if player_ctx.next_ep and (in_ed or near_end) then
-        draw_pill("next_ep", 938, 646, 1236, 692, string.format(">>|  NEXT EPISODE: Ep %d  [n/N]", player_ctx.next_ep), "&HFA8BA7&")
+        draw_pill("next_ep", 938, 590, 1236, 634, string.format(">>|  NEXT EPISODE: Ep %d  [n/N]", player_ctx.next_ep), "&HFA8BA7&")
     end
 
-    -- 3. Interactive Subtitle Sync Bar ([S] Toggle)
+    -- 3. Interactive Subtitle Sync Bar ([S] or [i] HUD — elevated cleanly above mpv OSC!)
     if sub_bar_open then
         local delay = mp.get_property_number("sub-delay", 0.0) or 0.0
-        table.insert(lines, "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H100C09&\\1a&H18&\\p1}m 190 642 l 1090 642 l 1090 698 l 190 698{\\p0}")
-        table.insert(lines, "{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&H24BFFB&\\p1}m 190 642 l 1090 642 l 1090 698 l 190 698{\\p0}")
-        table.insert(lines, string.format("{\\an7\\pos(208,658)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}SUB SYNC %+.2fs", delay))
-        draw_pill("sub_m50", 358, 650, 434, 690, "-0.5s", "&H24BFFB&")
-        draw_pill("sub_m10", 442, 650, 518, 690, "-0.1s", "&H24BFFB&")
-        draw_pill("sub_snap", 528, 650, 760, 690, "⚡ SNAP TO VOICE [y]", "&H99D334&")
-        draw_pill("sub_p10", 770, 650, 846, 690, "+0.1s", "&H24BFFB&")
-        draw_pill("sub_p50", 854, 650, 930, 690, "+0.5s", "&H24BFFB&")
-        draw_pill("sub_rst", 940, 650, 1020, 690, "Reset", "&HFA8BA7&")
-        draw_pill("sub_cls", 1028, 650, 1076, 690, "X", "&H5E3FF4&")
+        local sy1 = hud_visible and 390 or 516
+        local sy2 = sy1 + 96
+        local py1 = sy1 + 10
+        local py2 = sy1 + 48
+        table.insert(lines, string.format("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H100C09&\\1a&H14&\\p1}m 42 %d l 1238 %d l 1238 %d l 42 %d{\\p0}", sy1, sy1, sy2, sy2))
+        table.insert(lines, string.format("{\\an7\\pos(0,0)\\bord2\\1a&HFF&\\3c&H24BFFB&\\p1}m 42 %d l 1238 %d l 1238 %d l 42 %d{\\p0}", sy1, sy1, sy2, sy2))
+        table.insert(lines, string.format("{\\an7\\pos(62,%d)\\bord0\\shad0\\fs16\\b1\\1c&H24BFFB&}SUB SYNC %+.2fs", sy1 + 20, delay))
+        draw_pill("sub_m500", 214, py1, 274, py2, "-5s", "&H24BFFB&")
+        draw_pill("sub_m100", 280, py1, 340, py2, "-1s", "&H24BFFB&")
+        draw_pill("sub_m20",  346, py1, 414, py2, "-0.2s", "&H24BFFB&")
+        local snap_lbl = sync_in_progress and "◈ ANALYZING AUDIO..." or "◈ AUTO-SYNC VOICE [y]"
+        local snap_col = sync_in_progress and "&HF8BD38&" or "&H99D334&"
+        draw_pill("sub_snap", 422, py1, 676, py2, snap_lbl, snap_col)
+        draw_pill("sub_p20",  684, py1, 752, py2, "+0.2s", "&H24BFFB&")
+        draw_pill("sub_p100", 758, py1, 818, py2, "+1s", "&H24BFFB&")
+        draw_pill("sub_p500", 824, py1, 884, py2, "+5s", "&H24BFFB&")
+        draw_pill("sub_rst",  894, py1, 974, py2, "Reset", "&HFA8BA7&")
+        draw_pill("sub_cls",  982, py1, 1028, py2, "X", "&H5E3FF4&")
+
+        local cue_preview = find_active_cue_preview(delay)
+        table.insert(lines, string.format("{\\an7\\pos(62,%d)\\bord0\\shad0\\fs14\\1c&HFAF4F0&}%s   {\\1c%s}[%s]", sy1 + 60, cue_preview, sync_status_col, esc_ass(sync_status_msg)))
     end
 
     if #lines == 0 then
@@ -1050,27 +1090,50 @@ local function render_player_buttons()
     end
 end
 
+local function snap_sub_to_voice()
+    local cur_t = mp.get_property_number("time-pos", nil)
+    if not cur_t then return end
+    if sync_in_progress then
+        mp.osd_message("◈ Speech-VAD sync already analyzing audio...", 1.8)
+        return
+    end
+    sync_in_progress = true
+    sync_status_msg = "Sampling voice track & correlating (-90s..+90s)..."
+    sync_status_col = "&HF8BD38&"
+    mp.osd_message("◈ Analyzing speech audio (-90s..+90s)... please wait", 3.5)
+    mp.commandv("script-message", "solus-ipc-auto-sync-sub", string.format("%.2f", cur_t))
+    render_player_buttons()
+end
+
 local function handle_btn_click()
     local id = hovered_btn_id
     if id == "skip_op" or id == "skip_ed" then
         do_skip_intro_or_outro()
     elseif id == "next_ep" then
         do_next_episode()
-    elseif id == "sub_m50" then
-        adjust_sub_delay(-0.5)
-    elseif id == "sub_m10" then
-        adjust_sub_delay(-0.1)
+    elseif id == "sub_m500" then
+        adjust_sub_delay(-5.0)
+    elseif id == "sub_m100" then
+        adjust_sub_delay(-1.0)
+    elseif id == "sub_m20" then
+        adjust_sub_delay(-0.2)
     elseif id == "sub_snap" then
         snap_sub_to_voice()
-    elseif id == "sub_p10" then
-        adjust_sub_delay(0.1)
-    elseif id == "sub_p50" then
-        adjust_sub_delay(0.5)
+    elseif id == "sub_p20" then
+        adjust_sub_delay(0.2)
+    elseif id == "sub_p100" then
+        adjust_sub_delay(1.0)
+    elseif id == "sub_p500" then
+        adjust_sub_delay(5.0)
     elseif id == "sub_rst" then
         mp.set_property_number("sub-delay", 0.0)
+        sync_status_msg = "Delay reset to 0.00s"
+        sync_status_col = "&HFA8BA7&"
         mp.osd_message("◈ Subtitle Delay Reset: 0.00s", 1.8)
+        if hud_visible then render_info_hud() end
     elseif id == "sub_cls" then
         sub_bar_open = false
+        if hud_visible then hide_info_hud() end
     end
     render_player_buttons()
 end
@@ -1105,6 +1168,25 @@ mp.observe_property("mouse-pos", "native", function(_, mpos)
         end
     end
     render_player_buttons()
+end)
+
+mp.register_script_message("solus-sync-status", function(json_str)
+    sync_in_progress = false
+    local parsed = utils.parse_json(json_str or "")
+    if type(parsed) == "table" then
+        if parsed.ok and parsed.delay_secs ~= nil then
+            mp.set_property_number("sub-delay", parsed.delay_secs)
+            sync_status_col = "&H99D334&"
+        else
+            sync_status_col = "&H5E3FF4&"
+        end
+        if parsed.message and parsed.message ~= "" then
+            sync_status_msg = parsed.message
+            mp.osd_message("◈ " .. tostring(parsed.message), 3.2)
+        end
+        if hud_visible then render_info_hud() end
+        render_player_buttons()
+    end
 end)
 
 mp.register_script_message("solus-player-ctx", function(json_str)
@@ -1168,7 +1250,7 @@ pub fn mpv_network_kv_args(
     }
     kv.extend([
         "stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=3,multiple_requests=1".to_string(),
-        "demuxer-lavf-o=http_persistent=1,http_multiple=1".to_string(),
+        "demuxer-lavf-o=http_persistent=1,http_multiple=1,allowed_extensions=ALL,allowed_segment_extensions=ALL".to_string(),
         format!("hls-bitrate={}", mode.hls_bitrate_cap()),
         format!("demuxer-readahead-secs={}", mode.vod_readahead_secs()),
         "cache-pause-initial=yes".to_string(),
@@ -1280,8 +1362,16 @@ pub fn shared_mpv_kv_flags(
         let delay_secs = opts.sub_delay_ms as f64 / 1000.0;
         item_kv.push(format!("sub-delay={delay_secs:.3}"));
     }
-    if let Some(master_url) = derive_master_playlist_url(direct_url) {
-        item_kv.push(format!("audio-file={master_url}"));
+    if !opts.audio_urls.is_empty() {
+        for aurl in &opts.audio_urls {
+            if !aurl.trim().is_empty() {
+                item_kv.push(format!("audio-file={aurl}"));
+            }
+        }
+    } else if opts.has_demuxed_audio {
+        if let Some(master_url) = derive_master_playlist_url(direct_url) {
+            item_kv.push(format!("audio-file={master_url}"));
+        }
     }
     item_kv.push("audio-file-auto=all".to_string());
     if opts.dub {
@@ -1561,6 +1651,8 @@ mod tests {
             deband_mode: DebandMode::Auto,
             motion_mode: MotionMode::Off,
             referer: None,
+            audio_urls: Vec::new(),
+            has_demuxed_audio: false,
         }
     }
 
@@ -1653,5 +1745,25 @@ mod tests {
         assert!(!lua_text.contains(r#""script-message", "solus-next-ep-key""#));
         assert!(lua_text.contains("solus-snap-sub-voice"));
         assert!(lua_text.contains("solus-toggle-sub-bar"));
+        assert!(lua_text.contains("solus-ipc-auto-sync-sub"));
+        assert!(lua_text.contains("solus-sync-status"));
+        assert!(!lua_text.contains("⚡"), "Lua ASS canvas must not use missing-glyph lightning bolt");
+
+        // Verify demuxed audio_urls emits explicit --audio-file flags whereas muxed Zoko does not
+        let mut o_mux = opts("Chainsmoker Cat", 1, "1080p", false);
+        o_mux.has_demuxed_audio = false;
+        let mux_args = build_mpv_direct_args(&o_mux, "https://hls.example.com/p/1080/index.m3u8", None);
+        assert!(!mux_args.iter().any(|a| a.starts_with("--audio-file=")));
+        assert!(mux_args.iter().any(|a| a.contains("allowed_segment_extensions=ALL")));
+
+        let mut o_demux = opts("Chainsmoker Cat", 1, "1080p", false);
+        o_demux.has_demuxed_audio = true;
+        o_demux.audio_urls = vec![
+            "https://fetch.nexabloom.top/a/audio/ja/index.m3u8".to_string(),
+            "https://fetch.nexabloom.top/a/audio/en/index.m3u8".to_string(),
+        ];
+        let demux_args = build_mpv_direct_args(&o_demux, "https://fetch.nexabloom.top/a/index-f1.m3u8", None);
+        assert!(demux_args.contains(&"--audio-file=https://fetch.nexabloom.top/a/audio/ja/index.m3u8".to_string()));
+        assert!(demux_args.contains(&"--audio-file=https://fetch.nexabloom.top/a/audio/en/index.m3u8".to_string()));
     }
 }

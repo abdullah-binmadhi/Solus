@@ -20,6 +20,10 @@ pub struct Anime {
     pub format:        Option<String>,
     /// JSON-encoded Vec<String>: ["Action", "Drama"]
     pub genres:        String,
+    /// JSON-encoded Vec<String> of alternate/romaji/synonym titles from AniList
+    #[serde(default)]
+    #[sqlx(default)]
+    pub synonyms:      String,
     pub cover_url:     Option<String>,
     pub cover_blob:    Option<Vec<u8>>,
     pub has_dub:       i64,  // 0 or 1 (SQLite has no bool)
@@ -93,6 +97,7 @@ impl Anime {
     }
 
     /// Candidate playback queries for ambiguous series/franchises.
+    #[allow(dead_code)]
     pub fn playback_queries(&self) -> Vec<String> {
         let mut queries = Vec::new();
 
@@ -111,6 +116,26 @@ impl Anime {
         }
 
         queries
+    }
+
+    /// Decoded synonym list.
+    pub fn synonym_list(&self) -> Vec<String> {
+        serde_json::from_str(&self.synonyms).unwrap_or_default()
+    }
+
+    /// Canonical multi-alias search identity for accurate cross-provider resolution.
+    pub fn search_identity(&self) -> crate::api::subtitles::AnimeSearchIdentity {
+        crate::api::subtitles::AnimeSearchIdentity {
+            anilist_id: self.id,
+            mal_id: self.mal_id,
+            title_english: self.title_english.clone(),
+            title_romaji: self.title_romaji.clone(),
+            title_native: self.title_native.clone(),
+            synonyms: self.synonym_list(),
+            season_year: self.season_year,
+            expected_episodes: self.episodes.and_then(|e| (e > 0).then_some(e as u32)),
+            format: self.format.clone(),
+        }
     }
 
     /// Returns true if dub is available.
@@ -132,6 +157,7 @@ fn title_specificity(title: &str) -> usize {
     title.len() + keyword_bonus + digit_bonus
 }
 
+#[allow(dead_code)]
 fn push_unique(values: &mut Vec<String>, candidate: String) {
     if !candidate.is_empty() && !values.iter().any(|existing| existing == &candidate) {
         values.push(candidate);
@@ -149,9 +175,9 @@ where
         INSERT INTO anime (
             id, title_english, title_romaji, title_native,
             description, episodes, status, season, season_year,
-            score, format, genres, cover_url, cover_blob, has_dub, updated_at,
+            score, format, genres, synonyms, cover_url, cover_blob, has_dub, updated_at,
             next_airing_episode, mal_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             title_english = excluded.title_english,
             title_romaji  = excluded.title_romaji,
@@ -164,6 +190,7 @@ where
             score         = excluded.score,
             format        = excluded.format,
             genres        = excluded.genres,
+            synonyms      = CASE WHEN excluded.synonyms != '[]' AND excluded.synonyms != '' THEN excluded.synonyms ELSE anime.synonyms END,
             cover_url     = excluded.cover_url,
             has_dub       = excluded.has_dub,
             updated_at    = excluded.updated_at,
@@ -183,6 +210,7 @@ where
     .bind(anime.score)
     .bind(&anime.format)
     .bind(&anime.genres)
+    .bind(if anime.synonyms.is_empty() { "[]" } else { &anime.synonyms })
     .bind(&anime.cover_url)
     .bind(&anime.cover_blob)
     .bind(anime.has_dub)
@@ -447,6 +475,7 @@ mod tests {
             score:         Some(85),
             format:        Some("TV".to_string()),
             genres:        r#"["Action","Drama"]"#.to_string(),
+            synonyms:      "[]".to_string(),
             cover_url:     Some("https://example.com/cover.jpg".to_string()),
             cover_blob:    None,
             has_dub:       0,

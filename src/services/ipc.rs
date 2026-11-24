@@ -229,6 +229,48 @@ pub fn send_set_fullscreen(fullscreen: bool) -> bool {
     all_ok
 }
 
+fn extract_client_message_f64_arg(line: &str, arg_idx: usize) -> Option<f64> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    let args = v.get("args")?.as_array()?;
+    let item = args.get(arg_idx)?;
+    if let Some(n) = item.as_f64() {
+        Some(n)
+    } else if let Some(s) = item.as_str() {
+        s.trim().parse::<f64>().ok()
+    } else {
+        None
+    }
+}
+
+/// Push Speech-VAD voice synchronization status and optional updated `sub-delay` live into running mpv.
+pub fn send_sub_sync_result(
+    ok: bool,
+    delay_secs: Option<f64>,
+    confidence_pct: u8,
+    message: &str,
+) -> bool {
+    let payload = serde_json::json!({
+        "ok": ok,
+        "delay_secs": delay_secs,
+        "confidence": confidence_pct,
+        "message": message,
+    });
+    let mut cmds = Vec::new();
+    if ok {
+        if let Some(delay) = delay_secs {
+            cmds.push(serde_json::json!({ "command": ["set_property", "sub-delay", delay] }));
+        }
+    }
+    cmds.push(serde_json::json!({ "command": ["script-message", "solus-sync-status", payload.to_string()] }));
+    let mut all_ok = true;
+    for cmd in cmds {
+        if !try_send_via_active_monitor(&cmd.to_string()) {
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
 /// Labels for the 6 Picture-in-Picture corner & window size presets.
 pub const PIP_CORNER_LABELS: [&str; 6] = [
     "Bottom-Right 30%",
@@ -818,6 +860,16 @@ async fn drive_ipc_stream<S>(
                         next_ep_sent = true;
                         let _ = tx.send(AppMessage::NextEpisodeRequested).await;
                     }
+                    continue;
+                }
+
+                if line.contains("client-message") && line.contains("solus-ipc-auto-sync-sub") {
+                    let requested_pos = extract_client_message_f64_arg(&line, 1).unwrap_or(current_pos);
+                    let _ = tx
+                        .send(AppMessage::AutoSyncSubRequested {
+                            time_pos_secs: requested_pos,
+                        })
+                        .await;
                     continue;
                 }
 

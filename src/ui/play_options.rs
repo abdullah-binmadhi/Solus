@@ -787,6 +787,7 @@ mod tests {
                 qualities: vec![],
                 subtitles: vec![],
                 referer: None,
+                needs_hls_proxy: false,
             }];
             loaded_state.playback_qualities = vec![
                 crate::api::subtitles::QualityOption::simple("1080p", ""),
@@ -854,6 +855,9 @@ mod tests {
             height: Some(720),
             tbr_kbps: Some(1600),
             fps_x10: Some(240),
+            audio_urls: Vec::new(),
+            has_demuxed_audio: false,
+            needs_hls_proxy: false,
         }];
         let area = Rect::new(0, 0, 120, 36);
         let layout = compute_layout(area);

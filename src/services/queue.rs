@@ -857,48 +857,84 @@ pub async fn resolve_item_prefetch(
         (None, None) => None,
     };
 
-    let (selected_quality_label, stream_url) = if let Some(ref ladder) = stream_info.ladder {
-        if let Some(variant) = ladder.select_best_variant(capped_h, network_mode) {
-            (variant.label.clone(), Some(variant.url.clone()))
-        } else {
+    let (selected_quality_label, stream_url, chosen_audio_urls, chosen_demuxed) =
+        if let Some(prov) = stream_info.providers.first().filter(|p| !p.qualities.is_empty()) {
+            let chosen_q = if let Some(cap) = capped_h {
+                prov.qualities
+                    .iter()
+                    .find(|q| {
+                        crate::api::subtitles::parse_height_from_label(&q.label).is_some_and(|h| h <= cap)
+                    })
+                    .or_else(|| prov.qualities.last())
+            } else {
+                prov.qualities
+                    .iter()
+                    .find(|q| q.label.eq_ignore_ascii_case(&item.quality))
+                    .or_else(|| prov.qualities.first())
+            };
             (
-                item.quality.clone(),
+                chosen_q.map(|q| q.label.clone()).unwrap_or_else(|| item.quality.clone()),
+                chosen_q
+                    .map(|q| q.url.clone())
+                    .filter(|u| !u.is_empty())
+                    .or_else(|| prov.master_url.clone())
+                    .filter(|u| !u.is_empty())
+                    .or_else(|| stream_info.master_url.clone()),
+                chosen_q.map(|q| q.audio_urls.clone()).unwrap_or_default(),
+                chosen_q.is_some_and(|q| q.has_demuxed_audio),
+            )
+        } else if let Some(ref ladder) = stream_info.ladder {
+            if let Some(variant) = ladder.select_best_variant(capped_h, network_mode) {
+                let a = ladder
+                    .audio_uri_for(&variant, item.dub)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let has_d = !a.is_empty();
+                (variant.label.clone(), Some(variant.url.clone()), a, has_d)
+            } else {
+                let chosen_q = stream_info
+                    .qualities
+                    .iter()
+                    .find(|q| q.label.eq_ignore_ascii_case(&item.quality))
+                    .or_else(|| stream_info.qualities.first());
+                (
+                    chosen_q.map(|q| q.label.clone()).unwrap_or_else(|| item.quality.clone()),
+                    chosen_q
+                        .map(|q| q.url.clone())
+                        .filter(|u| !u.is_empty())
+                        .or_else(|| stream_info.master_url.clone())
+                        .filter(|u| !u.is_empty()),
+                    chosen_q.map(|q| q.audio_urls.clone()).unwrap_or_default(),
+                    chosen_q.is_some_and(|q| q.has_demuxed_audio),
+                )
+            }
+        } else {
+            let chosen_q = if let Some(cap) = capped_h {
+                stream_info
+                    .qualities
+                    .iter()
+                    .find(|q| {
+                        crate::api::subtitles::parse_height_from_label(&q.label).is_some_and(|h| h <= cap)
+                    })
+                    .or_else(|| stream_info.qualities.last())
+            } else {
                 stream_info
                     .qualities
                     .iter()
                     .find(|q| q.label.eq_ignore_ascii_case(&item.quality))
                     .or_else(|| stream_info.qualities.first())
+            };
+            (
+                chosen_q.map(|q| q.label.clone()).unwrap_or_else(|| item.quality.clone()),
+                chosen_q
                     .map(|q| q.url.clone())
                     .filter(|u| !u.is_empty())
                     .or_else(|| stream_info.master_url.clone())
                     .filter(|u| !u.is_empty()),
+                chosen_q.map(|q| q.audio_urls.clone()).unwrap_or_default(),
+                chosen_q.is_some_and(|q| q.has_demuxed_audio),
             )
-        }
-    } else {
-        let chosen_q = if let Some(cap) = capped_h {
-            stream_info
-                .qualities
-                .iter()
-                .find(|q| {
-                    crate::api::subtitles::parse_height_from_label(&q.label).is_some_and(|h| h <= cap)
-                })
-                .or_else(|| stream_info.qualities.last())
-        } else {
-            stream_info
-                .qualities
-                .iter()
-                .find(|q| q.label.eq_ignore_ascii_case(&item.quality))
-                .or_else(|| stream_info.qualities.first())
         };
-        (
-            chosen_q.map(|q| q.label.clone()).unwrap_or_else(|| item.quality.clone()),
-            chosen_q
-                .map(|q| q.url.clone())
-                .filter(|u| !u.is_empty())
-                .or_else(|| stream_info.master_url.clone())
-                .filter(|u| !u.is_empty()),
-        )
-    };
 
     // Do not cache empty fallback results as Ready; require an actual verified HTTP stream URL.
     let valid_url = match stream_url {
@@ -1003,6 +1039,8 @@ pub async fn resolve_item_prefetch(
         deband_mode: crate::config::DebandMode::Auto,
         motion_mode: crate::config::MotionMode::Off,
         referer: stream_info.providers.first().and_then(|p| p.referer.clone()),
+        audio_urls: chosen_audio_urls,
+        has_demuxed_audio: chosen_demuxed,
     };
 
     Some(ResolvedPrefetch {
@@ -1063,6 +1101,8 @@ mod tests {
                 deband_mode: crate::config::DebandMode::Auto,
                 motion_mode: crate::config::MotionMode::Off,
                 referer: None,
+                audio_urls: Vec::new(),
+                has_demuxed_audio: false,
             },
             resolved_at,
             sub_synced: false,

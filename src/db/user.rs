@@ -1016,7 +1016,7 @@ pub async fn get_anime_subtitle_delay_ms(
     .await
     .ok()
     .flatten()
-    .map(|v| (v as i32).clamp(-30_000, 30_000))
+    .map(|v| (v as i32).clamp(-120_000, 120_000))
 }
 
 /// Persist per-anime subtitle offset in milliseconds so subsequent episodes launch synced.
@@ -1027,7 +1027,7 @@ pub async fn save_anime_subtitle_delay_ms(
     delay_ms:   i32,
     now:        i64,
 ) -> Result<()> {
-    let clamped = delay_ms.clamp(-30_000, 30_000) as i64;
+    let clamped = delay_ms.clamp(-120_000, 120_000) as i64;
     sqlx::query(
         "INSERT INTO anime_subtitle_offsets (profile_id, anime_id, delay_ms, updated_at)
          VALUES (?, ?, ?, ?)
@@ -1037,6 +1037,60 @@ pub async fn save_anime_subtitle_delay_ms(
     )
     .bind(profile_id)
     .bind(anime_id)
+    .bind(clamped)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch saved provider-scoped subtitle offset in milliseconds for `(profile_id, anime_id, provider_id)`
+/// so delays on cut-mismatched hosts (e.g. AnimeGG) never corrupt clean streams (e.g. ZokoAnime / MegaPlay).
+pub async fn get_anime_provider_subtitle_delay_ms(
+    pool:        &SqlitePool,
+    profile_id:  &str,
+    anime_id:    i64,
+    provider_id: &str,
+) -> Option<i32> {
+    if provider_id.trim().is_empty() {
+        return get_anime_subtitle_delay_ms(pool, profile_id, anime_id).await;
+    }
+    sqlx::query_scalar::<_, i64>(
+        "SELECT delay_ms FROM anime_provider_sub_delays WHERE profile_id = ? AND anime_id = ? AND provider_id = ?",
+    )
+    .bind(profile_id)
+    .bind(anime_id)
+    .bind(provider_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .map(|v| (v as i32).clamp(-120_000, 120_000))
+}
+
+/// Persist provider-scoped subtitle offset in milliseconds.
+pub async fn save_anime_provider_subtitle_delay_ms(
+    pool:        &SqlitePool,
+    profile_id:  &str,
+    anime_id:    i64,
+    provider_id: &str,
+    delay_ms:    i32,
+    now:         i64,
+) -> Result<()> {
+    let clamped = delay_ms.clamp(-120_000, 120_000) as i64;
+    if provider_id.trim().is_empty() {
+        return save_anime_subtitle_delay_ms(pool, profile_id, anime_id, delay_ms, now).await;
+    }
+    sqlx::query(
+        "INSERT INTO anime_provider_sub_delays (profile_id, anime_id, provider_id, delay_ms, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(profile_id, anime_id, provider_id) DO UPDATE SET
+            delay_ms   = excluded.delay_ms,
+            updated_at = excluded.updated_at",
+    )
+    .bind(profile_id)
+    .bind(anime_id)
+    .bind(provider_id)
     .bind(clamped)
     .bind(now)
     .execute(pool)
@@ -2429,6 +2483,7 @@ mod tests {
             score:         Some(80),
             format:        Some("TV".into()),
             genres:        "[]".into(),
+            synonyms:      "[]".into(),
             cover_url:     None,
             cover_blob:    None,
             has_dub:       0,
@@ -2503,6 +2558,7 @@ mod tests {
                 score:         Some(80),
                 format:        Some("TV".into()),
                 genres:        "[]".into(),
+                synonyms:      "[]".into(),
                 cover_url:     None,
                 cover_blob:    None,
                 has_dub:       0,
@@ -2612,6 +2668,7 @@ mod tests {
                 score: Some(80),
                 format: Some("TV".into()),
                 genres: "[]".into(),
+                synonyms: "[]".into(),
                 cover_url: None,
                 cover_blob: None,
                 has_dub: 0,
@@ -2764,6 +2821,7 @@ mod tests {
             score:         Some(85),
             format:        Some("TV".into()),
             genres:        "[\"Psychological\",\"Sci-Fi\",\"Mystery\"]".into(),
+            synonyms:      "[]".into(),
             cover_url:     None,
             cover_blob:    None,
             has_dub:       1,
@@ -2792,6 +2850,7 @@ mod tests {
             score:         Some(88),
             format:        Some("TV".into()),
             genres:        "[\"Psychological\",\"Thriller\"]".into(),
+            synonyms:      "[]".into(),
             cover_url:     None,
             cover_blob:    None,
             has_dub:       1,
@@ -2850,6 +2909,7 @@ mod tests {
             score: Some(82),
             format: Some("TV".into()),
             genres: "[\"Action\",\"Fantasy\"]".into(),
+            synonyms: "[]".into(),
             cover_url: None,
             cover_blob: None,
             has_dub: 1,
@@ -2885,6 +2945,7 @@ mod tests {
             score: None,
             format: Some("TV".into()),
             genres: "[]".into(),
+            synonyms: "[]".into(),
             cover_url: None,
             cover_blob: None,
             has_dub: 0,
@@ -2941,6 +3002,7 @@ mod tests {
             score: Some(91),
             format: Some("TV".into()),
             genres: "[\"Adventure\",\"Fantasy\"]".into(),
+            synonyms: "[]".into(),
             cover_url: None,
             cover_blob: None,
             has_dub: 1,
@@ -3043,5 +3105,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_anime_subtitle_delay_ms(&pool, "default", 171032).await, Some(-850));
+
+        // Provider-scoped isolation: Zoko, MegaPlay HD-1, AnimeGG stay independent
+        save_anime_provider_subtitle_delay_ms(&pool, "default", 171032, "zoko", 0, 9200)
+            .await
+            .unwrap();
+        save_anime_provider_subtitle_delay_ms(&pool, "default", 171032, "hd1", 250, 9200)
+            .await
+            .unwrap();
+        save_anime_provider_subtitle_delay_ms(&pool, "default", 171032, "animegg", 18_400, 9200)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_anime_provider_subtitle_delay_ms(&pool, "default", 171032, "zoko").await,
+            Some(0)
+        );
+        assert_eq!(
+            get_anime_provider_subtitle_delay_ms(&pool, "default", 171032, "hd1").await,
+            Some(250)
+        );
+        assert_eq!(
+            get_anime_provider_subtitle_delay_ms(&pool, "default", 171032, "animegg").await,
+            Some(18_400)
+        );
     }
 }

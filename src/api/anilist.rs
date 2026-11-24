@@ -22,6 +22,7 @@ const MEDIA_FIELDS: &str = r#"
     averageScore
     format
     genres
+    synonyms
     tags { name rank isMediaSpoiler }
     coverImage { large }
     countryOfOrigin
@@ -220,6 +221,8 @@ struct RawAnime {
     format:        Option<String>,
     genres:        Vec<String>,
     #[serde(default)]
+    synonyms:      Option<Vec<String>>,
+    #[serde(default)]
     tags:          Option<Vec<RawTag>>,
     cover_image:   Option<RawCoverImage>,
     next_airing_episode: Option<RawNextAiringEpisode>,
@@ -267,6 +270,7 @@ impl RawAnime {
             score:         self.average_score,
             format:        self.format,
             genres:        serde_json::to_string(&combined_genres).unwrap_or_else(|_| "[]".to_string()),
+            synonyms:      serde_json::to_string(&self.synonyms.unwrap_or_default()).unwrap_or_else(|_| "[]".to_string()),
             cover_url:     self.cover_image.and_then(|c| c.large),
             cover_blob:    None,
             has_dub:       0, // AniList doesn't expose dub info reliably
@@ -1374,6 +1378,7 @@ mod tests {
             average_score: Some(87),
             format:        Some("TV".to_string()),
             genres:        vec!["Action".to_string(), "Drama".to_string()],
+            synonyms:      None,
             tags:          None,
             cover_image:   Some(RawCoverImage {
                 large: Some("https://example.com/cover.jpg".to_string()),
@@ -1443,6 +1448,7 @@ mod tests {
             average_score: None,
             format:        None,
             genres:        vec![],
+            synonyms:      None,
             tags:          None,
             cover_image:   None,
             next_airing_episode: None,

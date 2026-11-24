@@ -1,6 +1,7 @@
 pub mod calendar;
 pub mod cast;
 pub mod downloader;
+pub mod hls_proxy;
 pub mod importer;
 pub mod ipc;
 pub mod loading_art;

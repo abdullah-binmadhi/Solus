@@ -44,6 +44,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     let _ = sqlx::query("ALTER TABLE anime ADD COLUMN mal_id INTEGER;")
         .execute(pool)
         .await;
+    let _ = sqlx::query("ALTER TABLE anime ADD COLUMN synonyms TEXT NOT NULL DEFAULT '[]';")
+        .execute(pool)
+        .await;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_anime_mal_id ON anime(mal_id);")
         .execute(pool)
         .await?;
@@ -476,7 +479,20 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("PRAGMA user_version = 5;").execute(pool).await;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS anime_provider_sub_delays (
+            profile_id  TEXT    NOT NULL,
+            anime_id    INTEGER NOT NULL,
+            provider_id TEXT    NOT NULL,
+            delay_ms    INTEGER NOT NULL DEFAULT 0,
+            updated_at  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (profile_id, anime_id, provider_id)
+        );",
+    )
+    .execute(pool)
+    .await?;
+
+    let _ = sqlx::query("PRAGMA user_version = 6;").execute(pool).await;
 
     Ok(())
 }

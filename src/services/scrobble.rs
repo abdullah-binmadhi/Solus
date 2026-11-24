@@ -649,6 +649,7 @@ mod tests {
             score: None,
             format: Some("TV".into()),
             genres: "[]".into(),
+            synonyms: "[]".into(),
             cover_url: None,
             cover_blob: None,
             has_dub: 0,

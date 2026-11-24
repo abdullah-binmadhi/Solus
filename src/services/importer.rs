@@ -323,6 +323,7 @@ pub async fn import_entries_to_db(
             score: entry.score,
             format: entry.format.clone(),
             genres: genres_json,
+            synonyms: "[]".to_string(),
             cover_url: entry.cover_url.clone(),
             cover_blob: None,
             has_dub: 0,

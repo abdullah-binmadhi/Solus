@@ -12,6 +12,7 @@ pub enum Screen {
     /// Detail screen: full info + episode list for a selected anime
     Detail,
     /// Playback query picker overlay shown on top of Detail
+    #[allow(dead_code)]
     PlaybackQuery,
     /// Playback options overlay shown on top of Detail
     PlaybackOptions,
@@ -730,6 +731,13 @@ pub struct AppState {
     pub pip_corner_idx:              usize,
     pub live_playback:               LivePlaybackTelemetry,
     pub stream_ladder_cache:         HashMap<(i64, u32, bool), crate::api::subtitles::ResolvedStreamLadder>,
+    /// Live Speech-VAD subtitle sync & active playback context
+    pub hls_proxy:                   Option<std::sync::Arc<crate::services::hls_proxy::HlsProxyServer>>,
+    pub sub_sync_in_progress:        bool,
+    pub active_stream_url_for_sync:  Option<String>,
+    pub active_stream_referer:       Option<String>,
+    pub active_sub_path:             Option<String>,
+    pub active_provider_id:          Option<String>,
     /// Settings Control Hub v2 navigation + Remote live state
     pub settings_category:           usize,
     pub settings_scroll_offset:      usize,
@@ -1077,6 +1085,12 @@ impl AppState {
             pip_corner_idx: 0,
             live_playback: LivePlaybackTelemetry::default(),
             stream_ladder_cache: HashMap::new(),
+            hls_proxy: None,
+            sub_sync_in_progress: false,
+            active_stream_url_for_sync: None,
+            active_stream_referer: None,
+            active_sub_path: None,
+            active_provider_id: None,
             settings_category: 0,
             settings_scroll_offset: 0,
             remote_ws_clients: 0,
@@ -1609,6 +1623,7 @@ impl AppState {
     }
 
     /// Open the playback query picker for the current anime.
+    #[allow(dead_code)]
     pub fn open_playback_query_picker(&mut self, anime: &Anime) {
         self.playback_queries = anime.playback_queries();
         self.playback_query_cursor = 0;
@@ -1916,6 +1931,7 @@ mod tests {
             score:         Some(80),
             format:        None,
             genres:        "[]".into(),
+            synonyms:      "[]".into(),
             cover_url:     None,
             cover_blob:    None,
             has_dub:       0,
@@ -2296,6 +2312,7 @@ mod tests {
                 stream_label: "Zoko".into(),
             }],
             referer: None,
+            needs_hls_proxy: false,
         }];
         state.playback_provider_cursor = 0;
         state.sync_active_provider();

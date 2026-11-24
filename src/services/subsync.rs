@@ -390,6 +390,342 @@ pub fn apply_subtitle_shift(content: &str, offset_seconds: f64, scale_factor: f6
     out
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeechVadSyncResult {
+    pub offset_seconds: f64,
+    pub scale_factor: f64,
+    pub confidence_pct: u8,
+    pub z_score: f64,
+    pub prominence: f64,
+    pub applied: bool,
+    pub reason: String,
+}
+
+impl Default for SpeechVadSyncResult {
+    fn default() -> Self {
+        Self {
+            offset_seconds: 0.0,
+            scale_factor: 1.0,
+            confidence_pct: 0,
+            z_score: 0.0,
+            prominence: 0.0,
+            applied: false,
+            reason: "Insufficient speech signal".to_string(),
+        }
+    }
+}
+
+/// Convert `ffmpeg silencedetect` stderr log lines inside `[window_start, window_start + window_duration]`
+/// into absolute episode-time spoken speech intervals `(start_secs, end_secs)`.
+pub fn parse_silencedetect_speech_intervals(
+    stderr: &str,
+    window_start: f64,
+    window_duration: f64,
+) -> Vec<(f64, f64)> {
+    let mut silences: Vec<(f64, f64)> = Vec::new();
+    let mut pending_start: Option<f64> = None;
+
+    for line in stderr.lines() {
+        if let Some(pos) = line.find("silence_start:") {
+            let val_s = line[pos + 14..].split_whitespace().next().unwrap_or("");
+            if let Ok(t) = val_s.parse::<f64>() {
+                pending_start = Some(t.max(0.0));
+            }
+        } else if let Some(pos) = line.find("silence_end:") {
+            let val_s = line[pos + 12..].split_whitespace().next().unwrap_or("");
+            if let Ok(end_t) = val_s.parse::<f64>() {
+                let start_t = pending_start.take().unwrap_or(0.0).min(end_t);
+                silences.push((start_t, end_t.min(window_duration)));
+            }
+        }
+    }
+    if let Some(open_s) = pending_start {
+        if open_s < window_duration {
+            silences.push((open_s, window_duration));
+        }
+    }
+
+    let mut speech = Vec::new();
+    let mut cursor = 0.0_f64;
+    for (sil_s, sil_e) in silences {
+        if sil_s > cursor {
+            let dur = sil_s - cursor;
+            if (0.25..=25.0).contains(&dur) {
+                speech.push((window_start + cursor, window_start + sil_s));
+            }
+        }
+        cursor = cursor.max(sil_e);
+    }
+    if window_duration > cursor {
+        let dur = window_duration - cursor;
+        if (0.25..=25.0).contains(&dur) {
+            speech.push((window_start + cursor, window_start + window_duration));
+        }
+    }
+    speech
+}
+
+/// Extract speech-band (240 Hz - 3200 Hz) vocal activity intervals from a media URL or file using `ffmpeg`.
+pub async fn extract_speech_intervals_ffmpeg(
+    stream_url: &str,
+    referer: Option<&str>,
+    start_secs: f64,
+    duration_secs: f64,
+) -> Vec<(f64, f64)> {
+    let ffmpeg_cmd = if std::path::Path::new("/opt/homebrew/bin/ffmpeg").exists() {
+        "/opt/homebrew/bin/ffmpeg"
+    } else if std::path::Path::new("/usr/local/bin/ffmpeg").exists() {
+        "/usr/local/bin/ffmpeg"
+    } else {
+        "ffmpeg"
+    };
+    let is_http = stream_url.starts_with("http://") || stream_url.starts_with("https://");
+    let headers_val = referer
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| {
+            format!(
+                "Referer: {r}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n"
+            )
+        });
+
+    for af_filter in [
+        "highpass=f=240,lowpass=f=3200,afftdn=nf=-25,silencedetect=noise=-28dB:d=0.35",
+        "highpass=f=240,lowpass=f=3200,silencedetect=noise=-28dB:d=0.35",
+    ] {
+        let mut cmd = tokio::process::Command::new(ffmpeg_cmd);
+        cmd.arg("-hide_banner").arg("-nostats").arg("-vn");
+        if is_http {
+            if let Some(ref hdrs) = headers_val {
+                cmd.args(["-headers", hdrs]);
+            }
+            if stream_url.contains(".m3u8") || stream_url.contains("/m3u8") {
+                cmd.args([
+                    "-allowed_extensions",
+                    "ALL",
+                    "-allowed_segment_extensions",
+                    "ALL",
+                ]);
+            }
+        }
+        cmd.args([
+            "-ss",
+            &format!("{:.1}", start_secs.max(0.0)),
+            "-t",
+            &format!("{:.1}", duration_secs.clamp(15.0, 180.0)),
+            "-i",
+            stream_url,
+            "-af",
+            af_filter,
+            "-f",
+            "null",
+            "-",
+        ]);
+        let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(12), cmd.output()).await else {
+            continue;
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("No such filter: 'afftdn'") {
+            continue;
+        }
+        let intervals = parse_silencedetect_speech_intervals(&stderr, start_secs.max(0.0), duration_secs);
+        if !intervals.is_empty() || out.status.success() {
+            return intervals;
+        }
+    }
+    Vec::new()
+}
+
+/// Wide-range (-90s..+90s) Speech-VAD vs Subtitle onset cross-correlation with Z-score & prominence validation.
+/// Returns `offset_seconds` matching mpv's `sub-delay` sign convention (`t_audio ≈ t_sub + offset_seconds`).
+pub fn calculate_speech_vad_alignment(
+    audio_speech: &[(f64, f64)],
+    sub_cues: &[(f64, f64)],
+) -> SpeechVadSyncResult {
+    if audio_speech.len() < 3 || sub_cues.len() < 3 {
+        return SpeechVadSyncResult {
+            reason: "Too few dialogue or speech intervals in scene".to_string(),
+            ..Default::default()
+        };
+    }
+
+    const BIN: f64 = 0.05; // 50ms coarse grid
+    const ONSET_BINS: usize = 7; // 350ms onset weight 3x
+    let max_t = audio_speech
+        .iter()
+        .map(|i| i.1)
+        .chain(sub_cues.iter().map(|i| i.1))
+        .fold(0.0_f64, f64::max)
+        + 120.0;
+    let num_bins = ((max_t / BIN).ceil() as usize).clamp(4000, 120_000);
+
+    let mut audio_grid = vec![0u8; num_bins];
+    for &(s, e) in audio_speech {
+        let sb = ((s / BIN).max(0.0) as usize).min(num_bins - 1);
+        let eb = ((e / BIN).max(0.0) as usize).min(num_bins - 1);
+        for b in sb..=eb {
+            let w = if b < sb + ONSET_BINS { 3 } else { 1 };
+            audio_grid[b] = audio_grid[b].max(w);
+        }
+    }
+
+    // Focus subtitle cues near the probed audio span (with ±95s margin)
+    let a_min = audio_speech.iter().map(|i| i.0).fold(f64::INFINITY, f64::min) - 95.0;
+    let a_max = audio_speech.iter().map(|i| i.1).fold(0.0_f64, f64::max) + 95.0;
+    let local_subs: Vec<(f64, f64)> = sub_cues
+        .iter()
+        .copied()
+        .filter(|&(s, e)| e >= a_min && s <= a_max)
+        .collect();
+    let active_subs = if local_subs.len() >= 3 { &local_subs[..] } else { sub_cues };
+
+    let score_fn = |scale: f64, offset: f64| -> u64 {
+        let mut total = 0u64;
+        for &(s, e) in active_subs {
+            let sb = ((s * scale + offset) / BIN).round() as isize;
+            let eb = ((e * scale + offset) / BIN).round() as isize;
+            if sb < 0 || eb >= num_bins as isize {
+                continue;
+            }
+            let onset_end = sb + ONSET_BINS as isize;
+            for b in sb..=eb {
+                let aw = audio_grid[b as usize] as u64;
+                if aw > 0 {
+                    let sw = if b < onset_end { 3 } else { 1 };
+                    total += aw * sw;
+                }
+            }
+        }
+        total
+    };
+
+    // Coarse scan across -90.0s .. +90.0s in 0.10s steps
+    let mut coarse: Vec<(f64, u64)> = Vec::with_capacity(1801);
+    for step in -900..=900 {
+        let off = step as f64 * 0.1;
+        coarse.push((off, score_fn(1.0, off)));
+    }
+
+    let n = coarse.len() as f64;
+    let mean = coarse.iter().map(|&(_, sc)| sc as f64).sum::<f64>() / n;
+    let var = coarse
+        .iter()
+        .map(|&(_, sc)| {
+            let d = sc as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / n;
+    let std_dev = var.sqrt().max(1.0);
+
+    // Select best peak, refine around top 3 peaks at 20ms resolution
+    coarse.sort_by_key(|&(_, sc)| std::cmp::Reverse(sc));
+    let mut top_peaks: Vec<f64> = Vec::new();
+    for &(off, _) in &coarse {
+        if top_peaks.iter().all(|p| (p - off).abs() >= 2.0) {
+            top_peaks.push(off);
+            if top_peaks.len() >= 3 {
+                break;
+            }
+        }
+    }
+
+    let mut best_offset = 0.0_f64;
+    let mut best_scale = 1.0_f64;
+    let mut best_score = 0u64;
+    for peak in &top_peaks {
+        for sub_step in -30..=30 {
+            let off = peak + (sub_step as f64 * 0.02);
+            let sc = score_fn(1.0, off);
+            if sc > best_score {
+                best_score = sc;
+                best_offset = off;
+            }
+        }
+    }
+
+    // Also test common broadcast speed conversions around top peak
+    for &scale in &[23.976 / 25.0, 25.0 / 23.976, 24.0 / 23.976, 23.976 / 24.0] {
+        for sub_step in -25..=25 {
+            let off = best_offset + (sub_step as f64 * 0.05);
+            let sc = score_fn(scale, off);
+            if sc > ((best_score as f64 * 1.10) as u64) + 30 {
+                best_score = sc;
+                best_scale = scale;
+                best_offset = off;
+            }
+        }
+    }
+
+    let second_peak = coarse
+        .iter()
+        .find(|&&(off, _)| (off - best_offset).abs() >= 2.0)
+        .map(|&(_, sc)| sc.max(1) as f64)
+        .unwrap_or(1.0);
+
+    let z_score = (best_score as f64 - mean) / std_dev;
+    let prominence = best_score as f64 / second_peak;
+    let confidence_pct = ((z_score / 5.5).clamp(0.0, 1.0) * 100.0).round() as u8;
+    let applied = best_score >= 30 && z_score >= 2.4 && prominence >= 1.08;
+
+    let reason = if applied {
+        format!("Speech-VAD match ({confidence_pct}% confidence)")
+    } else {
+        "No clear spoken dialogue match near this scene — seek to dialogue and press [y]".to_string()
+    };
+
+    SpeechVadSyncResult {
+        offset_seconds: (best_offset * 100.0).round() / 100.0,
+        scale_factor: (best_scale * 100000.0).round() / 100000.0,
+        confidence_pct,
+        z_score,
+        prominence,
+        applied,
+        reason,
+    }
+}
+
+/// Automated dual-window `ffmpeg` speech-band extraction + wide cross-correlation for `SNAP TO VOICE`.
+pub async fn auto_sync_subtitle_to_audio(
+    stream_url: &str,
+    referer: Option<&str>,
+    sub_path: &str,
+    cur_pos_secs: f64,
+) -> SpeechVadSyncResult {
+    let sub_text = match std::fs::read_to_string(sub_path) {
+        Ok(t) => t,
+        Err(_) => {
+            return SpeechVadSyncResult {
+                reason: "Active subtitle file not cached locally".to_string(),
+                ..Default::default()
+            };
+        }
+    };
+    let sub_cues = parse_subtitle_intervals(&sub_text);
+    if sub_cues.len() < 3 {
+        return SpeechVadSyncResult {
+            reason: "Too few dialogue cues in subtitle file".to_string(),
+            ..Default::default()
+        };
+    }
+
+    // Window A centered around the user's current playback timestamp
+    let w1_start = (cur_pos_secs - 45.0).max(0.0);
+    let mut speech = extract_speech_intervals_ffmpeg(stream_url, referer, w1_start, 90.0).await;
+
+    let mut res = calculate_speech_vad_alignment(&speech, &sub_cues);
+    if !res.applied || speech.len() < 6 {
+        // Window B shifts past typical 90s OP song to lock onto dense main-episode dialogue
+        let w2_start = if w1_start < 90.0 { 130.0 } else { (w1_start + 95.0).min(1200.0) };
+        let speech_b = extract_speech_intervals_ffmpeg(stream_url, referer, w2_start, 90.0).await;
+        if !speech_b.is_empty() {
+            speech.extend(speech_b);
+            res = calculate_speech_vad_alignment(&speech, &sub_cues);
+        }
+    }
+
+    res
+}
+
 /// Fallback Tier 2: Probe audio lead time via ffmpeg silencedetect (runs in < 1.5s).
 #[allow(dead_code)]
 pub async fn estimate_audio_lead_time(stream_url: &str) -> Option<f64> {
@@ -839,5 +1175,47 @@ Dialogue: 0,0:01:37.75,0:01:40.91,NHK Dialogue - Border,,0,0,0,,Outline duplicat
         let shifted = apply_subtitle_shift(ass, 2.0, 1.0);
         assert!(shifted.contains("0:02:03.70,0:02:10.70"));
         assert!(is_valid_subtitle_content(ass));
+    }
+
+    #[test]
+    fn test_speech_vad_alignment_recovers_large_positive_and_negative_offsets() {
+        let base_cues = vec![
+            (10.0, 12.2),
+            (15.5, 18.0),
+            (24.0, 27.5),
+            (31.2, 33.4),
+            (42.0, 45.1),
+            (53.5, 56.0),
+            (64.0, 66.8),
+        ];
+
+        // Case 1: Audio happens 18.40s AFTER subtitle timestamps -> mpv sub-delay = +18.40s
+        let audio_late: Vec<(f64, f64)> = base_cues.iter().map(|&(s, e)| (s + 18.40, e + 18.40)).collect();
+        let res_pos = calculate_speech_vad_alignment(&audio_late, &base_cues);
+        assert!(res_pos.applied, "Expected confident match, got {:?}", res_pos);
+        assert!((res_pos.offset_seconds - 18.40).abs() <= 0.15, "got {}", res_pos.offset_seconds);
+        assert!(res_pos.z_score >= 2.4);
+
+        // Case 2: Audio happens 32.70s BEFORE subtitle timestamps -> mpv sub-delay = -32.70s
+        let shifted_subs: Vec<(f64, f64)> = base_cues.iter().map(|&(s, e)| (s + 50.0, e + 50.0)).collect();
+        let audio_early: Vec<(f64, f64)> = shifted_subs.iter().map(|&(s, e)| (s - 32.70, e - 32.70)).collect();
+        let res_neg = calculate_speech_vad_alignment(&audio_early, &shifted_subs);
+        assert!(res_neg.applied, "Expected negative match, got {:?}", res_neg);
+        assert!((res_neg.offset_seconds + 32.70).abs() <= 0.15, "got {}", res_neg.offset_seconds);
+    }
+
+    #[test]
+    fn test_parse_silencedetect_speech_intervals() {
+        let stderr = "\
+[silencedetect @ 0x1] silence_start: 0\n\
+[silencedetect @ 0x1] silence_end: 4.5 | silence_duration: 4.5\n\
+[silencedetect @ 0x1] silence_start: 7.2\n\
+[silencedetect @ 0x1] silence_end: 10.0 | silence_duration: 2.8\n";
+        let speech = parse_silencedetect_speech_intervals(stderr, 120.0, 15.0);
+        assert_eq!(speech.len(), 2);
+        assert!((speech[0].0 - 124.5).abs() < 0.01);
+        assert!((speech[0].1 - 127.2).abs() < 0.01);
+        assert!((speech[1].0 - 130.0).abs() < 0.01);
+        assert!((speech[1].1 - 135.0).abs() < 0.01);
     }
 }
