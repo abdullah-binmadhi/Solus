@@ -396,6 +396,7 @@ pub fn parse_numeric_property_change(line: &str, target_name: &str) -> Option<f6
 pub const PLAYBACK_EXIT_UNKNOWN: u8 = 0;
 pub const PLAYBACK_EXIT_NATURAL_EOF: u8 = 1;
 pub const PLAYBACK_EXIT_USER_QUIT: u8 = 2;
+pub const PLAYBACK_EXIT_STREAM_FAILED: u8 = 3;
 
 /// Configuration for launching an mpv IPC monitoring session.
 pub struct IpcMonitorConfig {
@@ -883,6 +884,8 @@ async fn drive_ipc_stream<S>(
                     if let Some(ref kind) = playback_exit_kind {
                         if reason == "quit" {
                             kind.store(PLAYBACK_EXIT_USER_QUIT, Ordering::Relaxed);
+                        } else if !stream_started && current_duration <= 10.0 && current_pos <= 1.5 && (reason == "eof" || reason == "error") {
+                            kind.store(PLAYBACK_EXIT_STREAM_FAILED, Ordering::Relaxed);
                         } else if reason == "eof"
                             && (stream_started || current_duration > 10.0 || current_pos > 1.0)
                         {

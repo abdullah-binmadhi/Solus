@@ -1200,10 +1200,41 @@ async fn probe_segment_zero_bytes(
     (true, needs_proxy)
 }
 
-async fn verify_mp4_reachable(
+fn slice_at_most_bytes(s: &str, start: usize, max_len: usize) -> &str {
+    let mut lo = start.min(s.len());
+    while lo < s.len() && !s.is_char_boundary(lo) {
+        lo += 1;
+    }
+    let mut hi = lo.saturating_add(max_len).min(s.len());
+    while hi > lo && !s.is_char_boundary(hi) {
+        hi -= 1;
+    }
+    &s[lo..hi]
+}
+
+fn parse_total_bytes_from_headers(headers: &reqwest::header::HeaderMap, status: reqwest::StatusCode) -> Option<u64> {
+    if let Some(cr) = headers.get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()) {
+        if let Some((_, total_str)) = cr.rsplit_once('/') {
+            if let Ok(total) = total_str.trim().parse::<u64>() {
+                return Some(total);
+            }
+        }
+    }
+    if status == reqwest::StatusCode::OK {
+        if let Some(cl) = headers.get(reqwest::header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()) {
+            if let Ok(total) = cl.trim().parse::<u64>() {
+                return Some(total);
+            }
+        }
+    }
+    None
+}
+
+async fn verify_mp4_stream(
     client: &reqwest::Client,
     mp4_url: &str,
     referer: &str,
+    min_total_bytes: u64,
 ) -> bool {
     if mp4_url.is_empty() {
         return false;
@@ -1212,15 +1243,28 @@ async fn verify_mp4_reachable(
         .get(mp4_url)
         .header("Referer", referer)
         .header("Range", "bytes=0-63")
-        .timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(4))
         .send()
         .await
     {
-        if resp.status().is_success() {
+        let status = resp.status();
+        if status.is_success() {
+            if let Some(total) = parse_total_bytes_from_headers(resp.headers(), status) {
+                if total > 0 && total < min_total_bytes {
+                    return false;
+                }
+            }
             if let Ok(bytes) = resp.bytes().await {
                 if bytes.len() >= 8 {
                     let head = String::from_utf8_lossy(&bytes[..bytes.len().min(32)]).to_ascii_lowercase();
-                    return !head.contains("<html") && !head.contains("<!doctype");
+                    if head.contains("<html") || head.contains("<!doctype") {
+                        return false;
+                    }
+                    let is_mp4_box = bytes.get(4..8) == Some(b"ftyp")
+                        || bytes.get(4..8) == Some(b"moov")
+                        || bytes.get(4..8) == Some(b"mdat")
+                        || bytes.starts_with(b"\x1a\x45\xdf\xa3");
+                    return is_mp4_box || min_total_bytes == 0;
                 }
             }
         }
@@ -1228,8 +1272,40 @@ async fn verify_mp4_reachable(
     false
 }
 
-/// Zero-prompt multi-alias stream discovery across 5 independent verified providers:
-/// ZokoAnime (MAL), MegaPlay HD-1, MegaPlay HD-2/Alt, AnimeHeaven Direct, AnimeGG Direct.
+#[allow(dead_code)]
+async fn verify_mp4_reachable(
+    client: &reqwest::Client,
+    mp4_url: &str,
+    referer: &str,
+) -> bool {
+    verify_mp4_stream(client, mp4_url, referer, 0).await
+}
+
+fn normalize_stream_dedup_key(url: &str) -> String {
+    let without_query = url.split('?').next().unwrap_or(url);
+    without_query
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .to_ascii_lowercase()
+}
+
+fn provider_rank_priority(id: &str) -> u8 {
+    match id {
+        "megaplay_mal" | "hd1" => 0,
+        "vidmoly" => 1,
+        "animeheaven" => 2,
+        "animegg" => 3,
+        "zoko" => 4,
+        "megaplay_hsub" => 5,
+        "hd2" => 6,
+        _ => 7,
+    }
+}
+
+/// Zero-prompt multi-alias stream discovery across independent verified providers:
+/// MegaPlay Direct MAL, Vidmoly Direct (9anime), AnimeHeaven Direct, AnimeGG Direct,
+/// ZokoAnime (sub/hsub), MegaPlay Hardsub, and HiAnime.fm.
 pub async fn fetch_stream_info_with_identity(
     identity: &AnimeSearchIdentity,
     episode: u32,
@@ -1238,15 +1314,15 @@ pub async fn fetch_stream_info_with_identity(
     timeout_secs: u64,
 ) -> StreamInfo {
     let client = build_http_client(force_ipv4, timeout_secs);
-    let probe_timeout = Duration::from_secs(timeout_secs.clamp(4, 7));
+    let probe_timeout = Duration::from_secs(timeout_secs.clamp(6, 9));
     let query_title = identity.primary_query();
+    let resolved_mal_id = match identity.mal_id {
+        Some(mid) => Some(mid),
+        None => fetch_mal_id(&client, identity.anilist_id).await,
+    };
 
     let mal_fut = async {
-        let mal_id = match identity.mal_id {
-            Some(mid) => Some(mid),
-            None => fetch_mal_id(&client, identity.anilist_id).await,
-        };
-        if let Some(mid) = mal_id {
+        if let Some(mid) = resolved_mal_id {
             let (mut res, dub_avail) = tokio::join!(
                 fetch_stream_for_mal(&client, mid, episode, is_dub),
                 check_mal_dub_available(&client, mid, episode)
@@ -1274,14 +1350,29 @@ pub async fn fetch_stream_info_with_identity(
         (None, false, false)
     };
 
+    let megaplay_direct_fut = async {
+        if let Some(mid) = resolved_mal_id {
+            fetch_megaplay_direct_providers(&client, mid, episode, is_dub).await
+        } else {
+            Vec::new()
+        }
+    };
+
     let (
         zoko_timeout_res,
+        megaplay_direct_res,
+        nineanime_vidmoly_res,
         hianime_res,
         animeheaven_res,
         animegg_res,
         ext_subs_res,
     ) = tokio::join!(
         tokio::time::timeout(probe_timeout, mal_fut),
+        tokio::time::timeout(probe_timeout, megaplay_direct_fut),
+        tokio::time::timeout(
+            probe_timeout,
+            fetch_9anime_and_vidmoly_providers(&client, identity, episode, is_dub)
+        ),
         tokio::time::timeout(
             probe_timeout,
             fetch_all_hianime_providers_identity(&client, identity, episode, is_dub)
@@ -1302,17 +1393,27 @@ pub async fn fetch_stream_info_with_identity(
 
     let (zoko_res, zoko_dub, zoko_proxy) = zoko_timeout_res.unwrap_or((None, false, false));
     let ext_subs = ext_subs_res.unwrap_or_default();
+    let megaplay_direct_provs = megaplay_direct_res.unwrap_or_default();
+    let nineanime_provs = nineanime_vidmoly_res.unwrap_or_default();
     let hianime_provs = hianime_res.unwrap_or_default();
     let animeheaven_prov = animeheaven_res.ok().flatten();
     let animegg_prov = animegg_res.ok().flatten();
 
-    // Assemble base StreamInfo from the strongest verified source
-    let mut info = if let Some(ref z_info) = zoko_res {
+    // Combine MegaPlay Direct, 9anime/Vidmoly, and HiAnime into unified multi-server pool
+    let mut combined_hls_provs: Vec<(StreamInfo, ProviderOption)> = Vec::new();
+    combined_hls_provs.extend(megaplay_direct_provs);
+    combined_hls_provs.extend(nineanime_provs);
+    combined_hls_provs.extend(hianime_provs);
+
+    // Assemble base StreamInfo from the strongest verified source (prefer clean MegaPlay/Vidmoly over Zoko when healthy)
+    let mut info = if let Some((best_hls, _)) = combined_hls_provs.first() {
+        let mut cloned = best_hls.clone();
+        cloned.dub_available = cloned.dub_available || zoko_dub || is_dub;
+        cloned
+    } else if let Some(ref z_info) = zoko_res {
         let mut cloned = z_info.clone();
         cloned.dub_available = cloned.dub_available || zoko_dub || is_dub;
         cloned
-    } else if let Some((best_hi_info, _)) = hianime_provs.first() {
-        best_hi_info.clone()
     } else if let Some(ref ah) = animeheaven_prov {
         StreamInfo {
             master_url: ah.master_url.clone(),
@@ -1351,9 +1452,17 @@ pub async fn fetch_stream_info_with_identity(
         ladder.is_dub = is_dub;
     }
 
-    // Merge subtitles discovered from HiAnime / MegaPlay providers into stream subtitle pool
+    // Merge subtitles discovered from Zoko, MegaPlay, and HiAnime providers into unified pool
     let mut existing_codes: HashSet<String> = info.subtitles.iter().map(|s| s.code.clone()).collect();
-    for (hi_info, _) in &hianime_provs {
+    if let Some(ref z_info) = zoko_res {
+        for sub in &z_info.subtitles {
+            if !sub.url.is_empty() && !existing_codes.contains(&sub.code) {
+                existing_codes.insert(sub.code.clone());
+                info.subtitles.push(sub.clone());
+            }
+        }
+    }
+    for (hi_info, _) in &combined_hls_provs {
         for sub in &hi_info.subtitles {
             if !sub.url.is_empty() && !existing_codes.contains(&sub.code) {
                 existing_codes.insert(sub.code.clone());
@@ -1375,14 +1484,14 @@ pub async fn fetch_stream_info_with_identity(
     let mut all_subtitles = info.subtitles.clone();
     SubtitleOption::ensure_none_option_first(&mut all_subtitles);
     let dub_avail = info.dub_available
-        || (!hianime_provs.is_empty() && hianime_provs.iter().any(|(_, p)| p.supports_dub))
+        || (!combined_hls_provs.is_empty() && combined_hls_provs.iter().any(|(_, p)| p.supports_dub))
         || animeheaven_prov.as_ref().is_some_and(|p| p.supports_dub)
         || animegg_prov.as_ref().is_some_and(|p| p.supports_dub);
 
-    // Build strictly verified provider list — dead or wrong-anime providers never appear!
+    // Build strictly verified provider list — dead or duplicate CDN entries never appear!
     let mut verified_providers: Vec<ProviderOption> = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
-    let mut seen_master_urls: HashSet<String> = HashSet::new();
+    let mut seen_stream_keys: HashSet<String> = HashSet::new();
 
     if let Some(ref z_info) = zoko_res {
         if let Some(ref m_url) = z_info.master_url {
@@ -1407,20 +1516,20 @@ pub async fn fetch_stream_info_with_identity(
                     needs_hls_proxy: zoko_proxy,
                 });
                 seen_ids.insert("zoko".to_string());
-                seen_master_urls.insert(m_url.clone());
+                seen_stream_keys.insert(normalize_stream_dedup_key(m_url));
             }
         }
     }
 
-    for (hi_info, mut hi_prov) in hianime_provs {
+    for (hi_info, mut hi_prov) in combined_hls_provs {
         let Some(ref m_url) = hi_prov.master_url else {
             continue;
         };
         if m_url.is_empty() {
             continue;
         }
-        // Avoid duplicating identical CDN master playlist URLs from different embed wrappers
-        if !seen_ids.insert(hi_prov.id.clone()) || !seen_master_urls.insert(m_url.clone()) {
+        let dedup_key = normalize_stream_dedup_key(m_url);
+        if !seen_ids.insert(hi_prov.id.clone()) || !seen_stream_keys.insert(dedup_key) {
             continue;
         }
         if hi_prov.qualities.is_empty() {
@@ -1452,6 +1561,7 @@ pub async fn fetch_stream_info_with_identity(
         }
     }
 
+    verified_providers.sort_by_key(|p| provider_rank_priority(&p.id));
     info.providers = filter_verified_providers(verified_providers);
     info.dub_available = dub_avail;
     info
@@ -1467,7 +1577,7 @@ async fn check_mal_dub_available(client: &reqwest::Client, mal_id: i64, episode:
     false
 }
 
-/// Probe all working HiAnime server embeds using ordered multi-alias search.
+/// Probe all working HiAnime server embeds using ordered multi-alias search on `hianime.fm`.
 async fn fetch_all_hianime_providers_identity(
     client: &reqwest::Client,
     identity: &AnimeSearchIdentity,
@@ -1478,15 +1588,15 @@ async fn fetch_all_hianime_providers_identity(
     let mut anime_id: Option<String> = None;
     for alias in aliases.iter().take(3) {
         let Ok(search_resp) = client
-            .get(format!("https://hianime.at/search?keyword={}", urlencoding::encode(alias)))
-            .timeout(Duration::from_secs(3))
+            .get(format!("https://hianime.fm/search?keyword={}", urlencoding::encode(alias)))
+            .timeout(Duration::from_secs(4))
             .send()
             .await
         else {
             continue;
         };
         if let Ok(search_html) = search_resp.text().await {
-            if let Some(aid) = extract_anime_id(&search_html) {
+            if let Some(aid) = extract_best_anime_id_scored(&search_html, identity) {
                 anime_id = Some(aid);
                 break;
             }
@@ -1497,7 +1607,7 @@ async fn fetch_all_hianime_providers_identity(
     };
 
     let Ok(ep_resp) = client
-        .get(format!("https://hianime.at/api/theme/episode/list/{}", anime_id))
+        .get(format!("https://hianime.fm/api/theme/episode/list/{}", anime_id))
         .timeout(Duration::from_secs(3))
         .send()
         .await
@@ -1513,7 +1623,7 @@ async fn fetch_all_hianime_providers_identity(
     };
 
     let Ok(srv_resp) = client
-        .get(format!("https://hianime.at/api/theme/episode/servers?episodeId={}", ep_id))
+        .get(format!("https://hianime.fm/api/theme/episode/servers?episodeId={}", ep_id))
         .timeout(Duration::from_secs(3))
         .send()
         .await
@@ -1525,12 +1635,16 @@ async fn fetch_all_hianime_providers_identity(
     };
     let srv_html = srv_json.get("html").and_then(|v| v.as_str()).unwrap_or("");
     let has_dub_srv = srv_html.contains("data-type=\"dub\"");
-    let has_sub_srv = srv_html.contains("data-type=\"sub\"");
+    let has_sub_srv = srv_html.contains("data-type=\"sub\"") || srv_html.contains("data-type=\"hsub\"");
 
-    let mode_attr = if is_dub { "data-type=\"dub\"" } else { "data-type=\"sub\"" };
     let mut embeds: Vec<(String, String, String)> = Vec::new();
     for block in srv_html.split("server-item") {
-        if !block.contains(mode_attr) {
+        let is_matching_mode = if is_dub {
+            block.contains("data-type=\"dub\"")
+        } else {
+            block.contains("data-type=\"sub\"") || block.contains("data-type=\"hsub\"")
+        };
+        if !is_matching_mode {
             continue;
         }
         if let Some(hash_idx) = block.find("data-hash=\"") {
@@ -1561,7 +1675,7 @@ async fn fetch_all_hianime_providers_identity(
         async move {
             let resp = client
                 .get(&embed_url)
-                .header("Referer", "https://hianime.at/")
+                .header("Referer", "https://hianime.fm/")
                 .timeout(Duration::from_secs(4))
                 .send()
                 .await
@@ -1786,7 +1900,7 @@ pub fn parse_animegg_video_sources(html: &str) -> Vec<QualityOption> {
             } else {
                 format!("https://www.animegg.org{file_path}")
             };
-            let tail = &html[abs + end_rel..html.len().min(abs + end_rel + 120)];
+            let tail = slice_at_most_bytes(html, abs + end_rel, 120);
             let label = tail
                 .find("label:")
                 .and_then(|li| {
@@ -1990,7 +2104,7 @@ async fn fetch_animegg_provider(
 
     let quals = parse_animegg_video_sources(&embed_html);
     let best_url = quals.first().map(|q| q.url.clone())?;
-    if !verify_mp4_reachable(client, &best_url, "https://www.animegg.org/").await {
+    if !verify_mp4_stream(client, &best_url, "https://www.animegg.org/", 512_000).await {
         return None;
     }
     let best_res = quals.first().map(|q| q.label.clone());
@@ -2018,7 +2132,7 @@ pub fn parse_animeheaven_search_candidates(html: &str) -> Vec<(String, String)> 
     let mut pos = 0usize;
     while let Some(rel) = html[pos..].find("anime.php?") {
         let abs = pos + rel;
-        let tail = &html[abs..html.len().min(abs + 260)];
+        let tail = slice_at_most_bytes(html, abs, 260);
         let path_end = tail.find(|c| c == '\'' || c == '"' || c == ' ' || c == '>').unwrap_or(0);
         if path_end > 10 {
             let path = &tail[..path_end];
@@ -2046,7 +2160,7 @@ pub fn parse_animeheaven_episode_gate_key(html: &str, episode: u32) -> Option<St
     let mut pos = 0usize;
     while let Some(rel) = html[pos..].find("gatea(") {
         let abs = pos + rel + 6;
-        let tail = &html[abs..html.len().min(abs + 320)];
+        let tail = slice_at_most_bytes(html, abs, 320);
         if let Some(q1) = tail.find('"').or_else(|| tail.find('\'')) {
             let quote = tail.as_bytes()[q1] as char;
             let after_q = &tail[q1 + 1..];
@@ -2070,34 +2184,53 @@ pub fn parse_animeheaven_episode_gate_key(html: &str, episode: u32) -> Option<St
     None
 }
 
-/// Extract playable `.mp4` `<source src='...'>` URLs from AnimeHeaven `gate.php` HTML, preferring primary non-error CDNs.
-pub fn parse_animeheaven_gate_videos(html: &str) -> Vec<String> {
-    let mut primary = Vec::new();
-    let mut fallback = Vec::new();
+fn animeheaven_cdn_priority(url: &str) -> u8 {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("//co.animeheaven.") {
+        0
+    } else if lower.contains("//rk.animeheaven.") {
+        1
+    } else if lower.contains("//ci.animeheaven.") {
+        2
+    } else if lower.contains("//cx.animeheaven.") {
+        3
+    } else {
+        4
+    }
+}
+
+/// Extract playable `.mp4` `<source src='...'>` URLs from AnimeHeaven `gate.php` HTML,
+/// rejecting `ax.animeheaven.me` 3-second decoys, `&error` mirrors, and mismatched episode keys.
+pub fn parse_animeheaven_gate_videos_for_key(html: &str, expected_hex_key: Option<&str>) -> Vec<String> {
+    let mut candidates = Vec::new();
     let mut pos = 0usize;
     while let Some(rel) = html[pos..].find("<source") {
         let abs = pos + rel;
-        let tail = &html[abs..html.len().min(abs + 320)];
+        let tail = slice_at_most_bytes(html, abs, 320);
         if let Some(src_idx) = tail.find("src='").or_else(|| tail.find("src=\"")) {
             let q = tail.as_bytes()[src_idx + 4] as char;
             let after = &tail[src_idx + 5..];
             if let Some(end) = after.find(q) {
                 let url = after[..end].trim().to_string();
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    if url.contains("&error") {
-                        if !fallback.contains(&url) {
-                            fallback.push(url);
-                        }
-                    } else if !primary.contains(&url) {
-                        primary.push(url);
-                    }
+                let lower = url.to_ascii_lowercase();
+                let is_http = lower.starts_with("http://") || lower.starts_with("https://");
+                let is_decoy = lower.contains("//ax.animeheaven.") || lower.contains("2c523c8cd9cc129bd13fc7407fa81220");
+                let is_error = lower.contains("&error");
+                let key_ok = expected_hex_key.is_none_or(|k| url.contains(k));
+                if is_http && !is_decoy && !is_error && key_ok && !candidates.contains(&url) {
+                    candidates.push(url);
                 }
             }
         }
         pos = abs + 7;
     }
-    primary.extend(fallback);
-    primary
+    candidates.sort_by_key(|u| animeheaven_cdn_priority(u));
+    candidates
+}
+
+/// Backwards-compatible wrapper for extracting AnimeHeaven MP4 candidates without explicit key check.
+pub fn parse_animeheaven_gate_videos(html: &str) -> Vec<String> {
+    parse_animeheaven_gate_videos_for_key(html, None)
 }
 
 /// Probe AnimeHeaven directly for independent direct MP4 streams.
@@ -2115,7 +2248,7 @@ async fn fetch_animeheaven_provider(
         let Ok(resp) = client
             .get(&search_url)
             .header("Referer", "https://animeheaven.me/")
-            .timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(4))
             .send()
             .await
         else {
@@ -2128,7 +2261,6 @@ async fn fetch_animeheaven_provider(
             let is_dub_entry = title.to_ascii_lowercase().contains("(dub)")
                 || title.to_ascii_lowercase().ends_with(" dub");
             if is_dub != is_dub_entry && !title.to_ascii_lowercase().contains("dub") && is_dub {
-                // Keep Sub entry excluded when Dub was explicitly requested unless dub exists
                 continue;
             }
             let mut score = score_candidate_title(&title, identity);
@@ -2173,16 +2305,32 @@ async fn fetch_animeheaven_provider(
         .text()
         .await
         .ok()?;
-    let mp4s = parse_animeheaven_gate_videos(&gate_html);
-    let mut chosen_url: Option<String> = None;
-    for candidate_url in mp4s.iter().take(2) {
-        if verify_mp4_reachable(client, candidate_url, "https://animeheaven.me/").await {
-            chosen_url = Some(candidate_url.clone());
-            break;
+    let mp4s = parse_animeheaven_gate_videos_for_key(&gate_html, Some(&hex_key));
+    let probe_futs = mp4s.into_iter().map(|candidate_url| {
+        let client = client.clone();
+        async move {
+            if verify_mp4_stream(&client, &candidate_url, "https://animeheaven.me/", 512_000).await {
+                Some(candidate_url)
+            } else {
+                None
+            }
         }
+    });
+    let verified_mirrors: Vec<String> = futures_util::future::join_all(probe_futs)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    let best_url = verified_mirrors.first()?.clone();
+    let mut quals = Vec::new();
+    for (idx, m_url) in verified_mirrors.into_iter().take(3).enumerate() {
+        let label = if idx == 0 {
+            "1080p".to_string()
+        } else {
+            format!("1080p · Mirror {}", idx + 1)
+        };
+        quals.push(QualityOption::simple(label, m_url));
     }
-    let best_url = chosen_url?;
-    let quals = vec![QualityOption::simple("1080p", best_url.clone())];
 
     Some(ProviderOption {
         id: "animeheaven".to_string(),
@@ -2557,18 +2705,25 @@ async fn fetch_mal_id(client: &reqwest::Client, anilist_id: i64) -> Option<i64> 
     json.pointer("/data/Media/idMal")?.as_i64()
 }
 
-/// Fetch and parse stream info using MAL ID directly on ZokoAnime embed
+/// Fetch and parse stream info using MAL ID directly on ZokoAnime embed (`sub` -> `hsub` fallback).
 async fn fetch_stream_for_mal(
     client: &reqwest::Client,
     mal_id: i64,
     episode: u32,
     is_dub: bool,
 ) -> Result<StreamInfo, ()> {
-    let mode_str = if is_dub { "dub" } else { "sub" };
-    let url = format!("https://zokoanime.video/stream/mal/{}/{}/{}", mal_id, episode, mode_str);
-    let resp = client.get(&url).send().await.map_err(|_| ())?;
-    let html = resp.text().await.map_err(|_| ())?;
-    parse_stream_embed(client, &html, is_dub).await
+    let modes: &[&str] = if is_dub { &["dub"] } else { &["sub", "hsub"] };
+    for mode_str in modes {
+        let url = format!("https://zokoanime.video/stream/mal/{}/{}/{}", mal_id, episode, mode_str);
+        if let Ok(resp) = client.get(&url).timeout(Duration::from_secs(4)).send().await {
+            if let Ok(html) = resp.text().await {
+                if let Ok(info) = parse_stream_embed(client, &html, is_dub).await {
+                    return Ok(info);
+                }
+            }
+        }
+    }
+    Err(())
 }
 
 #[allow(dead_code)]
@@ -2814,6 +2969,402 @@ fn map_subtitles(subs: &[serde_json::Value]) -> Vec<SubtitleOption> {
     prioritize_subtitles(&mut options);
 
     options
+}
+
+/// Score HiAnime search cards against `AnimeSearchIdentity` and return the strongest matching numeric anime ID.
+fn extract_best_anime_id_scored(html: &str, identity: &AnimeSearchIdentity) -> Option<String> {
+    let mut best: Option<(i32, String)> = None;
+    for part in html.split("film-name").skip(1) {
+        let slice = slice_at_most_bytes(part, 0, 500);
+        if let Some(href_idx) = slice.find("href=\"") {
+            let after = &slice[href_idx + 6..];
+            if let Some(end_idx) = after.find('"') {
+                let url = &after[..end_idx];
+                let slug = url.split('/').next_back().unwrap_or("");
+                if let Some(last_dash) = slug.rfind('-') {
+                    let id_part = &slug[last_dash + 1..];
+                    if id_part.chars().all(|c| c.is_ascii_digit()) && !id_part.is_empty() {
+                        let title = slice
+                            .find('>')
+                            .and_then(|gt| {
+                                let after_gt = &slice[gt + 1..];
+                                after_gt.find('<').map(|lt| after_gt[..lt].trim())
+                            })
+                            .unwrap_or(slug);
+                        let score = score_candidate_title(title, identity)
+                            .max(score_candidate_title(&slug[..last_dash], identity));
+                        if best.as_ref().is_none_or(|(bs, _)| score > *bs) {
+                            best = Some((score, id_part.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some((score, id)) = best {
+        if score >= 5 {
+            return Some(id);
+        }
+    }
+    extract_anime_id(html)
+}
+
+/// Fast direct MAL-ID lookup on MegaPlay (`/sub` + `/hsub` or `/dub`) without scraping HiAnime search.
+async fn fetch_megaplay_direct_providers(
+    client: &reqwest::Client,
+    mal_id: i64,
+    episode: u32,
+    is_dub: bool,
+) -> Vec<(StreamInfo, ProviderOption)> {
+    let specs: Vec<(&str, &str, &str)> = if is_dub {
+        vec![("dub", "megaplay_mal", "MegaPlay Direct")]
+    } else {
+        vec![
+            ("sub", "megaplay_mal", "MegaPlay Direct"),
+            ("hsub", "megaplay_hsub", "MegaPlay (Hardsub)"),
+        ]
+    };
+
+    let futs = specs.into_iter().map(|(mode, pid, pname)| {
+        let client = client.clone();
+        async move {
+            let embed_url = format!("https://megaplay.buzz/stream/mal/{mal_id}/{episode}/{mode}");
+            let html = client
+                .get(&embed_url)
+                .header("Referer", "https://megaplay.buzz/")
+                .timeout(Duration::from_secs(4))
+                .send()
+                .await
+                .ok()?
+                .text()
+                .await
+                .ok()?;
+            let mut st_info = parse_megaplay_embed(&client, &embed_url, &html, is_dub).await.ok()?;
+            let master = st_info.master_url.as_deref().filter(|u| !u.is_empty())?;
+            if st_info.qualities.is_empty() {
+                return None;
+            }
+            let probe_url = st_info
+                .qualities
+                .first()
+                .map(|q| q.url.as_str())
+                .filter(|u| !u.is_empty())
+                .unwrap_or(master);
+            let (ok, needs_proxy) = probe_hls_segment_health(&client, probe_url, "https://megaplay.buzz/").await;
+            if !ok {
+                return None;
+            }
+            for q in &mut st_info.qualities {
+                q.needs_hls_proxy = needs_proxy;
+            }
+            let best_res = st_info.qualities.first().map(|q| q.label.clone());
+            let prov = ProviderOption {
+                id: pid.to_string(),
+                name: pname.to_string(),
+                server_label: pname.to_string(),
+                master_url: Some(master.to_string()),
+                qualities: st_info.qualities.clone(),
+                subtitles: st_info.subtitles.clone(),
+                supports_sub: !is_dub,
+                supports_dub: is_dub,
+                is_verified: true,
+                verified_res: best_res,
+                referer: Some("https://megaplay.buzz/".to_string()),
+                needs_hls_proxy: needs_proxy,
+            };
+            Some((st_info, prov))
+        }
+    });
+
+    futures_util::future::join_all(futs)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Decode base64 `<option value="...">Label</option>` player tabs from a `9anime.org.lv` episode page.
+pub fn parse_9anime_player_tabs(html: &str) -> Vec<(String, String)> {
+    let mut tabs = Vec::new();
+    let mut pos = 0usize;
+    while let Some(rel) = html[pos..].find("<option") {
+        let abs = pos + rel;
+        let tail = slice_at_most_bytes(html, abs, 900);
+        if let Some(val_idx) = tail.find("value=\"") {
+            let after_val = &tail[val_idx + 7..];
+            if let Some(end_val) = after_val.find('"') {
+                let raw_val = after_val[..end_val].trim();
+                let label = tail[val_idx + 7 + end_val..]
+                    .find('>')
+                    .and_then(|gt| {
+                        let after_gt = &tail[val_idx + 7 + end_val + gt + 1..];
+                        after_gt.find("</option>").map(|lt| after_gt[..lt].trim().to_string())
+                    })
+                    .unwrap_or_default();
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(raw_val) {
+                    if let Ok(decoded) = String::from_utf8(bytes) {
+                        if let Some(src_idx) = decoded.find("src=\"")
+                            .or_else(|| decoded.find("src='"))
+                        {
+                            let q = decoded.as_bytes()[src_idx + 4] as char;
+                            let after_src = &decoded[src_idx + 5..];
+                            if let Some(end_src) = after_src.find(q) {
+                                let mut src = after_src[..end_src].trim().to_string();
+                                if src.starts_with("//") {
+                                    src = format!("https:{src}");
+                                }
+                                if src.starts_with("http://") || src.starts_with("https://") {
+                                    tabs.push((label, src));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pos = abs + 7;
+    }
+    tabs
+}
+
+/// Extract the direct HLS `master.m3u8` URL embedded in a `vidmoly.biz` / `vidmoly.net` embed page.
+pub fn parse_vidmoly_master_m3u8(html: &str) -> Option<String> {
+    let mut pos = 0usize;
+    while let Some(rel) = html[pos..].find("master.m3u8") {
+        let abs = pos + rel;
+        let prefix = &html[..abs];
+        if let Some(http_idx) = prefix.rfind("https://").or_else(|| prefix.rfind("http://")) {
+            let after_http = &html[http_idx..];
+            let end_rel = after_http
+                .find(|c: char| matches!(c, '"' | '\'' | '<' | '>' | ' ' | '\n' | '\r' | ')'))
+                .unwrap_or(after_http.len());
+            let candidate = after_http[..end_rel].trim();
+            if candidate.contains(".m3u8") {
+                return Some(candidate.to_string());
+            }
+        }
+        pos = abs + 11;
+    }
+    None
+}
+
+async fn resolve_vidmoly_provider(
+    client: &reqwest::Client,
+    embed_url: &str,
+    is_dub: bool,
+) -> Option<(StreamInfo, ProviderOption)> {
+    let embed_html = client
+        .get(embed_url)
+        .header("Referer", "https://9anime.org.lv/")
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let master_url = parse_vidmoly_master_m3u8(&embed_html)?;
+    let referer = if embed_url.contains("vidmoly.net") {
+        "https://vidmoly.net/"
+    } else {
+        "https://vidmoly.biz/"
+    };
+    let m3u8_text = client
+        .get(&master_url)
+        .header("Referer", referer)
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    if !m3u8_text.contains("#EXTM3U") {
+        return None;
+    }
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let ladder = parse_m3u8_ladder(&master_url, &m3u8_text, 0, 0, is_dub, now_unix);
+    let mut qualities = parse_m3u8_qualities_for_mode(&master_url, &m3u8_text, is_dub);
+    if qualities.is_empty() {
+        qualities.push(QualityOption::simple("900p", master_url.clone()));
+    }
+    let probe_url = qualities
+        .first()
+        .map(|q| q.url.as_str())
+        .unwrap_or(&master_url);
+    let (ok, needs_proxy) = probe_hls_segment_health(client, probe_url, referer).await;
+    if !ok {
+        return None;
+    }
+    for q in &mut qualities {
+        q.needs_hls_proxy = needs_proxy;
+    }
+    let best_res = qualities.first().map(|q| q.label.clone());
+    let info = StreamInfo {
+        master_url: Some(master_url.clone()),
+        qualities: qualities.clone(),
+        subtitles: Vec::new(),
+        audio_tracks: parse_m3u8_audio_tracks(&m3u8_text),
+        providers: Vec::new(),
+        dub_available: is_dub,
+        ladder: Some(ladder),
+    };
+    let prov = ProviderOption {
+        id: "vidmoly".to_string(),
+        name: "Vidmoly Direct".to_string(),
+        server_label: "Vidmoly".to_string(),
+        master_url: Some(master_url),
+        qualities,
+        subtitles: Vec::new(),
+        supports_sub: !is_dub,
+        supports_dub: is_dub,
+        is_verified: true,
+        verified_res: best_res,
+        referer: Some(referer.to_string()),
+        needs_hls_proxy: needs_proxy,
+    };
+    Some((info, prov))
+}
+
+/// Probe `9anime.org.lv` to harvest clean `Vidmoly Direct` (`vmpx.online`/`vmget.online`)
+/// and fallback `HD-1`/`HD-2` MegaPlay streams.
+async fn fetch_9anime_and_vidmoly_providers(
+    client: &reqwest::Client,
+    identity: &AnimeSearchIdentity,
+    episode: u32,
+    is_dub: bool,
+) -> Vec<(StreamInfo, ProviderOption)> {
+    let aliases = identity.ordered_aliases();
+    let mut best_series: Option<(i32, String)> = None;
+
+    for alias in aliases.iter().take(2) {
+        let search_url = format!("https://9anime.org.lv/?s={}", urlencoding::encode(alias));
+        let Ok(resp) = client.get(&search_url).timeout(Duration::from_secs(4)).send().await else {
+            continue;
+        };
+        let Ok(html) = resp.text().await else {
+            continue;
+        };
+        let mut pos = 0usize;
+        while let Some(rel) = html[pos..].find("https://9anime.org.lv/anime/") {
+            let abs = pos + rel;
+            let rest = &html[abs..];
+            let end_rel = rest.find('"').unwrap_or(0);
+            if end_rel > 28 {
+                let series_url = &rest[..end_rel];
+                let slug = series_url
+                    .trim_start_matches("https://9anime.org.lv/anime/")
+                    .trim_end_matches('/');
+                let is_dub_slug = slug.ends_with("-dub");
+                if is_dub == is_dub_slug {
+                    let clean_slug = slug.trim_end_matches("-dub");
+                    let score = score_candidate_title(clean_slug, identity);
+                    if best_series.as_ref().is_none_or(|(bs, _)| score > *bs) {
+                        best_series = Some((score, slug.to_string()));
+                    }
+                }
+                pos = abs + end_rel;
+            } else {
+                pos = abs + 28;
+            }
+        }
+        if best_series.as_ref().is_some_and(|(s, _)| *s >= 25) {
+            break;
+        }
+    }
+
+    let Some((best_score, series_slug)) = best_series else {
+        return Vec::new();
+    };
+    if best_score < 15 {
+        return Vec::new();
+    }
+
+    let ep_url = format!("https://9anime.org.lv/{series_slug}-episode-{episode}/");
+    let ep_html = match client.get(&ep_url).timeout(Duration::from_secs(4)).send().await {
+        Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
+        _ => String::new(),
+    };
+    if ep_html.is_empty() {
+        return Vec::new();
+    }
+
+    let tabs = parse_9anime_player_tabs(&ep_html);
+    let futs = tabs.into_iter().map(|(label, src_url)| {
+        let client = client.clone();
+        async move {
+            if src_url.contains("vidmoly.") {
+                return resolve_vidmoly_provider(&client, &src_url, is_dub).await;
+            }
+            if src_url.contains("gogoanime.me.uk/newplayer.php") {
+                let sub_html = client
+                    .get(&src_url)
+                    .header("Referer", "https://9anime.org.lv/")
+                    .timeout(Duration::from_secs(4))
+                    .send()
+                    .await
+                    .ok()?
+                    .text()
+                    .await
+                    .ok()?;
+                let iframe_idx = sub_html.find("https://megaplay.buzz/")?;
+                let after = &sub_html[iframe_idx..];
+                let end_rel = after.find('"').or_else(|| after.find('\''))?;
+                let mp_url = &after[..end_rel];
+                let mp_html = client
+                    .get(mp_url)
+                    .header("Referer", "https://gogoanime.me.uk/")
+                    .timeout(Duration::from_secs(4))
+                    .send()
+                    .await
+                    .ok()?
+                    .text()
+                    .await
+                    .ok()?;
+                let mut st_info = parse_megaplay_embed(&client, mp_url, &mp_html, is_dub).await.ok()?;
+                let master = st_info.master_url.as_deref().filter(|u| !u.is_empty())?;
+                let probe_url = st_info.qualities.first().map(|q| q.url.as_str()).unwrap_or(master);
+                let (ok, needs_proxy) = probe_hls_segment_health(&client, probe_url, "https://megaplay.buzz/").await;
+                if !ok {
+                    return None;
+                }
+                for q in &mut st_info.qualities {
+                    q.needs_hls_proxy = needs_proxy;
+                }
+                let (pid, pname) = if label.eq_ignore_ascii_case("HD-2") {
+                    ("hd2", "MegaPlay HD-2")
+                } else {
+                    ("hd1", "MegaPlay HD-1")
+                };
+                let best_res = st_info.qualities.first().map(|q| q.label.clone());
+                let prov = ProviderOption {
+                    id: pid.to_string(),
+                    name: pname.to_string(),
+                    server_label: label,
+                    master_url: Some(master.to_string()),
+                    qualities: st_info.qualities.clone(),
+                    subtitles: st_info.subtitles.clone(),
+                    supports_sub: !is_dub,
+                    supports_dub: is_dub,
+                    is_verified: true,
+                    verified_res: best_res,
+                    referer: Some("https://megaplay.buzz/".to_string()),
+                    needs_hls_proxy: needs_proxy,
+                };
+                return Some((st_info, prov));
+            }
+            None
+        }
+    });
+
+    futures_util::future::join_all(futs)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn extract_anime_id(html: &str) -> Option<String> {
@@ -3294,8 +3845,47 @@ index-f1.m3u8
         );
         assert_eq!(parse_animeheaven_episode_gate_key(anime_html, 2), None);
 
-        let gate_html = r#"<video><source src='https://ct.animeheaven.me/video.mp4?abc&error'><source src='https://rk.animeheaven.me/video.mp4?abc&token=1'></video>"#;
-        let videos = parse_animeheaven_gate_videos(gate_html);
-        assert_eq!(videos[0], "https://rk.animeheaven.me/video.mp4?abc&token=1");
+        let gate_html = r#"<video><source src='https://ax.animeheaven.me/video.mp4?2c523c8cd9cc129bd13fc7407fa81220&eed805517af9a226eed805517af9a226'><source src='https://ct.animeheaven.me/video.mp4?abc&error'><source src='https://rk.animeheaven.me/video.mp4?abc&token=1'><source src='https://co.animeheaven.me/video.mp4?abc&token=2'></video>"#;
+        let videos = parse_animeheaven_gate_videos_for_key(gate_html, Some("abc"));
+        assert_eq!(videos.len(), 2);
+        assert_eq!(videos[0], "https://co.animeheaven.me/video.mp4?abc&token=2");
+        assert_eq!(videos[1], "https://rk.animeheaven.me/video.mp4?abc&token=1");
+    }
+
+    #[test]
+    fn test_animeheaven_utf8_boundary_safety() {
+        let padding = format!("{}{}", "x".repeat(200), "√".repeat(50));
+        let search_html = format!("<div class='p1'><a href='anime.php?igr7m'><img src='i.jpg' alt='Tokyo Ghoul'>{padding}</a>");
+        let cands = parse_animeheaven_search_candidates(&search_html);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0].0, "anime.php?igr7m");
+
+        let padding_gate = "√".repeat(120);
+        let anime_html = format!("<a onclick='gatea(\"deadbeef\")' href='gate.php'><div class='watch2'>1</div>{padding_gate}</a>");
+        assert_eq!(parse_animeheaven_episode_gate_key(&anime_html, 1).as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn test_parse_9anime_tabs_and_vidmoly_m3u8() {
+        let iframe_b64 = base64::engine::general_purpose::STANDARD.encode(r#"<iframe src="https://vidmoly.biz/embed-giz7ij75xqy3.html"></iframe>"#);
+        let ep_html = format!(r#"<select><option value="{iframe_b64}">Omega</option></select>"#);
+        let tabs = parse_9anime_player_tabs(&ep_html);
+        assert_eq!(tabs, vec![("Omega".to_string(), "https://vidmoly.biz/embed-giz7ij75xqy3.html".to_string())]);
+
+        let vidmoly_html = r#"sources: [{file:"https://prx-1566-ant-r.vmpx.online/hls2/02/02585/giz7ij75xqy3_,n,l,.urlset/master.m3u8?t=abc"}]"#;
+        assert_eq!(
+            parse_vidmoly_master_m3u8(vidmoly_html).as_deref(),
+            Some("https://prx-1566-ant-r.vmpx.online/hls2/02/02585/giz7ij75xqy3_,n,l,.urlset/master.m3u8?t=abc")
+        );
+    }
+
+    #[test]
+    fn test_extract_best_anime_id_scored_prefers_exact_title() {
+        let html = r#"
+            <div class="film-name"><a href="/tokyo-ghoul-a-891">Tokyo Ghoul √A</a></div>
+            <div class="film-name"><a href="/tokyo-ghoul-890">Tokyo Ghoul</a></div>
+        "#;
+        let id = AnimeSearchIdentity::from_query(20605, Some(22319), "Tokyo Ghoul");
+        assert_eq!(extract_best_anime_id_scored(html, &id).as_deref(), Some("890"));
     }
 }

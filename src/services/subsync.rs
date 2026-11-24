@@ -684,7 +684,401 @@ pub fn calculate_speech_vad_alignment(
     }
 }
 
-/// Automated dual-window `ffmpeg` speech-band extraction + wide cross-correlation for `SNAP TO VOICE`.
+static VOCAL_ENV_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, u64), Vec<f32>>>,
+> = std::sync::OnceLock::new();
+
+fn vocal_env_cache() -> &'static std::sync::Mutex<std::collections::HashMap<(String, u64), Vec<f32>>> {
+    VOCAL_ENV_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Convert raw `8 kHz mono s16le` PCM into a 10 Hz (100ms/frame) vocal modulation envelope
+/// using `ln(1 + rms)` minus a centered 4.0s running local mean to cancel steady BGM/OPs.
+pub fn pcm_s16le_to_vocal_envelope(pcm_bytes: &[u8]) -> Vec<f32> {
+    const SAMPLES_PER_FRAME: usize = 800; // 100ms at 8000 Hz
+    const LOCAL_RADIUS: usize = 20; // ±2.0s => 4.0s window
+    let sample_count = pcm_bytes.len() / 2;
+    let frame_count = sample_count / SAMPLES_PER_FRAME;
+    if frame_count < 20 {
+        return Vec::new();
+    }
+
+    let mut log_rms = Vec::with_capacity(frame_count);
+    for f in 0..frame_count {
+        let base = f * SAMPLES_PER_FRAME * 2;
+        let mut sum_sq = 0.0_f64;
+        for s in 0..SAMPLES_PER_FRAME {
+            let idx = base + s * 2;
+            let sample = i16::from_le_bytes([pcm_bytes[idx], pcm_bytes[idx + 1]]) as f64;
+            sum_sq += sample * sample;
+        }
+        let rms = (sum_sq / SAMPLES_PER_FRAME as f64).sqrt();
+        log_rms.push((1.0 + rms).ln() as f32);
+    }
+
+    let mut env = Vec::with_capacity(frame_count);
+    let mut prefix = Vec::with_capacity(frame_count + 1);
+    prefix.push(0.0_f64);
+    for &v in &log_rms {
+        prefix.push(prefix.last().copied().unwrap_or(0.0) + v as f64);
+    }
+    for i in 0..frame_count {
+        let lo = i.saturating_sub(LOCAL_RADIUS);
+        let hi = (i + LOCAL_RADIUS + 1).min(frame_count);
+        let local_mean = ((prefix[hi] - prefix[lo]) / (hi - lo) as f64) as f32;
+        env.push((log_rms[i] - local_mean).max(0.0));
+    }
+
+    // Soft-cap extreme SFX spikes at 3x std-dev
+    let mean = env.iter().map(|&v| v as f64).sum::<f64>() / env.len() as f64;
+    let var = env
+        .iter()
+        .map(|&v| {
+            let d = v as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / env.len() as f64;
+    let cap = (mean + 3.0 * var.sqrt()).max(0.5) as f32;
+    for v in &mut env {
+        *v = (*v).min(cap);
+    }
+    env
+}
+
+/// Extract 10 Hz vocal-band (`300 Hz - 3000 Hz`) PCM envelope via `ffmpeg` (`s16le pipe:1`),
+/// supporting `.ts.jpg` HLS via `-extension_picky 0` and caching results in memory.
+pub async fn extract_vocal_envelope_ffmpeg(
+    stream_url: &str,
+    referer: Option<&str>,
+    start_secs: f64,
+    duration_secs: f64,
+) -> Result<Vec<f32>, String> {
+    let win_start_key = (start_secs.max(0.0) * 10.0).round() as u64;
+    let cache_key = (stream_url.to_string(), win_start_key);
+    if let Ok(guard) = vocal_env_cache().lock() {
+        if let Some(cached) = guard.get(&cache_key) {
+            return Ok(cached.clone());
+        }
+    }
+
+    let ffmpeg_cmd = if std::path::Path::new("/opt/homebrew/bin/ffmpeg").exists() {
+        "/opt/homebrew/bin/ffmpeg"
+    } else if std::path::Path::new("/usr/local/bin/ffmpeg").exists() {
+        "/usr/local/bin/ffmpeg"
+    } else {
+        "ffmpeg"
+    };
+
+    let is_http = stream_url.starts_with("http://") || stream_url.starts_with("https://");
+    let is_local_proxy = stream_url.starts_with("http://127.0.0.1:");
+    let is_hls = stream_url.contains(".m3u8") || stream_url.contains("/m3u8");
+    let timeout_secs = if !is_http || is_local_proxy { 10 } else { 22 };
+    let headers_val = referer
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| {
+            format!(
+                "Referer: {r}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
+            )
+        });
+
+    let mut last_err = String::from("ffmpeg failed to decode audio");
+    for use_picky_flag in [true, false] {
+        if !is_hls && use_picky_flag {
+            continue;
+        }
+        let mut cmd = tokio::process::Command::new(ffmpeg_cmd);
+        cmd.arg("-hide_banner").arg("-nostats").arg("-loglevel").arg("error");
+        if is_http {
+            cmd.args([
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "2",
+                "-rw_timeout", "10000000",
+                "-analyzeduration", "2000000",
+                "-probesize", "1000000",
+            ]);
+            if !is_local_proxy {
+                if let Some(ref hdrs) = headers_val {
+                    cmd.args(["-headers", hdrs]);
+                }
+            }
+            if is_hls {
+                if use_picky_flag {
+                    cmd.args(["-extension_picky", "0"]);
+                }
+                cmd.args([
+                    "-allowed_extensions", "ALL",
+                    "-allowed_segment_extensions", "ALL",
+                ]);
+            }
+        }
+        cmd.args([
+            "-ss", &format!("{:.1}", start_secs.max(0.0)),
+            "-t", &format!("{:.1}", duration_secs.clamp(30.0, 150.0)),
+            "-i", stream_url,
+            "-vn", "-sn", "-dn",
+            "-af", "highpass=f=300,lowpass=f=3000,aresample=8000",
+            "-ac", "1",
+            "-f", "s16le",
+            "pipe:1",
+        ]);
+
+        let out = match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                last_err = format!("ffmpeg launch failed: {e}");
+                break;
+            }
+            Err(_) => {
+                last_err = format!("Audio analysis timed out after {timeout_secs}s");
+                break;
+            }
+        };
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if use_picky_flag && stderr.contains("Unrecognized option 'extension_picky'") {
+            continue;
+        }
+        let env = pcm_s16le_to_vocal_envelope(&out.stdout);
+        if !env.is_empty() {
+            if let Ok(mut guard) = vocal_env_cache().lock() {
+                if guard.len() > 24 {
+                    guard.clear();
+                }
+                guard.insert(cache_key, env.clone());
+            }
+            return Ok(env);
+        }
+        if !stderr.trim().is_empty() {
+            last_err = stderr.lines().last().unwrap_or("No audio stream found").trim().to_string();
+        } else if out.stdout.is_empty() {
+            last_err = "No audio stream decoded from media source".to_string();
+        }
+        break;
+    }
+
+    Err(last_err)
+}
+
+/// Select 1–2 dialogue-dense 110s audio windows across the episode, avoiding silent OP/ED gaps.
+pub fn select_dialogue_windows(sub_cues: &[(f64, f64)], cur_pos_secs: f64) -> Vec<(f64, f64)> {
+    const WIN_DUR: f64 = 110.0;
+    let max_cue_t = sub_cues.iter().map(|c| c.1).fold(0.0_f64, f64::max);
+    if max_cue_t <= 15.0 {
+        return vec![(cur_pos_secs.max(0.0), WIN_DUR)];
+    }
+
+    let mut windows = Vec::new();
+    let cur_center = cur_pos_secs.max(55.0);
+    let cur_start = (cur_center - 55.0).max(0.0);
+    let cur_cues = sub_cues
+        .iter()
+        .filter(|&&(s, e)| e >= cur_start && s <= cur_start + WIN_DUR)
+        .count();
+    if cur_pos_secs >= 180.0 && cur_cues >= 8 {
+        windows.push((cur_start, WIN_DUR));
+    }
+
+    let mut scored: Vec<(f64, usize)> = Vec::new();
+    let mut t = 180.0_f64;
+    let upper = (max_cue_t - 40.0).max(200.0);
+    while t <= upper {
+        let count = sub_cues
+            .iter()
+            .filter(|&&(s, e)| e >= t && s <= t + WIN_DUR)
+            .count();
+        if count >= 6 {
+            scored.push((t, count));
+        }
+        t += 45.0;
+    }
+    if scored.is_empty() {
+        let mut t0 = 0.0_f64;
+        while t0 <= upper {
+            let count = sub_cues
+                .iter()
+                .filter(|&&(s, e)| e >= t0 && s <= t0 + WIN_DUR)
+                .count();
+            if count >= 4 {
+                scored.push((t0, count));
+            }
+            t0 += 45.0;
+        }
+    }
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (cand_start, _) in scored {
+        if windows.iter().all(|&(ws, _): &(f64, f64)| (ws - cand_start).abs() >= 140.0) {
+            windows.push((cand_start, WIN_DUR));
+            if windows.len() >= 2 {
+                break;
+            }
+        }
+    }
+    if windows.is_empty() {
+        windows.push((cur_pos_secs.max(0.0), WIN_DUR));
+    }
+    windows
+}
+
+/// Correlate a 10 Hz vocal modulation envelope over `[win_start, win_start + len*0.1]`
+/// against all subtitle cues using a bidirectional onset/body/silence-gap mask (`-150s..+150s`).
+pub fn correlate_envelope_against_cues(
+    audio_env: &[f32],
+    win_start: f64,
+    sub_cues: &[(f64, f64)],
+) -> SpeechVadSyncResult {
+    const BIN: f64 = 0.10;
+    if audio_env.len() < 150 || sub_cues.len() < 3 {
+        return SpeechVadSyncResult {
+            reason: "Too few audio frames or subtitle cues".to_string(),
+            ..Default::default()
+        };
+    }
+
+    let n = audio_env.len();
+    let a_mean = audio_env.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
+    let a_std = (audio_env
+        .iter()
+        .map(|&v| {
+            let d = v as f64 - a_mean;
+            d * d
+        })
+        .sum::<f64>()
+        / n as f64)
+        .sqrt()
+        .max(1e-6);
+    let norm_env: Vec<f64> = audio_env.iter().map(|&v| (v as f64 - a_mean) / a_std).collect();
+
+    let score_offset = |delta: f64| -> f64 {
+        let mut mask = vec![0.0_f64; n];
+        // Silence gap penalty +-300ms around each shifted cue
+        for &(s, e) in sub_cues {
+            let ss = s + delta - win_start;
+            let ee = e + delta - win_start;
+            if ee < -0.5 || ss > n as f64 * BIN + 0.5 {
+                continue;
+            }
+            let pre_lo = ((ss - 0.3) / BIN).floor() as isize;
+            let pre_hi = (ss / BIN).floor() as isize;
+            for b in pre_lo.max(0)..pre_hi.min(n as isize) {
+                if mask[b as usize] == 0.0 {
+                    mask[b as usize] = -0.5;
+                }
+            }
+            let post_lo = (ee / BIN).ceil() as isize;
+            let post_hi = ((ee + 0.3) / BIN).ceil() as isize;
+            for b in post_lo.max(0)..post_hi.min(n as isize) {
+                if mask[b as usize] == 0.0 {
+                    mask[b as usize] = -0.5;
+                }
+            }
+        }
+        // Positive cue onset (+2.0 for 0..300ms) and body (+1.0) overwrite gap penalties
+        for &(s, e) in sub_cues {
+            let ss = s + delta - win_start;
+            let ee = e + delta - win_start;
+            if ee < 0.0 || ss > n as f64 * BIN {
+                continue;
+            }
+            let sb = (ss / BIN).round() as isize;
+            let eb = (ee / BIN).round() as isize;
+            let onset_end = sb + 3;
+            for b in sb.max(0)..=eb.min(n as isize - 1) {
+                let w = if b < onset_end { 2.0 } else { 1.0 };
+                if w > mask[b as usize] {
+                    mask[b as usize] = w;
+                }
+            }
+        }
+        norm_env
+            .iter()
+            .zip(mask.iter())
+            .map(|(&a, &m)| a * m)
+            .sum::<f64>()
+            / (n as f64).sqrt()
+    };
+
+    // Coarse scan: -150.0s .. +150.0s in 0.20s steps
+    let mut coarse: Vec<(f64, f64)> = Vec::with_capacity(1501);
+    for step in -750..=750 {
+        let delta = step as f64 * 0.20;
+        coarse.push((delta, score_offset(delta)));
+    }
+
+    let cn = coarse.len() as f64;
+    let c_mean = coarse.iter().map(|&(_, sc)| sc).sum::<f64>() / cn;
+    let c_std = (coarse
+        .iter()
+        .map(|&(_, sc)| {
+            let d = sc - c_mean;
+            d * d
+        })
+        .sum::<f64>()
+        / cn)
+        .sqrt()
+        .max(1e-6);
+
+    let mut ranked = coarse.clone();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    let mut top_peaks: Vec<f64> = Vec::new();
+    for &(off, _) in &ranked {
+        if top_peaks.iter().all(|p| (p - off).abs() >= 3.0) {
+            top_peaks.push(off);
+            if top_peaks.len() >= 3 {
+                break;
+            }
+        }
+    }
+
+    let mut best_offset = 0.0_f64;
+    let mut best_score = f64::NEG_INFINITY;
+    for peak in &top_peaks {
+        for sub_step in -50..=50 {
+            let off = (peak + sub_step as f64 * 0.05).clamp(-150.0, 150.0);
+            let sc = score_offset(off);
+            if sc > best_score {
+                best_score = sc;
+                best_offset = off;
+            }
+        }
+    }
+
+    let second_peak = ranked
+        .iter()
+        .find(|&&(off, _)| (off - best_offset).abs() >= 3.0)
+        .map(|&(_, sc)| sc)
+        .unwrap_or(c_mean);
+    let z_score = (best_score - c_mean) / c_std;
+    let prominence = if second_peak > 0.0 {
+        best_score / second_peak
+    } else {
+        2.0
+    };
+    let confidence_pct = (((z_score - 2.0) / 3.0).clamp(0.0, 1.0) * 49.0 + 50.0)
+        .round()
+        .clamp(0.0, 99.0) as u8;
+    let applied = z_score >= 2.6 && best_score > 0.5;
+    let reason = if applied {
+        format!("Voice-Locked ({confidence_pct}% confidence, Z={z_score:.2})")
+    } else {
+        format!("Weak voice match (Z={z_score:.2}) — seek to clear dialogue and retry")
+    };
+
+    SpeechVadSyncResult {
+        offset_seconds: (best_offset * 100.0).round() / 100.0,
+        scale_factor: 1.0,
+        confidence_pct: if applied { confidence_pct } else { ((z_score / 3.0).clamp(0.0, 0.49) * 100.0).round() as u8 },
+        z_score,
+        prominence,
+        applied,
+        reason,
+    }
+}
+
+/// Automated dialogue-clustered `ffmpeg` PCM envelope extraction + wide cross-correlation for `SNAP TO VOICE`.
 pub async fn auto_sync_subtitle_to_audio(
     stream_url: &str,
     referer: Option<&str>,
@@ -708,22 +1102,32 @@ pub async fn auto_sync_subtitle_to_audio(
         };
     }
 
-    // Window A centered around the user's current playback timestamp
-    let w1_start = (cur_pos_secs - 45.0).max(0.0);
-    let mut speech = extract_speech_intervals_ffmpeg(stream_url, referer, w1_start, 90.0).await;
+    let windows = select_dialogue_windows(&sub_cues, cur_pos_secs);
+    let mut best_res = SpeechVadSyncResult {
+        reason: "Audio envelope extraction failed".to_string(),
+        ..Default::default()
+    };
 
-    let mut res = calculate_speech_vad_alignment(&speech, &sub_cues);
-    if !res.applied || speech.len() < 6 {
-        // Window B shifts past typical 90s OP song to lock onto dense main-episode dialogue
-        let w2_start = if w1_start < 90.0 { 130.0 } else { (w1_start + 95.0).min(1200.0) };
-        let speech_b = extract_speech_intervals_ffmpeg(stream_url, referer, w2_start, 90.0).await;
-        if !speech_b.is_empty() {
-            speech.extend(speech_b);
-            res = calculate_speech_vad_alignment(&speech, &sub_cues);
+    for (w_start, w_dur) in windows {
+        match extract_vocal_envelope_ffmpeg(stream_url, referer, w_start, w_dur).await {
+            Ok(env) => {
+                let res = correlate_envelope_against_cues(&env, w_start, &sub_cues);
+                if res.applied {
+                    return res;
+                }
+                if res.z_score > best_res.z_score {
+                    best_res = res;
+                }
+            }
+            Err(err) => {
+                if !best_res.applied && best_res.z_score == 0.0 {
+                    best_res.reason = err;
+                }
+            }
         }
     }
 
-    res
+    best_res
 }
 
 /// Fallback Tier 2: Probe audio lead time via ffmpeg silencedetect (runs in < 1.5s).
@@ -809,15 +1213,23 @@ pub async fn ensure_synchronized_subtitle(
         }
     }
 
-    // 1. Download target subtitle content with strict headers and status check
-    let target_resp = match client
+    // 1. Download target subtitle content (retry without Zoko Referer on 401/403 from external CDNs)
+    let mut target_resp = client
         .get(target_sub_url)
         .header("Referer", "https://zokoanime.video/")
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
         .timeout(Duration::from_secs(8))
         .send()
-        .await
-    {
+        .await;
+    if target_resp.as_ref().is_ok_and(|r| !r.status().is_success()) || target_resp.is_err() {
+        target_resp = client
+            .get(target_sub_url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await;
+    }
+    let target_resp = match target_resp {
         Ok(r) if r.status().is_success() => r,
         _ => return (target_sub_url.to_string(), None),
     };
@@ -918,9 +1330,15 @@ pub async fn ensure_synchronized_subtitle(
     }
 
     // Determine appropriate extension (.ass, .vtt, or .srt)
+    let first_non_empty = final_content
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("");
     let ext = if final_content.contains("[Script Info]") || final_content.contains("Dialogue:") {
         "ass"
-    } else if final_content.contains("WEBVTT") {
+    } else if first_non_empty.starts_with("WEBVTT") {
         "vtt"
     } else {
         "srt"
@@ -1217,5 +1635,78 @@ Dialogue: 0,0:01:37.75,0:01:40.91,NHK Dialogue - Border,,0,0,0,,Outline duplicat
         assert!((speech[0].1 - 127.2).abs() < 0.01);
         assert!((speech[1].0 - 130.0).abs() < 0.01);
         assert!((speech[1].1 - 135.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_pcm_envelope_and_correlator_recovers_shift_under_bgm() {
+        // Synthesize 90s of 8 kHz s16le PCM: continuous steady BGM + strong vocal-band bursts
+        // shifted by -14.5s relative to subtitle cues (so audio occurs 14.5s BEFORE sub -> offset = -14.5s).
+        let sample_rate = 8000usize;
+        let total_secs = 100usize;
+        let win_start = 180.0_f64;
+        let true_offset = -14.5_f64;
+
+        let sub_cues = vec![
+            (198.0, 200.5),
+            (203.0, 206.0),
+            (211.0, 214.2),
+            (219.5, 222.0),
+            (227.0, 230.5),
+            (236.0, 239.0),
+            (245.5, 249.0),
+            (256.0, 259.5),
+            (265.0, 268.0),
+        ];
+
+        let mut pcm = Vec::with_capacity(sample_rate * total_secs * 2);
+        for i in 0..(sample_rate * total_secs) {
+            let t = win_start + (i as f64 / sample_rate as f64);
+            // Constant BGM floor (~2500 amplitude)
+            let bgm = 2500.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin();
+            // Speech bursts at t_audio = t_sub + true_offset
+            let in_speech = sub_cues
+                .iter()
+                .any(|&(s, e)| t >= s + true_offset && t <= e + true_offset);
+            let voice = if in_speech {
+                12000.0 * (2.0 * std::f64::consts::PI * 950.0 * t).sin()
+            } else {
+                0.0
+            };
+            let sample = (bgm + voice).clamp(-32767.0, 32767.0) as i16;
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let env = pcm_s16le_to_vocal_envelope(&pcm);
+        assert!(env.len() >= 900);
+        let res = correlate_envelope_against_cues(&env, win_start, &sub_cues);
+        assert!(res.applied, "Expected confident BGM-cancelled lock, got {:?}", res);
+        assert!(
+            (res.offset_seconds - true_offset).abs() <= 0.25,
+            "Expected ~{}, got {}",
+            true_offset,
+            res.offset_seconds
+        );
+    }
+
+    #[test]
+    fn test_select_dialogue_windows_skips_op_gap() {
+        let mut cues = vec![
+            (10.0, 14.0),
+            (20.0, 25.0),
+            (35.0, 39.0),
+            (50.0, 54.0),
+        ];
+        // Silent OP gap from 55s to 195s, then dense dialogue 195s..320s
+        for k in 0..16 {
+            let s = 198.0 + k as f64 * 6.5;
+            cues.push((s, s + 3.0));
+        }
+        let wins = select_dialogue_windows(&cues, 140.0);
+        assert!(!wins.is_empty());
+        assert!(
+            wins[0].0 >= 180.0,
+            "Window should skip 140s OP gap and land in post-OP dialogue, got {:?}",
+            wins[0]
+        );
     }
 }

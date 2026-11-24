@@ -684,26 +684,53 @@ async fn main() -> anyhow::Result<()> {
                         );
                         continue;
                     };
-                    let Some(sub_path) = state.active_sub_path.clone().filter(|p| !p.starts_with("http")) else {
+                    let Some(sub_path) = state.active_sub_path.clone() else {
                         services::ipc::send_sub_sync_result(
                             false,
                             None,
                             0,
-                            "Voice-Sync requires an active cached subtitle track",
+                            "Voice-Sync requires an active subtitle track",
                         );
                         continue;
                     };
                     let anime_id = state.selected_anime.as_ref().map(|a| a.id).unwrap_or(0);
+                    let episode_num = state
+                        .last_play_options
+                        .as_ref()
+                        .map(|o| o.episode)
+                        .unwrap_or(1);
+                    let sub_code = state
+                        .last_play_options
+                        .as_ref()
+                        .and_then(|o| o.sub_lang.clone())
+                        .unwrap_or_else(|| "sub".to_string());
                     let provider_id = state.active_provider_id.clone().unwrap_or_default();
                     let referer = state.active_stream_referer.clone();
+                    let force_ipv4 = cfg.force_ipv4;
                     state.sub_sync_in_progress = true;
                     state.show_toast("◈ Running Speech-VAD subtitle voice alignment...", unix_now());
                     let tx_sync = tx.clone();
                     tokio::spawn(async move {
+                        let local_sub = if sub_path.starts_with("http://") || sub_path.starts_with("https://") {
+                            let client = api::subtitles::build_http_client(force_ipv4, 8);
+                            let (cached_path, _) = services::subsync::ensure_synchronized_subtitle(
+                                &client,
+                                &sub_path,
+                                None,
+                                None,
+                                anime_id,
+                                episode_num,
+                                &sub_code,
+                            )
+                            .await;
+                            cached_path
+                        } else {
+                            sub_path
+                        };
                         let result = services::subsync::auto_sync_subtitle_to_audio(
                             &stream_url,
                             referer.as_deref(),
-                            &sub_path,
+                            &local_sub,
                             time_pos_secs,
                         )
                         .await;
@@ -720,7 +747,7 @@ async fn main() -> anyhow::Result<()> {
                     state.sub_sync_in_progress = false;
                     if result.applied {
                         let delay_ms = (result.offset_seconds * 1000.0).round() as i32;
-                        let clamped_ms = delay_ms.clamp(-120_000, 120_000);
+                        let clamped_ms = delay_ms.clamp(-150_000, 150_000);
                         let delay_secs = clamped_ms as f64 / 1000.0;
                         if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
                             state.subtitle_delay_ms = clamped_ms;
@@ -1051,6 +1078,37 @@ async fn main() -> anyhow::Result<()> {
                     });
                     #[cfg(unix)]
                     let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
+
+                    // Self-healing retry once on verified backup mirror (e.g. AnimeHeaven Mirror 2/3)
+                    // if a direct HTTP MP4 failed immediately on startup.
+                    if !exited_ok && !user_quit && !natural_eof && elapsed_secs < 12 {
+                        if let Some(mut retry_opts) = state.last_play_options.clone() {
+                            if let Some(ref cur_url) = retry_opts.stream_url {
+                                if let Some(cur_idx) = state
+                                    .playback_qualities
+                                    .iter()
+                                    .position(|q| q.url == *cur_url)
+                                {
+                                    if let Some(next_mirror) = state
+                                        .playback_qualities
+                                        .get(cur_idx + 1)
+                                        .filter(|q| q.label.contains("Mirror") && !q.url.is_empty())
+                                    {
+                                        retry_opts.stream_url = Some(next_mirror.url.clone());
+                                        retry_opts.quality = next_mirror.label.clone();
+                                        state.show_toast(
+                                            format!("◈ Switching to backup CDN ({})...", next_mirror.label),
+                                            unix_now(),
+                                        );
+                                        let retry_title = retry_opts.title.clone();
+                                        let retry_ep = retry_opts.episode;
+                                        start_playback(&mut state, retry_opts, retry_title, retry_ep, &tx, &pool, &cfg).await;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // Self-healing retry once if a prefetched CDN URL failed quickly on launch
                     if !exited_ok && !user_quit && elapsed_secs < 20 {
@@ -9936,6 +9994,41 @@ async fn launch_remote_stream_switch(
 }
 
 /// Spawn player wrapper with IPC socket, auto-scrobble on 85% completion, auto-skip intro/outro, and exact timestamp resume.
+fn resolve_sync_stream_url(
+    opts: &api::player::PlayOptions,
+    q_pool: &[api::subtitles::QualityOption],
+    proxy: Option<&services::hls_proxy::HlsProxyServer>,
+) -> Option<String> {
+    let referer = opts.referer.as_deref().unwrap_or("https://zokoanime.video/");
+    let wrap_if_needed = |raw: &str, force_proxy: bool| -> String {
+        let is_hls = raw.contains(".m3u8") || raw.contains("/m3u8");
+        if is_hls && !raw.starts_with("http://127.0.0.1:") {
+            if let Some(p) = proxy {
+                if force_proxy || opts.stream_url.as_deref().is_some_and(|s| s.starts_with("http://127.0.0.1:")) {
+                    return p.wrap_playlist_url(raw, referer);
+                }
+            }
+        }
+        raw.to_string()
+    };
+
+    if let Some(first_audio) = opts.audio_urls.first().filter(|u| !u.trim().is_empty()) {
+        return Some(wrap_if_needed(first_audio, false));
+    }
+
+    if let Some(lowest_q) = q_pool
+        .iter()
+        .filter(|q| !q.url.trim().is_empty() && !q.label.contains("Mirror"))
+        .min_by_key(|q| q.height.unwrap_or(1080))
+    {
+        if lowest_q.url.contains(".m3u8") || lowest_q.url.contains("/m3u8") {
+            return Some(wrap_if_needed(&lowest_q.url, lowest_q.needs_hls_proxy));
+        }
+    }
+
+    opts.stream_url.clone()
+}
+
 async fn start_playback(
     state:   &mut AppState,
     opts:    api::player::PlayOptions,
@@ -10342,7 +10435,11 @@ async fn start_playback(
     } else {
         opts.sub_url.clone()
     };
-    state.active_stream_url_for_sync = opts.stream_url.clone();
+    state.active_stream_url_for_sync = resolve_sync_stream_url(
+        &opts,
+        &state.playback_qualities,
+        state.hls_proxy.as_deref(),
+    );
     state.active_stream_referer = opts.referer.clone();
     state.active_sub_path = sub_path_for_ctx.clone();
     state.sub_sync_in_progress = false;
@@ -10356,12 +10453,12 @@ async fn start_playback(
             .as_deref()
             .is_some_and(|id| id == "animegg" || id == "animeheaven")
     {
-        if let (Some(ref s_url), Some(ref sub_p)) = (&opts.stream_url, &sub_path_for_ctx) {
+        if let (Some(ref s_url), Some(ref sub_p)) = (&state.active_stream_url_for_sync, &sub_path_for_ctx) {
             if !sub_p.starts_with("http://") && !sub_p.starts_with("https://") {
                 let s_url_bg = s_url.clone();
                 let ref_bg = opts.referer.clone();
                 let sub_p_bg = sub_p.clone();
-                let anchor_pos = opts.start_pos.unwrap_or(140.0);
+                let anchor_pos = opts.start_pos.filter(|&p| p >= 185.0).unwrap_or(0.0);
                 let prov_id_bg = state.active_provider_id.clone().unwrap_or_default();
                 let tx_bg = tx.clone();
                 tokio::spawn(async move {

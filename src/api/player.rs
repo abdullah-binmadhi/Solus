@@ -1098,9 +1098,9 @@ local function snap_sub_to_voice()
         return
     end
     sync_in_progress = true
-    sync_status_msg = "Sampling voice track & correlating (-90s..+90s)..."
+    sync_status_msg = "Analyzing voice track & correlating (-150s..+150s)..."
     sync_status_col = "&HF8BD38&"
-    mp.osd_message("◈ Analyzing speech audio (-90s..+90s)... please wait", 3.5)
+    mp.osd_message("◈ Analyzing speech audio (-150s..+150s)... please wait", 3.5)
     mp.commandv("script-message", "solus-ipc-auto-sync-sub", string.format("%.2f", cur_t))
     render_player_buttons()
 end
@@ -1280,6 +1280,22 @@ pub fn mpv_network_args(mode: NetworkMode, force_ipv4: bool, is_local_file: bool
         .collect()
 }
 
+/// Hardening flags for direct progressive HTTP MP4 origins (e.g., AnimeHeaven / AnimeGG)
+/// that emit corrupt H.264 NAL warnings or stall under pipelined range requests (`http_multiple=1`).
+pub fn mpv_direct_mp4_resilience_kv_args(direct_url: &str) -> Vec<String> {
+    let lower = direct_url.to_ascii_lowercase();
+    let is_http = lower.starts_with("http://") || lower.starts_with("https://");
+    let is_hls = lower.contains(".m3u8") || lower.contains("/m3u8");
+    if !is_http || is_hls {
+        return Vec::new();
+    }
+    vec![
+        "demuxer-lavf-o=http_persistent=1,allowed_extensions=ALL,allowed_segment_extensions=ALL".to_string(),
+        "demuxer-lavf-hacks=yes".to_string(),
+        "vd-lavc-dr=no".to_string(),
+    ]
+}
+
 /// Single source of truth for all `libmpv` players (`mpv`, `mpv.net`, `Celluloid`, `Auto-Best`).
 /// Returns `(global_kv_flags, item_kv_flags)`.
 pub fn shared_mpv_kv_flags(
@@ -1319,6 +1335,7 @@ pub fn shared_mpv_kv_flags(
     }
 
     global_kv.extend(mpv_network_kv_args(opts.network_mode, opts.force_ipv4, is_local_file));
+    global_kv.extend(mpv_direct_mp4_resilience_kv_args(direct_url));
 
     let has_shaders = opts.glsl_shaders.as_deref().is_some_and(|s| !s.is_empty());
     global_kv.extend(mpv_mastering_kv_flags(
