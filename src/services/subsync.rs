@@ -696,7 +696,6 @@ fn vocal_env_cache() -> &'static std::sync::Mutex<std::collections::HashMap<(Str
 /// using `ln(1 + rms)` minus a centered 4.0s running local mean to cancel steady BGM/OPs.
 pub fn pcm_s16le_to_vocal_envelope(pcm_bytes: &[u8]) -> Vec<f32> {
     const SAMPLES_PER_FRAME: usize = 800; // 100ms at 8000 Hz
-    const LOCAL_RADIUS: usize = 20; // ±2.0s => 4.0s window
     let sample_count = pcm_bytes.len() / 2;
     let frame_count = sample_count / SAMPLES_PER_FRAME;
     if frame_count < 20 {
@@ -1434,7 +1433,388 @@ pub fn correlate_audio_envelopes(
     Some(((refined_off * 100.0).round() / 100.0, z, conf))
 }
 
-/// Automated 4-window dialogue-clustered `ffmpeg` PCM extraction + structural cadence gate for `SNAP TO VOICE`.
+/// Run pure-Rust `earshot` WebRTC neural/Mel VAD over 16 kHz mono `s16le` PCM (`256`-sample / `16ms` frames)
+/// and return `(speech_spans, env_10hz)` simultaneously from one decoded stream.
+pub fn pcm_s16le_16k_to_earshot_spans_and_env(
+    pcm_bytes: &[u8],
+    win_start_secs: f64,
+) -> (Vec<(f64, f64)>, Vec<f32>) {
+    const VAD_FRAME_SAMPLES: usize = 256; // 16ms at 16 kHz
+    const ENV_SAMPLES_PER_BIN: usize = 1600; // 100ms (10 Hz) at 16 kHz
+    let sample_count = pcm_bytes.len() / 2;
+    if sample_count < VAD_FRAME_SAMPLES * 4 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut samples = Vec::with_capacity(sample_count);
+    for i in 0..sample_count {
+        samples.push(i16::from_le_bytes([pcm_bytes[i * 2], pcm_bytes[i * 2 + 1]]));
+    }
+
+    let mut vad = earshot::Detector::default_boxed();
+    let num_vad_frames = samples.len() / VAD_FRAME_SAMPLES;
+    let mut probs = Vec::with_capacity(num_vad_frames);
+    for f in 0..num_vad_frames {
+        let base = f * VAD_FRAME_SAMPLES;
+        let p = vad.predict_i16(&samples[base..base + VAD_FRAME_SAMPLES]);
+        probs.push(p);
+    }
+
+    // Hysteresis speech detection + bridge pauses <= 240ms (15 frames)
+    let mut raw_active = vec![false; probs.len()];
+    let mut in_speech = false;
+    for (idx, &p) in probs.iter().enumerate() {
+        if !in_speech && p >= 0.55 {
+            in_speech = true;
+        } else if in_speech && p < 0.36 {
+            in_speech = false;
+        }
+        raw_active[idx] = in_speech;
+    }
+
+    let mut idx = 0usize;
+    while idx < raw_active.len() {
+        if !raw_active[idx] {
+            let gap_start = idx;
+            while idx < raw_active.len() && !raw_active[idx] {
+                idx += 1;
+            }
+            let gap_len = idx - gap_start;
+            if gap_start > 0 && idx < raw_active.len() && gap_len <= 15 {
+                for slot in &mut raw_active[gap_start..idx] {
+                    *slot = true;
+                }
+            }
+        } else {
+            idx += 1;
+        }
+    }
+
+    let frame_dur = VAD_FRAME_SAMPLES as f64 / 16000.0;
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    while i < raw_active.len() {
+        if raw_active[i] {
+            let s_idx = i;
+            while i < raw_active.len() && raw_active[i] {
+                i += 1;
+            }
+            let s_t = win_start_secs + s_idx as f64 * frame_dur;
+            let e_t = win_start_secs + i as f64 * frame_dur;
+            if e_t - s_t >= 0.18 {
+                spans.push((s_t, e_t));
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    // Build 10 Hz speech-gated vocal modulation envelope for Structural Fit verification
+    let env_frames = samples.len() / ENV_SAMPLES_PER_BIN;
+    let mut env = Vec::with_capacity(env_frames);
+    if env_frames >= 10 {
+        let mut raw_log = Vec::with_capacity(env_frames);
+        for ef in 0..env_frames {
+            let b0 = ef * ENV_SAMPLES_PER_BIN;
+            let mut sum_sq = 0.0_f64;
+            for &s in &samples[b0..b0 + ENV_SAMPLES_PER_BIN] {
+                let sf = s as f64;
+                sum_sq += sf * sf;
+            }
+            let rms = (sum_sq / ENV_SAMPLES_PER_BIN as f64).sqrt();
+            // Gate loudness gently by local earshot speech probability
+            let vad_idx0 = (ef * ENV_SAMPLES_PER_BIN / VAD_FRAME_SAMPLES).min(probs.len().saturating_sub(1));
+            let vad_idx1 = (((ef + 1) * ENV_SAMPLES_PER_BIN) / VAD_FRAME_SAMPLES).min(probs.len());
+            let max_p = if vad_idx1 > vad_idx0 {
+                probs[vad_idx0..vad_idx1].iter().copied().fold(0.0_f32, f32::max)
+            } else {
+                0.0
+            };
+            let vad_w = if max_p >= 0.45 { 1.0 } else { 0.18 };
+            raw_log.push(((1.0 + rms).ln() as f32) * vad_w);
+        }
+        let mut sorted = raw_log.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let floor = sorted[sorted.len() / 4];
+        for v in &raw_log {
+            env.push((*v - floor).max(0.0));
+        }
+    }
+
+    (spans, env)
+}
+
+/// Extract 16 kHz mono `s16le` audio window via `ffmpeg` and run `earshot` WebRTC VAD.
+pub async fn extract_webrtc_vad_ffmpeg_for_lang(
+    stream_url: &str,
+    referer: Option<&str>,
+    start_secs: f64,
+    duration_secs: f64,
+    target_lang: Option<&str>,
+) -> Result<(Vec<(f64, f64)>, Vec<f32>), String> {
+    let ffmpeg_cmd = if std::path::Path::new("/opt/homebrew/bin/ffmpeg").exists() {
+        "/opt/homebrew/bin/ffmpeg"
+    } else if std::path::Path::new("/usr/local/bin/ffmpeg").exists() {
+        "/usr/local/bin/ffmpeg"
+    } else {
+        "ffmpeg"
+    };
+
+    let is_http = stream_url.starts_with("http://") || stream_url.starts_with("https://");
+    let is_local_proxy = stream_url.starts_with("http://127.0.0.1:");
+    let is_hls = stream_url.contains(".m3u8") || stream_url.contains("/m3u8");
+    let timeout_secs = if !is_http || is_local_proxy { 12 } else { 24 };
+    let headers_val = referer
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| {
+            format!(
+                "Referer: {r}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
+            )
+        });
+
+    let mut map_attempts: Vec<Option<String>> = Vec::new();
+    if let Some(lang) = target_lang.filter(|l| !l.trim().is_empty()) {
+        map_attempts.push(Some(format!("0:a:m:language:{lang}")));
+    }
+    map_attempts.push(None);
+
+    let mut last_err = String::from("ffmpeg WebRTC-VAD audio extraction failed");
+    'outer: for map_spec in &map_attempts {
+        for use_picky_flag in [true, false] {
+            if !is_hls && use_picky_flag {
+                continue;
+            }
+            let mut cmd = tokio::process::Command::new(ffmpeg_cmd);
+            cmd.arg("-hide_banner").arg("-nostats").arg("-loglevel").arg("error");
+            if is_http {
+                cmd.args([
+                    "-reconnect", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "2",
+                    "-rw_timeout", "10000000",
+                    "-analyzeduration", "2000000",
+                    "-probesize", "1000000",
+                ]);
+                if !is_local_proxy {
+                    if let Some(ref hdrs) = headers_val {
+                        cmd.args(["-headers", hdrs]);
+                    }
+                }
+                if is_hls {
+                    if use_picky_flag {
+                        cmd.args(["-extension_picky", "0"]);
+                    }
+                    cmd.args([
+                        "-allowed_extensions", "ALL",
+                        "-allowed_segment_extensions", "ALL",
+                    ]);
+                }
+            }
+            cmd.args([
+                "-ss", &format!("{:.1}", start_secs.max(0.0)),
+                "-t", &format!("{:.1}", duration_secs.clamp(30.0, 150.0)),
+                "-i", stream_url,
+            ]);
+            if let Some(ref m) = map_spec {
+                cmd.args(["-map", m]);
+            }
+            cmd.args([
+                "-vn", "-sn", "-dn",
+                "-af", "highpass=f=80,lowpass=f=4500,aresample=16000",
+                "-ac", "1",
+                "-f", "s16le",
+                "pipe:1",
+            ]);
+
+            let out = match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
+                Ok(Ok(o)) => o,
+                Ok(Err(e)) => {
+                    last_err = format!("ffmpeg launch failed: {e}");
+                    break 'outer;
+                }
+                Err(_) => {
+                    last_err = format!("Audio VAD analysis timed out after {timeout_secs}s");
+                    break;
+                }
+            };
+
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if use_picky_flag && stderr.contains("Unrecognized option 'extension_picky'") {
+                continue;
+            }
+            if map_spec.is_some() && !out.status.success() {
+                break;
+            }
+            let (spans, env) = pcm_s16le_16k_to_earshot_spans_and_env(&out.stdout, start_secs.max(0.0));
+            if !env.is_empty() {
+                return Ok((spans, env));
+            }
+            if !stderr.trim().is_empty() {
+                last_err = stderr.lines().last().unwrap_or("No audio stream found").trim().to_string();
+            } else if out.stdout.is_empty() {
+                last_err = "No audio stream decoded from media source".to_string();
+            }
+            break;
+        }
+    }
+
+    Err(last_err)
+}
+
+fn to_alass_spans(intervals: &[(f64, f64)]) -> Vec<alass_core::TimeSpan> {
+    intervals
+        .iter()
+        .filter_map(|&(s, e)| {
+            if !s.is_finite() || !e.is_finite() || e <= s {
+                return None;
+            }
+            let s_pts = (s * 100.0).round() as i64;
+            let e_pts = ((e * 100.0).round() as i64).max(s_pts + 5);
+            Some(alass_core::TimeSpan::new_safe(
+                alass_core::TimePoint::from(s_pts),
+                alass_core::TimePoint::from(e_pts),
+            ))
+        })
+        .collect()
+}
+
+/// Align subtitle intervals globally against reference spans (`speech` or `ref_sub`) using `alass-core` DP (`no-split`).
+pub fn align_cues_with_alass_nosplit(
+    reference_spans: &[(f64, f64)],
+    sub_cues: &[(f64, f64)],
+) -> (f64, f64) {
+    let ref_sp = to_alass_spans(reference_spans);
+    let sub_sp = to_alass_spans(sub_cues);
+    if ref_sp.is_empty() || sub_sp.is_empty() {
+        return (0.0, 0.0);
+    }
+    let (delta, score) = alass_core::align_nosplit(
+        &ref_sp,
+        &sub_sp,
+        alass_core::standard_scoring,
+        alass_core::NoProgressHandler,
+    );
+    ((delta.as_f64() / 100.0 * 100.0).round() / 100.0, score)
+}
+
+/// Align subtitle intervals piecewise (handling commercial/OP splits) via `alass-core` DP (`align`).
+pub fn align_cues_with_alass_split(
+    reference_spans: &[(f64, f64)],
+    sub_cues: &[(f64, f64)],
+    split_penalty: f64,
+) -> (Vec<f64>, f64) {
+    let ref_sp = to_alass_spans(reference_spans);
+    let sub_sp = to_alass_spans(sub_cues);
+    if ref_sp.is_empty() || sub_sp.is_empty() {
+        return (vec![0.0; sub_cues.len()], 0.0);
+    }
+    let (deltas, score) = alass_core::align(
+        &ref_sp,
+        &sub_sp,
+        split_penalty,
+        Some(3.0),
+        alass_core::standard_scoring,
+        alass_core::NoProgressHandler,
+    );
+    (
+        deltas
+            .into_iter()
+            .map(|d| (d.as_f64() / 100.0 * 100.0).round() / 100.0)
+            .collect(),
+        score,
+    )
+}
+
+/// Apply per-cue `(orig_start, delta_secs)` shifts across SRT, VTT, or ASS files cleanly.
+pub fn apply_piecewise_subtitle_shifts(content: &str, cue_deltas: &[(f64, f64)]) -> String {
+    if cue_deltas.is_empty() {
+        return content.to_string();
+    }
+    let lookup_delta = |start_s: f64| -> f64 {
+        cue_deltas
+            .iter()
+            .min_by(|a, b| (a.0 - start_s).abs().total_cmp(&(b.0 - start_s).abs()))
+            .map(|x| x.1)
+            .unwrap_or(0.0)
+    };
+    let mut out = String::with_capacity(content.len());
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(arrow_idx) = line.find(" --> ") {
+            let start_str = line[..arrow_idx].trim();
+            let after_arrow = &line[arrow_idx + 5..];
+            let mut parts = after_arrow.split_whitespace();
+            if let Some(end_str) = parts.next() {
+                let remainder = &after_arrow[end_str.len()..];
+                if let (Some(s), Some(e)) = (parse_timestamp(start_str), parse_timestamp(end_str)) {
+                    let sep = if start_str.contains(',') || end_str.contains(',') { ',' } else { '.' };
+                    let d = lookup_delta(s);
+                    let ns = (s + d).max(0.0);
+                    let ne = (e + d).max(ns + 0.05);
+                    out.push_str(&format!(
+                        "{} --> {}{}\n",
+                        format_timestamp(ns, sep),
+                        format_timestamp(ne, sep),
+                        remainder
+                    ));
+                    continue;
+                }
+            }
+        } else if trimmed.starts_with("Dialogue:") {
+            let parts: Vec<&str> = line.splitn(10, ',').collect();
+            if parts.len() >= 3 {
+                let start_str = parts[1].trim();
+                let end_str = parts[2].trim();
+                if let (Some(s), Some(e)) = (parse_timestamp(start_str), parse_timestamp(end_str)) {
+                    let d = lookup_delta(s);
+                    let ns = (s + d).max(0.0);
+                    let ne = (e + d).max(ns + 0.05);
+                    out.push_str(&format!(
+                        "{},{},{},{}\n",
+                        parts[0],
+                        format_ass_timestamp(ns),
+                        format_ass_timestamp(ne),
+                        parts[3..].join(",")
+                    ));
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn measure_span_overlap_ratio(speech_spans: &[(f64, f64)], cues: &[(f64, f64)], delta: f64, win_bounds: &[(f64, f64)]) -> f64 {
+    let mut probed_cues = 0usize;
+    let mut hit_cues = 0usize;
+    for &(cs, ce) in cues {
+        let s = cs + delta;
+        let e = ce + delta;
+        let in_win = win_bounds.iter().any(|&(ws, we)| s >= ws && e <= we);
+        if !in_win {
+            continue;
+        }
+        probed_cues += 1;
+        let dur = (e - s).max(0.1);
+        let mut ov = 0.0_f64;
+        for &(vs, ve) in speech_spans {
+            let o = (e.min(ve) - s.max(vs)).max(0.0);
+            ov += o;
+        }
+        if ov / dur >= 0.22 {
+            hit_cues += 1;
+        }
+    }
+    if probed_cues == 0 {
+        0.0
+    } else {
+        hit_cues as f64 / probed_cues as f64
+    }
+}
+
+/// Automated `Alass-Core` DP + `earshot` WebRTC VAD Synchronizer v5 (global no-split + piecewise split fallback).
 pub async fn auto_sync_subtitle_to_audio(
     stream_url: &str,
     referer: Option<&str>,
@@ -1469,200 +1849,126 @@ pub async fn auto_sync_subtitle_to_audio_for_lang(
     }
 
     let windows = select_dialogue_windows(&sub_cues, cur_pos_secs);
-    let env_futs = windows.iter().map(|&(w_start, w_dur)| {
-        extract_vocal_envelope_ffmpeg_for_lang(stream_url, referer, w_start, w_dur, target_lang)
+    let vad_futs = windows.iter().map(|&(w_start, w_dur)| {
+        extract_webrtc_vad_ffmpeg_for_lang(stream_url, referer, w_start, w_dur, target_lang)
     });
-    let env_results = futures_util::future::join_all(env_futs).await;
+    let vad_results = futures_util::future::join_all(vad_futs).await;
 
-    struct ParsedWin {
-        win_start: f64,
-        env: Vec<f32>,
-        res: SpeechVadSyncResult,
-        curve: Vec<(f64, f64)>,
-    }
+    let mut all_vad_spans: Vec<(f64, f64)> = Vec::new();
+    let mut win_envs: Vec<(f64, Vec<f32>)> = Vec::new();
+    let mut win_bounds: Vec<(f64, f64)> = Vec::new();
+    let mut last_err = String::from("WebRTC-VAD audio extraction failed");
 
-    let mut parsed_windows: Vec<ParsedWin> = Vec::new();
-    let mut last_err = String::from("Audio envelope extraction failed");
-
-    for (&(w_start, _), env_res) in windows.iter().zip(env_results.into_iter()) {
-        match env_res {
-            Ok(env) => {
-                let (res, curve) = correlate_envelope_with_curve(&env, w_start, &sub_cues);
-                parsed_windows.push(ParsedWin {
-                    win_start: w_start,
-                    env,
-                    res,
-                    curve,
-                });
+    for (&(w_start, w_dur), res) in windows.iter().zip(vad_results.into_iter()) {
+        match res {
+            Ok((spans, env)) => {
+                all_vad_spans.extend(spans);
+                win_bounds.push((w_start, w_start + w_dur));
+                win_envs.push((w_start, env));
             }
-            Err(err) => {
-                last_err = err;
+            Err(e) => {
+                last_err = e;
             }
         }
     }
 
-    if parsed_windows.is_empty() {
+    if win_envs.is_empty() || all_vad_spans.is_empty() {
         return SpeechVadSyncResult {
             reason: last_err,
             ..Default::default()
         };
     }
+    all_vad_spans.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-    // Strict Multi-Window Consensus (NO <= 25s disagreement bypass!)
-    if parsed_windows.len() >= 2 {
-        let base_len = parsed_windows[0].curve.len();
-        if base_len > 100 && parsed_windows.iter().all(|w| w.curve.len() == base_len) {
-            let mut joint: Vec<(f64, f64)> = Vec::with_capacity(base_len);
-            let w_cnt = parsed_windows.len() as f64;
-            for bi in 0..base_len {
-                let off = parsed_windows[0].curve[bi].0;
-                let avg_r = parsed_windows.iter().map(|w| w.curve[bi].1).sum::<f64>() / w_cnt;
-                joint.push((off, avg_r));
-            }
-            let j_mean = joint.iter().map(|&(_, s)| s).sum::<f64>() / joint.len() as f64;
-            let j_std = (joint
+    let env_refs: Vec<(f64, &[f32])> = win_envs
+        .iter()
+        .map(|(ws, e)| (*ws, e.as_slice()))
+        .collect();
+
+    // 1. Global Alass No-Split Dynamic Programming over all extracted WebRTC VAD spans
+    let (delta_nosplit, _alass_score) = align_cues_with_alass_nosplit(&all_vad_spans, &sub_cues);
+    if delta_nosplit.abs() <= 150.0 {
+        let fit = evaluate_structural_fit(&env_refs, &sub_cues, delta_nosplit);
+        let vad_hit = measure_span_overlap_ratio(&all_vad_spans, &sub_cues, delta_nosplit, &win_bounds);
+        if fit.passes() && vad_hit >= 0.42 {
+            let c_term = ((fit.inside_vs_gap_contrast - 1.45) / 2.2).clamp(0.0, 1.0);
+            let o_term = ((fit.onset_hit_rate - 0.45) / 0.45).clamp(0.0, 1.0);
+            let v_term = ((vad_hit - 0.42) / 0.48).clamp(0.0, 1.0);
+            let conf = (62.0 + 37.0 * (0.35 * c_term + 0.30 * o_term + 0.35 * v_term))
+                .round()
+                .clamp(62.0, 99.0) as u8;
+            return SpeechVadSyncResult {
+                offset_seconds: delta_nosplit,
+                scale_factor: 1.0,
+                confidence_pct: conf,
+                z_score: 4.5,
+                prominence: 1.8,
+                applied: true,
+                reason: format!(
+                    "Alass+WebRTC VAD Locked ({conf}%, {:.0}% cues matched, {:.1}x contrast)",
+                    vad_hit * 100.0,
+                    fit.inside_vs_gap_contrast
+                ),
+            };
+        }
+    }
+
+    // 2. Piecewise Split Alignment via Alass DP (fixes commercial breaks / OP-length cut differences)
+    let (cue_deltas, _) = align_cues_with_alass_split(&all_vad_spans, &sub_cues, 8.0);
+    if cue_deltas.len() == sub_cues.len() && cue_deltas.iter().all(|d| d.abs() <= 150.0) {
+        let shifted_cues: Vec<(f64, f64)> = sub_cues
+            .iter()
+            .zip(cue_deltas.iter())
+            .map(|(&(s, e), &d)| ((s + d).max(0.0), (e + d).max((s + d).max(0.0) + 0.05)))
+            .collect();
+        let fit_split = evaluate_structural_fit(&env_refs, &shifted_cues, 0.0);
+        let vad_hit_split = measure_span_overlap_ratio(&all_vad_spans, &shifted_cues, 0.0, &win_bounds);
+        if fit_split.passes() && vad_hit_split >= 0.48 {
+            let pairs: Vec<(f64, f64)> = sub_cues
                 .iter()
-                .map(|&(_, s)| {
-                    let d = s - j_mean;
-                    d * d
-                })
-                .sum::<f64>()
-                / joint.len() as f64)
-                .sqrt()
-                .max(1e-6);
-
-            if let Some(&(best_off, best_j)) = joint.iter().max_by(|a, b| a.1.total_cmp(&b.1)) {
-                let j_z = (best_j - j_mean) / j_std;
-                let best_bin_idx = ((best_off / 0.20).round() as isize + 750)
-                    .clamp(0, base_len as isize - 1) as usize;
-                let agreeing_wins: Vec<&ParsedWin> = parsed_windows
-                    .iter()
-                    .filter(|w| {
-                        let r_at = w.curve[best_bin_idx].1;
-                        let max_w = w.curve.iter().map(|&(_, r)| r).fold(0.0_f64, f64::max);
-                        (w.res.offset_seconds - best_off).abs() <= 0.85
-                            || (r_at >= 0.18 && max_w > 0.10 && r_at >= max_w * 0.72)
-                    })
-                    .collect();
-
-                if agreeing_wins.len() >= 2 && j_z >= 3.2 && best_j >= 0.20 {
-                    let env_refs: Vec<(f64, &[f32])> = agreeing_wins
-                        .iter()
-                        .map(|w| (w.win_start, w.env.as_slice()))
-                        .collect();
-                    let fit = evaluate_structural_fit(&env_refs, &sub_cues, best_off);
-                    if fit.passes() {
-                        let r_term = ((best_j - 0.18) / 0.42).clamp(0.0, 1.0);
-                        let c_term = ((fit.inside_vs_gap_contrast - 1.45) / 2.2).clamp(0.0, 1.0);
-                        let o_term = ((fit.onset_hit_rate - 0.45) / 0.45).clamp(0.0, 1.0);
-                        let w_term = (agreeing_wins.len() as f64 / parsed_windows.len() as f64).clamp(0.0, 1.0);
-                        let conf_f = 55.0 + 44.0 * (0.35 * r_term + 0.25 * c_term + 0.25 * o_term + 0.15 * w_term);
-                        let conf = conf_f.round().clamp(55.0, 99.0) as u8;
-                        return SpeechVadSyncResult {
-                            offset_seconds: (best_off * 100.0).round() / 100.0,
-                            scale_factor: 1.0,
-                            confidence_pct: conf,
-                            z_score: j_z,
-                            prominence: 1.6,
-                            applied: true,
-                            reason: format!(
-                                "Multi-Scene Voice Lock ({conf}%, {}/{} scenes, contrast {:.1}x)",
-                                agreeing_wins.len(),
-                                parsed_windows.len(),
-                                fit.inside_vs_gap_contrast
-                            ),
-                        };
-                    }
-                    return SpeechVadSyncResult {
-                        offset_seconds: 0.0,
-                        scale_factor: 1.0,
-                        confidence_pct: 38,
-                        z_score: j_z,
-                        prominence: 1.0,
-                        applied: false,
-                        reason: format!(
-                            "Rejected accidental overlap (contrast {:.2}x, onset {:.0}%) — subtitles may not match cut",
-                            fit.inside_vs_gap_contrast,
-                            fit.onset_hit_rate * 100.0
-                        ),
-                    };
+                .zip(cue_deltas.iter())
+                .map(|(&(s, _), &d)| (s, d))
+                .collect();
+            let rewritten = apply_piecewise_subtitle_shifts(&sub_text, &pairs);
+            if is_valid_subtitle_content(&rewritten) && std::fs::write(sub_path, &rewritten).is_ok() {
+                let mut distinct_bins = std::collections::HashSet::new();
+                for &d in &cue_deltas {
+                    distinct_bins.insert((d * 2.0).round() as i64);
                 }
-
-                // Mid-episode commercial cut detection: lock to the window closest to cur_pos_secs ONLY if clean & strong
-                if let Some(local_w) = parsed_windows
-                    .iter()
-                    .min_by(|a, b| (a.win_start + 37.5 - cur_pos_secs).abs().total_cmp(&(b.win_start + 37.5 - cur_pos_secs).abs()))
-                {
-                    if local_w.res.applied && local_w.res.z_score >= 3.8 {
-                        let fit = evaluate_structural_fit(
-                            &[(local_w.win_start, local_w.env.as_slice())],
-                            &sub_cues,
-                            local_w.res.offset_seconds,
-                        );
-                        if fit.passes() && fit.inside_vs_gap_contrast >= 1.75 {
-                            return SpeechVadSyncResult {
-                                offset_seconds: local_w.res.offset_seconds,
-                                scale_factor: 1.0,
-                                confidence_pct: local_w.res.confidence_pct.clamp(60, 88),
-                                z_score: local_w.res.z_score,
-                                prominence: local_w.res.prominence,
-                                applied: true,
-                                reason: format!(
-                                    "Scene-Locked {:+.2}s (mid-ep cut differs across scenes)",
-                                    local_w.res.offset_seconds
-                                ),
-                            };
-                        }
-                    }
-                }
-
+                let conf = (72.0 + 26.0 * ((vad_hit_split - 0.48) / 0.45).clamp(0.0, 1.0))
+                    .round()
+                    .clamp(72.0, 98.0) as u8;
                 return SpeechVadSyncResult {
                     offset_seconds: 0.0,
                     scale_factor: 1.0,
-                    confidence_pct: 30,
-                    z_score: j_z,
-                    prominence: 1.0,
-                    applied: false,
+                    confidence_pct: conf,
+                    z_score: 4.8,
+                    prominence: 2.0,
+                    applied: true,
                     reason: format!(
-                        "No cross-scene dialogue consensus (0/{} scenes agreed) — adjust manually or check sub file",
-                        parsed_windows.len()
+                        "Piecewise Cut-Synced via Alass+VAD ({} sections, {conf}%)",
+                        distinct_bins.len().min(9)
                     ),
                 };
             }
         }
     }
 
-    // Single-window strict fallback with structural verification gate
-    let best = parsed_windows
-        .into_iter()
-        .max_by(|a, b| a.res.z_score.total_cmp(&b.res.z_score));
-    if let Some(w) = best {
-        let mut r = w.res;
-        if r.applied {
-            let fit = evaluate_structural_fit(&[(w.win_start, w.env.as_slice())], &sub_cues, r.offset_seconds);
-            if !fit.passes() || fit.inside_vs_gap_contrast < 1.65 {
-                r.applied = false;
-                r.confidence_pct = r.confidence_pct.min(42);
-                r.reason = format!(
-                    "Rejected single-scene false overlap (contrast {:.2}x, onset {:.0}%)",
-                    fit.inside_vs_gap_contrast,
-                    fit.onset_hit_rate * 100.0
-                );
-            }
-        }
-        return r;
-    }
-
     SpeechVadSyncResult {
-        reason: last_err,
-        ..Default::default()
+        offset_seconds: 0.0,
+        scale_factor: 1.0,
+        confidence_pct: 32,
+        z_score: 1.5,
+        prominence: 1.0,
+        applied: false,
+        reason: "Subtitles do not match episode dialogue cuts — use +/- or try another sub track".to_string(),
     }
 }
 
-/// Unified Tier-A + Tier-B Synchronizer v4:
-/// 1. Multi-window Audio-to-Audio waveform lock against a Clean sibling provider (±90s, non-OP windows),
-///    composed cleanly with verified Tier-1 provider-native subtitle alignment.
-/// 2. Falls back to 4-Window Cadence + Structural-Fit Tier-B Speech-VAD v4.
+/// Unified Tier-A + Tier-B Synchronizer v5:
+/// 1. Only accepts Tier-A Reference-Audio if BOTH audio-to-audio locks AND `alass-core` aligns
+///    the subtitle cleanly against a verified Clean sibling transcript (`delta_video + delta_sub`).
+/// 2. Otherwise falls straight through to `Alass + earshot WebRTC VAD` against the active stream!
 pub async fn sync_subtitle_with_reference_or_vad(
     client: &reqwest::Client,
     target_stream_url: &str,
@@ -1698,31 +2004,41 @@ pub async fn sync_subtitle_with_reference_or_vad_for_lang(
     ref_sub_url: Option<&str>,
     target_lang: Option<&str>,
 ) -> SpeechVadSyncResult {
-    if let Some(r_url) = ref_stream_url.filter(|u| !u.is_empty() && *u != target_stream_url) {
+    if let (Some(r_url), Some(rs_url)) = (
+        ref_stream_url.filter(|u| !u.is_empty() && *u != target_stream_url),
+        ref_sub_url.filter(|u| !u.is_empty() && *u != target_sub_path),
+    ) {
         let sub_text = std::fs::read_to_string(target_sub_path).unwrap_or_default();
         let cues = parse_subtitle_intervals(&sub_text);
         let max_t = cues.iter().map(|c| c.1).fold(0.0_f64, f64::max);
 
-        // Two widely spaced non-OP windows when episode length permits
         let w1_start = if max_t > 450.0 { 205.0 } else if max_t > 240.0 { 135.0 } else { 20.0 };
         let has_w2 = max_t > 680.0;
         let w2_start = (max_t * 0.60).clamp(440.0, (max_t - 110.0).max(440.0));
 
-        let ((r1, t1), (r2, t2)) = if has_w2 {
-            let (a, b, c, d) = tokio::join!(
-                extract_vocal_envelope_ffmpeg_for_lang(r_url, ref_referer, w1_start, 65.0, target_lang),
-                extract_vocal_envelope_ffmpeg_for_lang(target_stream_url, target_referer, w1_start, 65.0, target_lang),
-                extract_vocal_envelope_ffmpeg_for_lang(r_url, ref_referer, w2_start, 65.0, target_lang),
-                extract_vocal_envelope_ffmpeg_for_lang(target_stream_url, target_referer, w2_start, 65.0, target_lang),
-            );
-            ((a, b), (c, d))
-        } else {
-            let (a, b) = tokio::join!(
-                extract_vocal_envelope_ffmpeg_for_lang(r_url, ref_referer, w1_start, 65.0, target_lang),
-                extract_vocal_envelope_ffmpeg_for_lang(target_stream_url, target_referer, w1_start, 65.0, target_lang),
-            );
-            ((a, b), (Err(String::new()), Err(String::new())))
-        };
+        let ((r1, t1), (r2, t2), ref_sub_resp) = tokio::join!(
+            async {
+                tokio::join!(
+                    extract_vocal_envelope_ffmpeg_for_lang(r_url, ref_referer, w1_start, 65.0, target_lang),
+                    extract_vocal_envelope_ffmpeg_for_lang(target_stream_url, target_referer, w1_start, 65.0, target_lang),
+                )
+            },
+            async {
+                if has_w2 {
+                    tokio::join!(
+                        extract_vocal_envelope_ffmpeg_for_lang(r_url, ref_referer, w2_start, 65.0, target_lang),
+                        extract_vocal_envelope_ffmpeg_for_lang(target_stream_url, target_referer, w2_start, 65.0, target_lang),
+                    )
+                } else {
+                    (Err(String::new()), Err(String::new()))
+                }
+            },
+            client
+                .get(rs_url)
+                .header("Referer", ref_referer.unwrap_or("https://zokoanime.video/"))
+                .timeout(Duration::from_secs(5))
+                .send()
+        );
 
         let c1 = match (r1, t1) {
             (Ok(re), Ok(te)) => correlate_audio_envelopes(&re, &te, 90.0),
@@ -1752,40 +2068,31 @@ pub async fn sync_subtitle_with_reference_or_vad_for_lang(
             _ => None,
         };
 
-        if let Some((delta_video, z, conf)) = waveform_lock {
-            let mut delta_sub_vs_ref = 0.0_f64;
-            if let Some(rs_url) = ref_sub_url.filter(|u| !u.is_empty() && *u != target_sub_path) {
-                if let Ok(resp) = client
-                    .get(rs_url)
-                    .header("Referer", ref_referer.unwrap_or("https://zokoanime.video/"))
-                    .timeout(Duration::from_secs(5))
-                    .send()
-                    .await
-                {
-                    if resp.status().is_success() {
-                        if let Ok(bytes) = resp.bytes().await {
-                            let ref_txt = decode_subtitle_bytes(&bytes);
-                            if is_valid_subtitle_content(&ref_txt) {
-                                let ref_cues = parse_subtitle_intervals(&ref_txt);
-                                let align = calculate_optimal_alignment(&ref_cues, &cues);
-                                if align.applied {
-                                    delta_sub_vs_ref = align.offset_seconds;
-                                }
+        if let (Some((delta_video, z, conf)), Ok(resp)) = (waveform_lock, ref_sub_resp) {
+            if resp.status().is_success() {
+                if let Ok(bytes) = resp.bytes().await {
+                    let ref_txt = decode_subtitle_bytes(&bytes);
+                    if is_valid_subtitle_content(&ref_txt) {
+                        let ref_cues = parse_subtitle_intervals(&ref_txt);
+                        if !ref_cues.is_empty() && !cues.is_empty() {
+                            let (delta_sub_vs_ref, score) = align_cues_with_alass_nosplit(&ref_cues, &cues);
+                            let min_cues = ref_cues.len().min(cues.len()) as f64;
+                            if delta_sub_vs_ref.abs() <= 150.0 && score >= (min_cues * 0.25).max(8.0) {
+                                let total_offset = ((delta_video + delta_sub_vs_ref) * 100.0).round() / 100.0;
+                                return SpeechVadSyncResult {
+                                    offset_seconds: total_offset,
+                                    scale_factor: 1.0,
+                                    confidence_pct: conf,
+                                    z_score: z,
+                                    prominence: 2.0,
+                                    applied: true,
+                                    reason: format!("Reference-Audio + Alass Locked ({conf}% confidence, Z={z:.2})"),
+                                };
                             }
                         }
                     }
                 }
             }
-            let total_offset = ((delta_video + delta_sub_vs_ref) * 100.0).round() / 100.0;
-            return SpeechVadSyncResult {
-                offset_seconds: total_offset,
-                scale_factor: 1.0,
-                confidence_pct: conf,
-                z_score: z,
-                prominence: 2.0,
-                applied: true,
-                reason: format!("Reference-Audio Locked ({conf}% confidence, Z={z:.2})"),
-            };
         }
     }
 
@@ -2495,5 +2802,82 @@ Dialogue: 0,0:01:37.75,0:01:40.91,NHK Dialogue - Border,,0,0,0,,Outline duplicat
         assert!(fit.inside_vs_gap_contrast >= 2.0);
         assert!(fit.onset_hit_rate >= 0.80);
         assert!(fit.duration_corr >= 0.50);
+    }
+
+    #[test]
+    fn test_alass_nosplit_recovers_large_110s_offset() {
+        // Simulates a massive 110s cold-open / bumper discrepancy across 15 cues (impossible with ±45s legacy range)
+        let mut speech = Vec::new();
+        let mut cues = Vec::new();
+        for k in 0..15 {
+            let s = 150.0 + k as f64 * 7.5 + (k % 3) as f64 * 1.1;
+            let d = if k % 2 == 0 { 1.8 } else { 3.6 };
+            speech.push((s + 110.0, s + 110.0 + d));
+            cues.push((s, s + d));
+        }
+        let (delta, score) = align_cues_with_alass_nosplit(&speech, &cues);
+        assert!(
+            (delta - 110.0).abs() <= 0.15,
+            "alass-core must recover +110.0s offset, got {} (score={})",
+            delta,
+            score
+        );
+        assert!(score >= 10.0);
+    }
+
+    #[test]
+    fn test_alass_piecewise_split_handles_mid_episode_commercial_cut() {
+        // Act 1 shifted +2.5s; Act 2 after commercial break shifted -14.0s
+        let mut speech = Vec::new();
+        let mut cues = Vec::new();
+        let mut srt = String::new();
+        for k in 0..16 {
+            let s = 30.0 + k as f64 * 12.0;
+            let d = if k % 2 == 0 { 1.6 } else { 3.2 };
+            let true_shift = if k < 8 { 2.5 } else { -14.0 };
+            speech.push((s + true_shift, s + true_shift + d));
+            cues.push((s, s + d));
+            srt.push_str(&format!(
+                "{}\n{} --> {}\nLine {}\n\n",
+                k + 1,
+                format_timestamp(s, ','),
+                format_timestamp(s + d, ','),
+                k + 1
+            ));
+        }
+
+        let (deltas, _) = align_cues_with_alass_split(&speech, &cues, 8.0);
+        assert_eq!(deltas.len(), 16);
+        assert!((deltas[2] - 2.5).abs() <= 0.25, "Act 1 expected +2.5s, got {}", deltas[2]);
+        assert!((deltas[13] - (-14.0)).abs() <= 0.25, "Act 2 expected -14.0s, got {}", deltas[13]);
+
+        let pairs: Vec<(f64, f64)> = cues.iter().zip(deltas.iter()).map(|(&(s, _), &d)| (s, d)).collect();
+        let rewritten = apply_piecewise_subtitle_shifts(&srt, &pairs);
+        let reparsed = parse_subtitle_intervals(&rewritten);
+        assert_eq!(reparsed.len(), 16);
+        assert!((reparsed[2].0 - speech[2].0).abs() <= 0.25);
+        assert!((reparsed[13].0 - speech[13].0).abs() <= 0.25);
+    }
+
+    #[test]
+    fn test_earshot_detector_runs_on_16k_speech_frames() {
+        // 3 seconds of 16 kHz PCM: silence -> speech-band burst -> silence
+        let total_samples = 48_000;
+        let mut pcm = Vec::with_capacity(total_samples * 2);
+        for i in 0..total_samples {
+            let t = i as f64 / 16_000.0;
+            let amp = if (0.8..2.1).contains(&t) {
+                let env = (2.0 * std::f64::consts::PI * 5.0 * t).sin().abs();
+                9000.0 * env * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+            } else {
+                0.0
+            };
+            let s = amp.clamp(-32767.0, 32767.0) as i16;
+            pcm.extend_from_slice(&s.to_le_bytes());
+        }
+        let (spans, env) = pcm_s16le_16k_to_earshot_spans_and_env(&pcm, 0.0);
+        assert_eq!(env.len(), 30);
+        // Should never produce garbage outside the 3s range
+        assert!(spans.iter().all(|&(s, e)| s >= 0.0 && e <= 3.05));
     }
 }

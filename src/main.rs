@@ -764,8 +764,13 @@ async fn main() -> anyhow::Result<()> {
                 AppMessage::AutoSyncSubCompleted { anime_id, provider_id, result } => {
                     state.sub_sync_in_progress = false;
                     if result.applied {
-                        let delay_ms = (result.offset_seconds * 1000.0).round() as i32;
-                        let clamped_ms = delay_ms.clamp(-150_000, 150_000);
+                        let is_piecewise = result.reason.contains("Piecewise");
+                        let clamped_ms = if is_piecewise {
+                            0
+                        } else {
+                            (result.offset_seconds * 1000.0).round() as i32
+                        }
+                        .clamp(-89_000, 89_000);
                         let delay_secs = clamped_ms as f64 / 1000.0;
                         if state.selected_anime.as_ref().is_some_and(|a| a.id == anime_id) {
                             state.subtitle_delay_ms = clamped_ms;
@@ -775,8 +780,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                         let safe_to_persist = clamped_ms.abs() <= 25_000
                             || result.reason.contains("Reference-Audio")
+                            || result.reason.contains("Alass")
                             || result.z_score >= 3.6;
-                        if safe_to_persist {
+                        if safe_to_persist && clamped_ms.abs() < 90_000 {
                             let pool2 = pool.clone();
                             let pid = state.active_profile_id.clone();
                             let prov_id = provider_id.clone();
@@ -793,6 +799,17 @@ async fn main() -> anyhow::Result<()> {
                                 .await;
                             });
                         }
+                        if is_piecewise {
+                            let sock = services::ipc::get_active_socket_path()
+                                .unwrap_or_else(|| "/tmp/solus-mpv.sock".to_string());
+                            tokio::spawn(async move {
+                                let _ = services::remote::send_mpv_json_command(
+                                    &sock,
+                                    serde_json::json!({ "command": ["sub-reload"] }),
+                                )
+                                .await;
+                            });
+                        }
                         let r_state = state.remote_state.clone();
                         tokio::spawn(async move {
                             {
@@ -801,10 +818,14 @@ async fn main() -> anyhow::Result<()> {
                             }
                             services::remote::broadcast_state(&r_state).await;
                         });
-                        let msg = format!(
-                            "Voice-Locked {:+.2}s ({}% confidence)",
-                            delay_secs, result.confidence_pct
-                        );
+                        let msg = if is_piecewise {
+                            format!("{} ({}% confidence)", result.reason, result.confidence_pct)
+                        } else {
+                            format!(
+                                "Alass-Locked {:+.2}s ({}% confidence)",
+                                delay_secs, result.confidence_pct
+                            )
+                        };
                         services::ipc::send_sub_sync_result(
                             true,
                             Some(delay_secs),
@@ -1048,17 +1069,19 @@ async fn main() -> anyhow::Result<()> {
                         let pid = state.active_profile_id.clone();
                         let prov_id = state.active_provider_id.clone().unwrap_or_default();
                         let now = unix_now();
-                        tokio::spawn(async move {
-                            let _ = db::user::save_anime_provider_subtitle_delay_ms(
-                                &pool2,
-                                &pid,
-                                anime_id,
-                                &prov_id,
-                                delay_ms,
-                                now,
-                            )
-                            .await;
-                        });
+                        if delay_ms.abs() < 90_000 {
+                            tokio::spawn(async move {
+                                let _ = db::user::save_anime_provider_subtitle_delay_ms(
+                                    &pool2,
+                                    &pid,
+                                    anime_id,
+                                    &prov_id,
+                                    delay_ms,
+                                    now,
+                                )
+                                .await;
+                            });
+                        }
                         let delay_secs = state.subtitle_delay_secs();
                         let r_state = state.remote_state.clone();
                         tokio::spawn(async move {
@@ -5255,7 +5278,7 @@ async fn handle_playback_options(
                         )
                         .await
                         {
-                            state.subtitle_delay_ms = saved_prov_delay;
+                            state.subtitle_delay_ms = if saved_prov_delay.abs() >= 90_000 { 0 } else { saved_prov_delay };
                         } else if !chosen_pid.is_empty() {
                             state.subtitle_delay_ms = 0;
                         }

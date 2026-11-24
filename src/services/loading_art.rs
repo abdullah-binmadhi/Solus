@@ -177,15 +177,15 @@ pub fn generate_y2k_loading_screen(
         draw_text(&mut canvas, &clean_title, hud_x, 326, 3, white);
     }
 
-    // Equalizer/bar track (animated live by mpv OSD while buffering)
-    draw_rect_outline(&mut canvas, hud_x, 392, 580, 26, 2, dim_border);
-    draw_text(&mut canvas, "BUFFERING STREAM...", hud_x, 434, 2, muted);
+    // Track outline & active progress bar are rendered together in ASS overlay (`format_loader_ass_overlay`)
+    // so both scale identically across 16:9 and 16:10 displays without drift.
+    draw_text(&mut canvas, "BUFFERING STREAM...", hud_x, 424, 2, muted);
 
-    // YouTube Keybindings Legend
-    fill_rect(&mut canvas, hud_x, 486, 580, 2, dim_border);
-    draw_text(&mut canvas, "PLAYER KEYS:", hud_x, 504, 2, accent);
-    draw_text(&mut canvas, "K/SPACE PLAY   J/L +-10S   P/SHIFT+P PIP", hud_x, 530, 2, white);
-    draw_text(&mut canvas, "I/SHIFT+I HUD  F FULL    C SUBS   0-9 SEEK", hud_x, 554, 2, muted);
+    // YouTube Keybindings Legend (positioned safely above bottom OSC zone)
+    fill_rect(&mut canvas, hud_x, 458, 580, 2, dim_border);
+    draw_text(&mut canvas, "PLAYER KEYS:", hud_x, 474, 2, accent);
+    draw_text(&mut canvas, "K/SPACE PLAY   J/L +-10S   P/SHIFT+P PIP", hud_x, 500, 2, white);
+    draw_text(&mut canvas, "I/SHIFT+I HUD  F FULL    C SUBS   0-9 SEEK", hud_x, 524, 2, muted);
 
     let dir = crate::config::Config::cache_dir()
         .map(|d| d.join("loading"))

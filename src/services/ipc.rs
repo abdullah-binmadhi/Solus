@@ -461,17 +461,17 @@ pub fn format_y2k_loader_osd(elapsed_ms: u64) -> String {
     )
 }
 
-/// Format an ASS `osd-overlay` vector bar positioned directly inside the 1280x720 loading card's bar track.
+/// Format an ASS `osd-overlay` vector bar (outer border + animated fill together in 1280x720 coordinates
+/// so outline and progress bar never drift on 16:10 or ultrawide displays).
 pub fn format_loader_ass_overlay(elapsed_ms: u64) -> String {
-    // Smoothly advance 0% -> 95% over 2.5s, then pulse gently while waiting for first video frame
     let pct = if elapsed_ms < 2500 {
         (elapsed_ms as f64 / 2500.0) * 0.95
     } else {
         0.95
     };
-    let bar_w = ((568.0 * pct).round() as u32).clamp(16, 568);
+    let bar_w = ((572.0 * pct).round() as u32).clamp(16, 572);
     format!(
-        "{{\\an7\\pos(600,398)\\p1\\bord0\\shad0\\1c&HFFFFFF&}}m 0 0 l {bar_w} 0 l {bar_w} 14 l 0 14{{\\p0}}"
+        "{{\\an7\\pos(594,386)\\bord2\\shad0\\1c&H100C09&\\3c&HBDA82D&\\p1}}m 0 0 l 580 0 l 580 26 l 0 26{{\\p0}}\n{{\\an7\\pos(598,390)\\bord0\\shad0\\1c&HFFFFFF&\\p1}}m 0 0 l {bar_w} 0 l {bar_w} 18 l 0 18{{\\p0}}"
     )
 }
 

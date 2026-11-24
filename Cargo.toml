@@ -51,6 +51,8 @@ base64        = "0.22"
 aes           = "0.8"
 cbc           = { version = "0.1", features = ["std"] }
 flate2        = "1.0"
+alass-core    = "2.0.0"
+earshot       = "1.2.2"
 qrcode = { version = "0.14.1", default-features = false }
 tokio-tungstenite = "0.30.0"
 futures-util = "0.3.34"

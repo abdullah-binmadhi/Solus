@@ -1441,7 +1441,7 @@ pub async fn fetch_stream_info_with_identity(
             fetch_animegg_provider(&client, identity, episode, is_dub)
         ),
         tokio::time::timeout(
-            Duration::from_secs(4),
+            Duration::from_secs(6),
             fetch_external_subtitles(&client, identity.anilist_id, &query_title, episode),
         )
     );

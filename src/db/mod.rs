@@ -492,7 +492,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    let _ = sqlx::query("PRAGMA user_version = 6;").execute(pool).await;
+    let _ = sqlx::query("DELETE FROM anime_provider_sub_delays WHERE ABS(delay_ms) >= 90000;")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("PRAGMA user_version = 7;").execute(pool).await;
 
     Ok(())
 }

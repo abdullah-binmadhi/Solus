@@ -121,17 +121,17 @@ impl HardsubBandHeight {
 
     pub fn bounds(self) -> (f32, f32) {
         match self {
-            Self::Compact => (0.840, 0.998),
-            Self::Standard => (0.770, 0.998),
-            Self::Tall => (0.700, 0.998),
+            Self::Compact => (0.810, 0.998),
+            Self::Standard => (0.730, 0.998),
+            Self::Tall => (0.660, 0.998),
         }
     }
 
     pub fn sub_alignment(self) -> (u8, u8) {
         match self {
-            Self::Compact => (93, 14),
-            Self::Standard => (91, 16),
-            Self::Tall => (89, 18),
+            Self::Compact => (98, 6),
+            Self::Standard => (97, 6),
+            Self::Tall => (96, 6),
         }
     }
 }
@@ -995,9 +995,9 @@ local shield_modes = {
     { name = "Off",            slug = nil },
 }
 local band_sizes = {
-    { label = "Compact (12%)",  tag = "84_100", sub_pos = 93, margin_y = 14 },
-    { label = "Standard (19%)", tag = "77_100", sub_pos = 91, margin_y = 16 },
-    { label = "Tall (25%)",     tag = "70_100", sub_pos = 89, margin_y = 18 },
+    { label = "Compact (12%)",  tag = "81_100", sub_pos = 98, margin_y = 6 },
+    { label = "Standard (19%)", tag = "73_100", sub_pos = 97, margin_y = 6 },
+    { label = "Tall (25%)",     tag = "66_100", sub_pos = 96, margin_y = 6 },
 }
 local shield_idx = 1
 local band_idx = 2
@@ -1012,8 +1012,8 @@ local function solus_detect_initial_shield()
             if s:find("solus_hs_inpaint_", 1, true) then shield_idx = 2
             elseif s:find("solus_hs_matte_", 1, true) then shield_idx = 3
             else shield_idx = 1 end
-            if s:find("_84_100.glsl", 1, true) then band_idx = 1
-            elseif s:find("_70_100.glsl", 1, true) then band_idx = 3
+            if s:find("_81_100.glsl", 1, true) then band_idx = 1
+            elseif s:find("_66_100.glsl", 1, true) then band_idx = 3
             else band_idx = 2 end
             break
         end
@@ -1775,6 +1775,8 @@ pub fn build_mpv_direct_args_with_script(
         args.push("--loop-playlist=no".to_string());
         if let Some(ref loading_img) = opts.loading_image {
             args.push("--{".to_string());
+            args.push("--osc=no".to_string());
+            args.push("--osd-bar=no".to_string());
             args.push(loading_img.clone());
             args.push("--}".to_string());
         }
@@ -2131,9 +2133,9 @@ mod tests {
         let shield_args = build_mpv_direct_args(&o_ar, "https://vmpx.online/master.m3u8", None);
         assert!(shield_args.contains(&"--secondary-sid=no".to_string()));
         assert!(shield_args.contains(&"--sub-auto=no".to_string()));
-        assert!(shield_args.iter().any(|a| a.starts_with("--glsl-shaders=") && a.contains("/tmp/anime4k.glsl") && a.contains("solus_hs_blur_70_100.glsl")));
+        assert!(shield_args.iter().any(|a| a.starts_with("--glsl-shaders=") && a.contains("/tmp/anime4k.glsl") && a.contains("solus_hs_blur_66_100.glsl")));
         assert!(shield_args.contains(&"--sub-use-margins=no".to_string()));
-        assert!(shield_args.contains(&"--sub-pos=89".to_string()));
+        assert!(shield_args.contains(&"--sub-pos=96".to_string()));
         assert!(shield_args.contains(&"--sub-border-style=outline-and-shadow".to_string()));
 
         o_ar.hardsub_shield = HardsubShieldMode::FrameLift;
