@@ -1072,9 +1072,9 @@ async fn drive_ipc_stream<S>(
                                 let _ = tx.send(AppMessage::NearEofPrefetch(anime_id, episode)).await;
                             }
 
-                            // 3. Throttle progress updates to UI and database
+                            // 3. Throttle progress updates to UI and database (every ~2s or 1.5s seek jump)
                             let now_instant = tokio::time::Instant::now();
-                            if (current_pos - last_saved_pos).abs() >= 3.0 || now_instant.duration_since(last_save_time).as_secs() >= 4 {
+                            if (current_pos - last_saved_pos).abs() >= 1.5 || now_instant.duration_since(last_save_time).as_secs() >= 2 {
                                 last_saved_pos = current_pos;
                                 last_save_time = now_instant;
                                 let now_unix = std::time::SystemTime::now()
@@ -1112,12 +1112,32 @@ async fn drive_ipc_stream<S>(
     clear_active_monitor_if_same(&sock_path, &cmd_tx);
     set_playback_paused_for_cache(false);
 
-    // On player exit, persist the final position
+    // On player exit, persist final position and ensure completion scrobble isn't lost
     if current_pos > 0.0 {
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        if !scrobbled && is_completion_threshold_reached(current_pos, current_duration) {
+            let _ = db::user::record_watched(&pool, anime_id, episode as i64, now_unix).await;
+            let pool_clone = pool.clone();
+            let mut auth_clone = auth.clone();
+            let trackers_clone = trackers.clone();
+            tokio::spawn(async move {
+                if let Ok(Some(anime)) = db::cache::get_anime(&pool_clone, anime_id).await {
+                    let _ = crate::services::scrobble::sync_episode_watched_all(
+                        &pool_clone,
+                        &anime,
+                        episode,
+                        &mut auth_clone,
+                        &trackers_clone,
+                        now_unix,
+                    )
+                    .await;
+                }
+            });
+            let _ = tx.send(AppMessage::EpisodeAutoScrobbled(anime_id, episode)).await;
+        }
         let _ = db::user::save_playback_progress(
             &pool,
             anime_id,

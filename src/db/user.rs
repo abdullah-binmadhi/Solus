@@ -1762,14 +1762,32 @@ async fn load_calendar_telemetry(
     avg_hours_per_ep: f64,
 ) -> CalendarTelemetry {
     let history_day_rows = sqlx::query(
-        "SELECT date(watched_at, 'unixepoch', 'localtime') as day_str,
+        "WITH effective_history AS (
+             SELECT h.anime_id, h.episode, MAX(h.watched_at) as watched_at
+             FROM history h
+             WHERE h.profile_id = ?
+             GROUP BY h.anime_id, h.episode
+             UNION ALL
+             SELECT p.anime_id, p.episode, p.updated_at as watched_at
+             FROM playback_progress p
+             WHERE p.profile_id = ?
+               AND p.duration_secs > 60.0
+               AND (p.position_secs / p.duration_secs) >= 0.85
+               AND NOT EXISTS (
+                   SELECT 1 FROM history h2
+                   WHERE h2.profile_id = p.profile_id
+                     AND h2.anime_id = p.anime_id
+                     AND h2.episode = p.episode
+               )
+         )
+         SELECT date(watched_at, 'unixepoch', 'localtime') as day_str,
                 CAST(julianday(date(watched_at, 'unixepoch', 'localtime')) AS INTEGER) as jday,
                 COUNT(*) as cnt
-         FROM history
-         WHERE profile_id = ?
+         FROM effective_history
          GROUP BY day_str
          ORDER BY jday ASC",
     )
+    .bind(profile_id)
     .bind(profile_id)
     .fetch_all(pool)
     .await
@@ -1901,70 +1919,157 @@ async fn load_calendar_telemetry(
     }
 }
 
-/// Query local SQLite watch history and anime metadata to generate personalized analytics.
+/// Query local SQLite watch history, live playback progress, and synced tracker status to generate accurate analytics.
 pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> {
     let pid = get_active_profile_id(pool).await;
 
-    // 1. Total distinct episodes watched & duration calculation
+    // 1. Unified watched episodes (history + >=85% completed playback_progress) & exact watch duration
     let total_episodes: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM history WHERE profile_id = ?",
+        "WITH effective_history AS (
+             SELECT h.anime_id, h.episode
+             FROM history h
+             WHERE h.profile_id = ?
+             UNION
+             SELECT p.anime_id, p.episode
+             FROM playback_progress p
+             WHERE p.profile_id = ?
+               AND p.duration_secs > 60.0
+               AND (p.position_secs / p.duration_secs) >= 0.85
+         )
+         SELECT COUNT(*) FROM effective_history",
     )
+    .bind(&pid)
     .bind(&pid)
     .fetch_one(pool)
     .await
     .unwrap_or(0);
 
-    let tracked_seconds: f64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(position_secs), 0.0) FROM playback_progress WHERE profile_id = ?",
+    let watched_ep_rows = sqlx::query(
+        "SELECT anime_id, episode, MAX(watched_at) as watched_at
+         FROM (
+             SELECT h.anime_id, h.episode, h.watched_at
+             FROM history h
+             WHERE h.profile_id = ?
+             UNION ALL
+             SELECT p.anime_id, p.episode, p.updated_at as watched_at
+             FROM playback_progress p
+             WHERE p.profile_id = ?
+               AND p.duration_secs > 60.0
+               AND (p.position_secs / p.duration_secs) >= 0.85
+         )
+         GROUP BY anime_id, episode",
     )
     .bind(&pid)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0.0);
-
-    let tracked_episodes_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM playback_progress WHERE profile_id = ?",
-    )
-    .bind(&pid)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
-
-    let untracked_episodes = (total_episodes - tracked_episodes_count).max(0);
-    let total_seconds = tracked_seconds + (untracked_episodes as f64 * 24.0 * 60.0);
-    let total_hours = total_seconds / 3600.0;
-
-    // 2. Watched anime statistics (genres, eras, seasons, formats, scores, canon, rotation)
-    let rows = sqlx::query(
-        "SELECT a.id, a.title_english, a.title_romaji, a.genres, a.season, a.season_year,
-                a.format, a.score, a.episodes,
-                COUNT(h.episode) as watched_count, MAX(h.watched_at) as last_watched_at
-         FROM history h
-         JOIN anime a ON h.anime_id = a.id
-         WHERE h.profile_id = ?
-         GROUP BY a.id",
-    )
     .bind(&pid)
     .fetch_all(pool)
-    .await?;
+    .await
+    .unwrap_or_default();
 
-    let progress_rows = sqlx::query(
-        "SELECT anime_id, COALESCE(SUM(position_secs), 0.0) as dur, COUNT(*) as cnt
+    let mut watched_eps_set: std::collections::HashSet<(i64, i64)> =
+        std::collections::HashSet::with_capacity(watched_ep_rows.len());
+    for r in &watched_ep_rows {
+        let aid: i64 = r.try_get("anime_id").unwrap_or(0);
+        let ep: i64 = r.try_get("episode").unwrap_or(0);
+        watched_eps_set.insert((aid, ep));
+    }
+
+    let progress_ep_rows = sqlx::query(
+        "SELECT anime_id, episode, position_secs, duration_secs
          FROM playback_progress
-         WHERE profile_id = ?
-         GROUP BY anime_id",
+         WHERE profile_id = ?",
     )
     .bind(&pid)
     .fetch_all(pool)
     .await
     .unwrap_or_default();
 
-    let mut anime_durations: HashMap<i64, (f64, i64)> = HashMap::new();
-    for r in progress_rows {
+    let mut prog_ep_map: HashMap<(i64, i64), (f64, f64)> =
+        HashMap::with_capacity(progress_ep_rows.len());
+    let mut anime_partial_secs: HashMap<i64, f64> = HashMap::new();
+    let mut partial_seconds = 0.0f64;
+
+    for r in progress_ep_rows {
         let aid: i64 = r.try_get("anime_id").unwrap_or(0);
-        let dur: f64 = r.try_get("dur").unwrap_or(0.0);
-        let cnt: i64 = r.try_get("cnt").unwrap_or(0);
-        anime_durations.insert(aid, (dur, cnt));
+        let ep: i64 = r.try_get("episode").unwrap_or(0);
+        let pos: f64 = r.try_get::<f64, _>("position_secs").unwrap_or(0.0).max(0.0);
+        let dur: f64 = r.try_get::<f64, _>("duration_secs").unwrap_or(0.0).max(0.0);
+        prog_ep_map.insert((aid, ep), (pos, dur));
+        if !watched_eps_set.contains(&(aid, ep)) && pos > 10.0 {
+            partial_seconds += pos;
+            *anime_partial_secs.entry(aid).or_insert(0.0) += pos;
+        }
+    }
+
+    let mut completed_seconds = 0.0f64;
+    let mut anime_completed_secs: HashMap<i64, f64> = HashMap::new();
+    for &(aid, ep) in &watched_eps_set {
+        let ep_secs = match prog_ep_map.get(&(aid, ep)) {
+            Some(&(pos, dur)) if dur > 60.0 => {
+                if (pos / dur) >= 0.85 {
+                    pos.max(dur * 0.85)
+                } else {
+                    dur
+                }
+            }
+            Some(&(pos, _)) if pos > 1200.0 => pos,
+            _ => 1440.0,
+        };
+        completed_seconds += ep_secs;
+        *anime_completed_secs.entry(aid).or_insert(0.0) += ep_secs;
+    }
+    let total_hours = (completed_seconds + partial_seconds) / 3600.0;
+
+    // 2. Watched anime statistics (genres, eras, seasons, formats, scores, canon, rotation)
+    let rows = sqlx::query(
+        "WITH effective_history AS (
+             SELECT h.anime_id, h.episode, MAX(h.watched_at) as watched_at
+             FROM history h
+             WHERE h.profile_id = ?
+             GROUP BY h.anime_id, h.episode
+             UNION
+             SELECT p.anime_id, p.episode, p.updated_at as watched_at
+             FROM playback_progress p
+             WHERE p.profile_id = ?
+               AND p.duration_secs > 60.0
+               AND (p.position_secs / p.duration_secs) >= 0.85
+               AND NOT EXISTS (
+                   SELECT 1 FROM history h2
+                   WHERE h2.profile_id = p.profile_id
+                     AND h2.anime_id = p.anime_id
+                     AND h2.episode = p.episode
+               )
+         )
+         SELECT a.id, a.title_english, a.title_romaji, a.genres, a.season, a.season_year,
+                a.format, a.score, a.episodes,
+                COUNT(DISTINCT eh.episode) as watched_count, MAX(eh.watched_at) as last_watched_at
+         FROM effective_history eh
+         JOIN anime a ON eh.anime_id = a.id
+         GROUP BY a.id",
+    )
+    .bind(&pid)
+    .bind(&pid)
+    .fetch_all(pool)
+    .await?;
+
+    let wl_status_rows = sqlx::query(
+        "SELECT w.anime_id, w.status, w.added_at,
+                a.title_english, a.title_romaji, a.genres, a.season, a.season_year, a.format, a.score, a.episodes,
+                COALESCE((SELECT MAX(t.progress) FROM tracker_entries t WHERE t.profile_id = w.profile_id AND t.anime_id = w.anime_id), 0) as tracker_prog
+         FROM watchlist w
+         JOIN anime a ON w.anime_id = a.id
+         WHERE w.profile_id = ?",
+    )
+    .bind(&pid)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut wl_meta_by_id: HashMap<i64, (String, i64)> = HashMap::new();
+    for r in &wl_status_rows {
+        let aid: i64 = r.try_get("anime_id").unwrap_or(0);
+        let status: String = r.try_get("status").unwrap_or_default();
+        let prog: i64 = r.try_get("tracker_prog").unwrap_or(0);
+        wl_meta_by_id.insert(aid, (status, prog));
     }
 
     let filler_rows = sqlx::query(
@@ -2024,13 +2129,22 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     let mut format_counts: HashMap<String, usize> = HashMap::new();
     let mut top_shows: Vec<TopWatchedAnime> = Vec::new();
 
+    let mut seen_show_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+
     for row in &rows {
         let aid: i64 = row.try_get("id").unwrap_or(0);
+        seen_show_ids.insert(aid);
         let title_eng: Option<String> = row.try_get("title_english").unwrap_or(None);
         let title_rom: String = row.try_get("title_romaji").unwrap_or_else(|_| "Unknown".to_string());
         let display_title = title_eng.filter(|s| !s.trim().is_empty()).unwrap_or(title_rom);
 
-        let watched: i64 = row.try_get("watched_count").unwrap_or(0);
+        let local_watched: i64 = row.try_get("watched_count").unwrap_or(0);
+        let (wl_status_opt, tracker_prog) = wl_meta_by_id
+            .get(&aid)
+            .map(|(s, p)| (Some(s.as_str()), *p))
+            .unwrap_or((None, 0));
+        let is_wl_completed = wl_status_opt.is_some_and(|s| s.eq_ignore_ascii_case("COMPLETED"));
+
         let last_watched_at: i64 = row.try_get("last_watched_at").unwrap_or(0);
         let ep_opt: Option<i64> = row.try_get("episodes").unwrap_or(None);
         let score_opt: Option<i64> = row.try_get("score").unwrap_or(None);
@@ -2039,16 +2153,25 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
         let format_opt: Option<String> = row.try_get("format").unwrap_or(None);
         let genres_raw: String = row.try_get("genres").unwrap_or_else(|_| "[]".to_string());
 
+        let watched = if is_wl_completed {
+            ep_opt.unwrap_or(local_watched).max(local_watched).max(tracker_prog)
+        } else {
+            let eff = local_watched.max(tracker_prog);
+            ep_opt.map(|tot| eff.min(tot.max(local_watched))).unwrap_or(eff)
+        };
         let eps_watched = watched as usize;
         let total_eps = ep_opt.map(|e| e as usize);
-        let completion_pct = match total_eps {
-            Some(t) if t > 0 => ((eps_watched as f64 / t as f64) * 100.0).min(100.0),
-            _ => 0.0,
+        let completion_pct = if is_wl_completed {
+            100.0
+        } else {
+            match total_eps {
+                Some(t) if t > 0 => ((eps_watched as f64 / t as f64) * 100.0).min(100.0),
+                _ => 0.0,
+            }
         };
 
-        let (tracked_sec, tracked_cnt) = anime_durations.get(&aid).copied().unwrap_or((0.0, 0));
-        let untracked = watched.saturating_sub(tracked_cnt).max(0);
-        let anime_total_sec = tracked_sec + (untracked as f64 * 1440.0);
+        let anime_total_sec = anime_completed_secs.get(&aid).copied().unwrap_or(0.0)
+            + anime_partial_secs.get(&aid).copied().unwrap_or(0.0);
         let anime_hours = anime_total_sec / 3600.0;
 
         let parsed_genres: Vec<String> = serde_json::from_str::<Vec<String>>(&genres_raw)
@@ -2085,7 +2208,9 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
             last_watched_at,
         });
 
-        if let Some(total_eps) = ep_opt {
+        if is_wl_completed {
+            completed_shows += 1;
+        } else if let Some(total_eps) = ep_opt {
             if total_eps > 0 && watched >= total_eps {
                 completed_shows += 1;
             } else {
@@ -2129,6 +2254,59 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
         }
 
         if let Some(s) = season_opt.as_deref() {
+            match s.to_ascii_uppercase().as_str() {
+                "WINTER" => { season_counts[0] += 1; total_seasonal_shows += 1; }
+                "SPRING" => { season_counts[1] += 1; total_seasonal_shows += 1; }
+                "SUMMER" => { season_counts[2] += 1; total_seasonal_shows += 1; }
+                "FALL" | "AUTUMN" => { season_counts[3] += 1; total_seasonal_shows += 1; }
+                _ => {}
+            }
+        }
+    }
+
+    // Include synced COMPLETED shows from watchlist so Completion % reflects your finished catalog
+    for r in &wl_status_rows {
+        let aid: i64 = r.try_get("anime_id").unwrap_or(0);
+        if seen_show_ids.contains(&aid) {
+            continue;
+        }
+        let status: String = r.try_get("status").unwrap_or_default();
+        if !status.eq_ignore_ascii_case("COMPLETED") {
+            continue;
+        }
+        completed_shows += 1;
+        let fmt: String = r.try_get::<Option<String>, _>("format").unwrap_or(None).unwrap_or_else(|| "TV".to_string());
+        *format_counts.entry(fmt).or_insert(0) += 1;
+        if let Some(score) = r.try_get::<Option<i64>, _>("score").unwrap_or(None) {
+            if score > 0 {
+                total_score += score as f64;
+                scored_count += 1;
+                if score >= 90 {
+                    score_buckets[0] += 1;
+                } else if score >= 80 {
+                    score_buckets[1] += 1;
+                } else if score >= 70 {
+                    score_buckets[2] += 1;
+                } else {
+                    score_buckets[3] += 1;
+                }
+            }
+        }
+        if let Some(year) = r.try_get::<Option<i64>, _>("season_year").unwrap_or(None) {
+            total_dated_shows += 1;
+            min_year = Some(min_year.map_or(year, |m| m.min(year)));
+            max_year = Some(max_year.map_or(year, |m| m.max(year)));
+            if year < 2000 {
+                pre_2000 += 1;
+            } else if year < 2010 {
+                era_2000s += 1;
+            } else if year < 2020 {
+                era_2010s += 1;
+            } else {
+                era_2020s += 1;
+            }
+        }
+        if let Some(s) = r.try_get::<Option<String>, _>("season").unwrap_or(None).as_deref() {
             match s.to_ascii_uppercase().as_str() {
                 "WINTER" => { season_counts[0] += 1; total_seasonal_shows += 1; }
                 "SPRING" => { season_counts[1] += 1; total_seasonal_shows += 1; }
@@ -2213,13 +2391,31 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
 
     // 4. Local hour & weekday histograms
     let hour_rows = sqlx::query(
-        "SELECT CAST(strftime('%H', watched_at, 'unixepoch', 'localtime') AS INTEGER) as hr,
+        "WITH effective_history AS (
+             SELECT h.anime_id, h.episode, MAX(h.watched_at) as watched_at
+             FROM history h
+             WHERE h.profile_id = ?
+             GROUP BY h.anime_id, h.episode
+             UNION ALL
+             SELECT p.anime_id, p.episode, p.updated_at as watched_at
+             FROM playback_progress p
+             WHERE p.profile_id = ?
+               AND p.duration_secs > 60.0
+               AND (p.position_secs / p.duration_secs) >= 0.85
+               AND NOT EXISTS (
+                   SELECT 1 FROM history h2
+                   WHERE h2.profile_id = p.profile_id
+                     AND h2.anime_id = p.anime_id
+                     AND h2.episode = p.episode
+               )
+         )
+         SELECT CAST(strftime('%H', watched_at, 'unixepoch', 'localtime') AS INTEGER) as hr,
                 CAST(strftime('%w', watched_at, 'unixepoch', 'localtime') AS INTEGER) as dow,
                 COUNT(*) as cnt
-         FROM history
-         WHERE profile_id = ?
+         FROM effective_history
          GROUP BY hr, dow",
     )
+    .bind(&pid)
     .bind(&pid)
     .fetch_all(pool)
     .await
@@ -2369,14 +2565,32 @@ pub async fn compute_user_analytics(pool: &SqlitePool) -> Result<UserAnalytics> 
     };
 
     let log_rows = sqlx::query(
-        "SELECT h.anime_id, h.episode, h.watched_at,
+        "WITH effective_history AS (
+             SELECT h.anime_id, h.episode, MAX(h.watched_at) as watched_at
+             FROM history h
+             WHERE h.profile_id = ?
+             GROUP BY h.anime_id, h.episode
+             UNION ALL
+             SELECT p.anime_id, p.episode, p.updated_at as watched_at
+             FROM playback_progress p
+             WHERE p.profile_id = ?
+               AND p.duration_secs > 60.0
+               AND (p.position_secs / p.duration_secs) >= 0.85
+               AND NOT EXISTS (
+                   SELECT 1 FROM history h2
+                   WHERE h2.profile_id = p.profile_id
+                     AND h2.anime_id = p.anime_id
+                     AND h2.episode = p.episode
+               )
+         )
+         SELECT eh.anime_id, eh.episode, eh.watched_at,
                 a.title_english, a.title_romaji,
-                strftime('%m-%d %H:%M', h.watched_at, 'unixepoch', 'localtime') as fmt_time
-         FROM history h
-         JOIN anime a ON h.anime_id = a.id
-         WHERE h.profile_id = ?
-         ORDER BY h.watched_at DESC",
+                strftime('%m-%d %H:%M', eh.watched_at, 'unixepoch', 'localtime') as fmt_time
+         FROM effective_history eh
+         JOIN anime a ON eh.anime_id = a.id
+         ORDER BY eh.watched_at DESC",
     )
+    .bind(&pid)
     .bind(&pid)
     .fetch_all(pool)
     .await

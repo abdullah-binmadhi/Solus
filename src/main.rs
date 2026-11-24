@@ -461,7 +461,8 @@ async fn main() -> anyhow::Result<()> {
     state.playback_player_cursor = state.playback_players.iter().position(|p| *p == cfg.player).unwrap_or(0);
     if let Some(pb_settings) = db::user::get_profile_playback_settings(&pool, &state.active_profile_id).await {
         state.subtitle_delay_ms = pb_settings.subtitle_delay_ms.clamp(-30_000, 30_000);
-        state.preferred_subtitle_code = pb_settings.subtitle_code;
+        // Always start from Settings default subtitle language (English by default) on launch
+        state.preferred_subtitle_code.clear();
     }
     state.queue = services::queue::load_active_queue(&state.active_profile_id, boot_now as u64);
     {
@@ -1120,6 +1121,7 @@ async fn main() -> anyhow::Result<()> {
                     services::ipc::set_playback_paused_for_cache(false);
                     services::ipc::set_active_ipc_sender(None);
                     services::ipc::set_active_socket_path(None);
+                    spawn_silent_analytics_refresh(&pool, &tx);
                     let remote_state_done = state.remote_state.clone();
                     tokio::spawn(async move {
                         {
@@ -1825,6 +1827,9 @@ async fn main() -> anyhow::Result<()> {
                         services::queue::save_active_queue(&state.active_profile_id, &state.queue);
                         sync_remote_queue_snapshot(&state);
                     }
+                    if state.screen == Screen::TasteAnalytics {
+                        spawn_silent_analytics_refresh(&pool, &tx);
+                    }
                     state.live_playback.last_time_pos = pos;
                     let remote_state_clone = state.remote_state.clone();
                     let title = state.selected_anime.as_ref().map(|a| a.display_title().to_string()).unwrap_or_else(|| "Anime Stream".to_string());
@@ -1847,6 +1852,7 @@ async fn main() -> anyhow::Result<()> {
                         state.watched_episodes.insert(ep);
                     }
                     state.show_toast(format!("󰄬 Episode {} completed — auto-scrobbled", ep), unix_now());
+                    spawn_silent_analytics_refresh(&pool, &tx);
                     let pool_clone = pool.clone();
                     let tx_cw = tx.clone();
                     tokio::spawn(async move {
@@ -4617,6 +4623,9 @@ async fn handle_detail(
                     state.show_toast(format!("Episode {} marked unwatched", ep), now);
                     tokio::spawn(async move {
                         let _ = db::user::remove_watched_episode(&pool2, anime_id, ep as i64).await;
+                        if let Ok(data) = db::user::compute_user_analytics(&pool2).await {
+                            let _ = tx2.send(AppMessage::AnalyticsDataReady(data)).await;
+                        }
                     });
                 } else {
                     state.watched_episodes.insert(ep);
@@ -4625,6 +4634,9 @@ async fn handle_detail(
                     let trackers_cfg = cfg.trackers.clone();
                     tokio::spawn(async move {
                         let _ = db::user::record_watched(&pool2, anime_id, ep as i64, now).await;
+                        if let Ok(data) = db::user::compute_user_analytics(&pool2).await {
+                            let _ = tx2.send(AppMessage::AnalyticsDataReady(data)).await;
+                        }
                         if auth_clone.is_authenticated() {
                             let outcome = services::scrobble::sync_episode_watched_all(
                                 &pool2,
@@ -4899,7 +4911,7 @@ async fn persist_profile_playback_settings_fields(state: &AppState, pool: &sqlx:
     let settings = db::user::ProfilePlaybackSettings {
         profile_id: state.active_profile_id.clone(),
         dub: state.pending_dub,
-        subtitle_code: state.preferred_subtitle_code.clone(),
+        subtitle_code: String::new(),
         subtitle_delay_ms: state.subtitle_delay_ms.clamp(-120_000, 120_000),
         quality,
         preferred_player: state.selected_player().as_str().to_string(),
@@ -5222,13 +5234,15 @@ async fn handle_playback_options(
                         .unwrap_or_else(|| cfg.default_sub_lang.clone())
                 };
                 let is_dub = audio == config::AudioMode::Dub;
-                state.preferred_subtitle_code = if subtitles_disabled {
-                    "none".to_string()
-                } else if is_dub || !chosen_sub_str.eq_ignore_ascii_case(&cfg.default_sub_lang) {
-                    chosen_sub_str.clone()
-                } else {
-                    String::new()
-                };
+                if !is_hardsub_provider {
+                    state.preferred_subtitle_code = if subtitles_disabled {
+                        "none".to_string()
+                    } else if is_dub || !chosen_sub_str.eq_ignore_ascii_case(&cfg.default_sub_lang) {
+                        chosen_sub_str.clone()
+                    } else {
+                        String::new()
+                    };
+                }
                 persist_profile_playback_settings_fields(state, pool).await;
 
                 match effective_purpose {
@@ -7371,7 +7385,7 @@ async fn apply_profile_switch(
         db::user::get_profile_playback_settings(pool, &state.active_profile_id).await
     {
         state.subtitle_delay_ms = pb_settings.subtitle_delay_ms.clamp(-30_000, 30_000);
-        state.preferred_subtitle_code = pb_settings.subtitle_code;
+        state.preferred_subtitle_code.clear();
     } else {
         state.subtitle_delay_ms = 0;
         state.preferred_subtitle_code.clear();
@@ -9018,17 +9032,26 @@ async fn handle_cast_deck(
     }
 }
 
+fn spawn_silent_analytics_refresh(
+    pool: &sqlx::SqlitePool,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
+    let pool = pool.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        if let Ok(data) = db::user::compute_user_analytics(&pool).await {
+            let _ = tx.send(AppMessage::AnalyticsDataReady(data)).await;
+        }
+    });
+}
+
 fn trigger_analytics_fetch(
     state: &mut AppState,
     pool: sqlx::SqlitePool,
     tx: tokio::sync::mpsc::Sender<AppMessage>,
 ) {
     state.open_taste_analytics();
-    tokio::spawn(async move {
-        if let Ok(data) = db::user::compute_user_analytics(&pool).await {
-            let _ = tx.send(AppMessage::AnalyticsDataReady(data)).await;
-        }
-    });
+    spawn_silent_analytics_refresh(&pool, &tx);
 }
 
 // ── Seasonal & Movie Release Calendar ─────────────────────────────────────────

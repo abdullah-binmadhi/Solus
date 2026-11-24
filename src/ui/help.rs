@@ -43,43 +43,46 @@ struct SectionSpec {
 
 const BROWSING_BINDINGS: &[BindingRow] = &[
     BindingRow { key: "Enter/Click", desc: "Open anime detail stage" },
-    BindingRow { key: "h/j/k/l", desc: "Navigate shelves & posters" },
-    BindingRow { key: "1-6", desc: "Jump directly to shelf row" },
-    BindingRow { key: "r", desc: "Resume next episode" },
+    BindingRow { key: "h / j / k / l", desc: "Navigate shelves & posters" },
+    BindingRow { key: "1 - 6", desc: "Jump directly to shelf row" },
+    BindingRow { key: "r", desc: "Resume next unwatched ep" },
     BindingRow { key: "/", desc: "Instant anime search" },
-    BindingRow { key: "+ / x", desc: "Add or remove watchlist" },
-    BindingRow { key: "R", desc: "Refresh AniList shelves" },
+    BindingRow { key: "+ / x", desc: "Status picker / Remove entry" },
+    BindingRow { key: "R", desc: "Refresh AniList & MAL shelves" },
+    BindingRow { key: "q / Esc", desc: "Back or quit confirmation" },
 ];
 
 const PLAYBACK_BINDINGS: &[BindingRow] = &[
     BindingRow { key: "Enter/Space", desc: "Launch highlighted episode" },
-    BindingRow { key: "e / E", desc: "Config & queue / Batch range" },
-    BindingRow { key: "a (Playing)", desc: "Switch Sub/Dub stream live" },
-    BindingRow { key: "v / w", desc: "Split/List view / Mark watched" },
-    BindingRow { key: "p / D", desc: "Stream opts / Offline vault" },
-    BindingRow { key: "n / c", desc: "Next aired ep / LAN Cast" },
+    BindingRow { key: "e / E", desc: "Enqueue / Batch range queue" },
+    BindingRow { key: "p / D", desc: "Stream opts / Offline download" },
+    BindingRow { key: "v / Tab", desc: "Grid view / Switch detail pane" },
+    BindingRow { key: "w", desc: "Mark highlighted ep watched" },
+    BindingRow { key: "n / +", desc: "Next aired ep / Status picker" },
+    BindingRow { key: "c / m", desc: "LAN Cast Deck / QR remote" },
     BindingRow { key: "Esc / q", desc: "Return to previous screen" },
 ];
 
 const FEATURES_BINDINGS: &[BindingRow] = &[
     BindingRow { key: "Q / Ctrl+Q", desc: "Queue & Playlist editor" },
-    BindingRow { key: "a (Home)", desc: "Taste Analytics Bento Hub" },
+    BindingRow { key: "a", desc: "Taste Analytics Bento Hub" },
     BindingRow { key: "w (Home)", desc: "Tailored recommendation wizard" },
-    BindingRow { key: "c / m", desc: "Airing calendar / Mobile remote" },
-    BindingRow { key: "C", desc: "AirPlay / DLNA Cast Deck" },
-    BindingRow { key: "L", desc: "Trackers OAuth & Merge Hub" },
-    BindingRow { key: "t / T", desc: "Cycle UI theme on Home & Detail" },
+    BindingRow { key: "c / C", desc: "Airing calendar / Cast Deck" },
+    BindingRow { key: "m", desc: "Mobile phone QR remote control" },
+    BindingRow { key: "L", desc: "AniList & MAL Auth & Merge Hub" },
+    BindingRow { key: "t / T", desc: "Cycle UI visual theme" },
+    BindingRow { key: "Tab / Arrows", desc: "Move focus inside overlays" },
 ];
 
 const SYSTEM_BINDINGS: &[BindingRow] = &[
-    BindingRow { key: "P", desc: "Switch / manage user profiles" },
+    BindingRow { key: "P", desc: "Switch or manage user profiles" },
     BindingRow { key: "s", desc: "Open Settings Control Hub" },
     BindingRow { key: "N", desc: "Cycle network mode (Full/WiFi/Eco)" },
-    BindingRow { key: "!", desc: "Open System Doctor & Pipeline" },
+    BindingRow { key: "!", desc: "System Doctor & shader pipeline" },
     BindingRow { key: "U", desc: "Check or install self-update" },
     BindingRow { key: "X", desc: "Stop active player process" },
+    BindingRow { key: "? / Esc", desc: "Toggle or dismiss this matrix" },
     BindingRow { key: "Ctrl+C", desc: "Immediate emergency exit" },
-    BindingRow { key: "q / Esc", desc: "Go back or quit confirmation" },
 ];
 
 /// Returns the responsive modal `(percent_x, percent_y)` matching `Home` backdrop clearing.
@@ -90,16 +93,16 @@ pub fn modal_pct(area: Rect) -> (u16, u16) {
     (px, py)
 }
 
-/// Content-fitted centered modal rectangle eliminating empty lower deadspace on wide/tall terminals.
+/// Content-fitted centered modal rectangle eliminating clipping, concatenation, and dead space.
 fn help_modal_rect(area: Rect) -> Rect {
-    let target_w = if area.width >= 88 {
-        area.width.saturating_sub(4).min(108)
+    let target_w = if area.width >= 96 {
+        area.width.saturating_sub(4).min(118)
     } else {
         area.width.saturating_sub(2).max(20)
     };
-    let top_h = BROWSING_BINDINGS.len().max(PLAYBACK_BINDINGS.len()) as u16 + 3;
-    let bot_h = FEATURES_BINDINGS.len().max(SYSTEM_BINDINGS.len()) as u16 + 3;
-    let player_bar_h: u16 = if area.height >= 28 { 3 } else { 0 };
+    let top_h = BROWSING_BINDINGS.len().max(PLAYBACK_BINDINGS.len()) as u16 + 2;
+    let bot_h = FEATURES_BINDINGS.len().max(SYSTEM_BINDINGS.len()) as u16 + 2;
+    let player_bar_h: u16 = if area.height >= 28 { 4 } else { 0 };
     let desired_h = 2 + 2 + top_h + bot_h + player_bar_h + 2; // borders + header + cards + player + dock
     let target_h = desired_h.min(area.height.saturating_sub(2)).max(12);
 
@@ -210,9 +213,9 @@ pub fn render_overlay(frame: &mut Frame, state: &AppState) {
 
     let show_header_rule = padded.height >= 24;
     let show_dock_rule = padded.height >= 22;
-    let show_player_strip = padded.height >= 25;
+    let show_player_strip = padded.height >= 26;
     let header_h = if show_header_rule { 2 } else { 1 };
-    let player_h = if show_player_strip { 3 } else { 0 };
+    let player_h = if show_player_strip { 4 } else { 0 };
     let dock_h = if show_dock_rule { 2 } else { 1 };
 
     let rows = Layout::default()
@@ -327,8 +330,8 @@ fn render_bento_cards(
 ) {
     // 2x2 Bento matrix when horizontal budget avoids label truncation; 1-column fallback on narrow panes.
     if area.width >= 76 && area.height >= 16 {
-        let top_rows = (sections[0].bindings.len().max(sections[1].bindings.len()) + 3) as u16;
-        let bot_rows = (sections[2].bindings.len().max(sections[3].bindings.len()) + 3) as u16;
+        let top_rows = (sections[0].bindings.len().max(sections[1].bindings.len()) + 2) as u16;
+        let bot_rows = (sections[2].bindings.len().max(sections[3].bindings.len()) + 2) as u16;
         let grid_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -421,7 +424,7 @@ fn render_section_card(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let max_rows = inner.height as usize;
 
-    // Include contextual subtitle on spacious cards while keeping all 6 bindings visible when compact.
+    // Show contextual subtitle only when all 4 cards have extra spare height so rows align evenly.
     if max_rows > spec.bindings.len() + 1 {
         lines.push(Line::from(Span::styled(
             format!("  {}", spec.subtitle),
@@ -429,7 +432,7 @@ fn render_section_card(
         )));
     }
 
-    let key_col_width: usize = if inner.width >= 42 { 13 } else { 11 };
+    let key_col_width: usize = if inner.width >= 48 { 14 } else { 13 };
     let key_fg = if is_active {
         theme.accent
     } else {
@@ -443,6 +446,16 @@ fn render_section_card(
         let pill = format!(" {} ", row.key);
         let pill_chars = pill.chars().count();
         let pad = key_col_width.saturating_sub(pill_chars) + 2;
+        let desc_budget = (inner.width as usize).saturating_sub(1 + pill_chars + pad);
+        let desc_text = if row.desc.chars().count() > desc_budget {
+            let mut s: String = row.desc.chars().take(desc_budget.saturating_sub(1)).collect();
+            if desc_budget >= 2 {
+                s.push('…');
+            }
+            s
+        } else {
+            row.desc.to_string()
+        };
 
         lines.push(Line::from(vec![
             Span::raw(" "),
@@ -454,47 +467,23 @@ fn render_section_card(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" ".repeat(pad)),
-            Span::styled(row.desc, Style::default().fg(FG_PRIMARY)),
+            Span::styled(desc_text, Style::default().fg(FG_PRIMARY)),
         ]));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_player_strip(frame: &mut Frame, area: Rect, theme: &ThemePalette) {
-    let block = Block::default()
-        .title(Span::styled(
-            "  In-Player (mpv YouTube Keys) ",
-            Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.border_idle))
-        .style(Style::default().bg(BG_CARD));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let chips: [(&str, &str, Color, u8); 8] = [
-        ("Space/k", "Pause", theme.primary, 1),
-        ("j/l", "+-10s", theme.accent, 2),
-        ("#/Ctrl+a", "Audio", theme.secondary, 1),
-        ("f", "Full", FG_PRIMARY, 4),
-        ("c", "Sub", theme.primary, 3),
-        ("m", "Mute", FG_PRIMARY, 6),
-        ("0-9", "Jump%", theme.accent, 7),
-        ("q", "Exit", FG_MUTED, 1),
-    ];
-
+fn render_player_chip_row(chips: &[(&str, &str, Color, u8)], max_w: usize) -> Line<'static> {
     let chip_width = |key: &str, label: &str| key.chars().count() + label.chars().count() + 3;
-    let max_w = inner.width as usize;
     let sep_w = 2usize;
+    let mut include = vec![true; chips.len()];
 
-    let mut include = [true; 8];
-    let calc_total = |inc: &[bool; 8]| -> usize {
+    loop {
         let mut count = 0usize;
         let mut total = 0usize;
         for (idx, (k, l, _, _)) in chips.iter().enumerate() {
-            if inc[idx] {
+            if include[idx] {
                 if count > 0 {
                     total += sep_w;
                 }
@@ -502,10 +491,9 @@ fn render_player_strip(frame: &mut Frame, area: Rect, theme: &ThemePalette) {
                 count += 1;
             }
         }
-        total
-    };
-
-    while calc_total(&include) > max_w {
+        if total <= max_w {
+            break;
+        }
         if let Some((drop_idx, _)) = chips
             .iter()
             .enumerate()
@@ -528,10 +516,49 @@ fn render_player_strip(frame: &mut Frame, area: Rect, theme: &ThemePalette) {
         }
         spans.push(dock_pill(key, label, *color));
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
-        inner,
-    );
+    Line::from(spans).alignment(Alignment::Center)
+}
+
+fn render_player_strip(frame: &mut Frame, area: Rect, theme: &ThemePalette) {
+    let block = Block::default()
+        .title(Span::styled(
+            "  In-Player Controls (Unified libmpv) ",
+            Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border_idle))
+        .style(Style::default().bg(BG_CARD));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let max_w = inner.width as usize;
+    let row1: [(&str, &str, Color, u8); 9] = [
+        ("Space/k", "Pause", theme.primary, 1),
+        ("j/l", "±10s", theme.accent, 2),
+        ("#/Ctrl+a", "Audio", theme.secondary, 1),
+        ("c", "Sub", theme.primary, 3),
+        ("M", "Mute", FG_PRIMARY, 5),
+        ("f", "Full", FG_PRIMARY, 4),
+        ("p/P", "PiP", theme.accent, 4),
+        ("0-9", "Jump%", theme.accent, 7),
+        ("q", "Exit", FG_MUTED, 1),
+    ];
+    let row2: [(&str, &str, Color, u8); 7] = [
+        ("i/I", "HUD", theme.primary, 2),
+        ("Tab", "Skip OP/ED", theme.accent, 1),
+        ("n/N", "Next Ep", theme.secondary, 1),
+        ("y", "Voice Sync", theme.primary, 2),
+        ("S", "Sync Bar", theme.secondary, 3),
+        ("z/x", "Delay", FG_MUTED, 6),
+        ("a/d/m/g", "4K/Deband/24p/Perf", theme.accent, 5),
+    ];
+
+    let mut lines = vec![render_player_chip_row(&row1, max_w)];
+    if inner.height >= 2 {
+        lines.push(render_player_chip_row(&row2, max_w));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_action_dock(frame: &mut Frame, area: Rect, theme: &ThemePalette, show_rule: bool) {
@@ -653,9 +680,11 @@ mod tests {
             assert!(text.contains("System Doctor"), "missing Doctor action dock at {}x{}", w, h);
             assert!(text.contains("Queue & Playlist editor"), "missing Queue keybind in help matrix");
             if h >= 32 {
-                assert!(text.contains("In-Player (mpv YouTube Keys)"), "missing player bar");
+                assert!(text.contains("In-Player Controls (Unified libmpv)"), "missing player bar");
                 assert!(text.contains("[q] Exit"), "player strip must not clip [q] Exit mid-word at {}x{}", w, h);
                 assert!(text.contains("[#/Ctrl+a] Audio"), "missing audio switch keybind at {}x{}", w, h);
+                assert!(text.contains("[y] Voice Sync"), "missing Voice Sync keybind at {}x{}", w, h);
+                assert!(text.contains("[Tab] Skip OP/ED"), "missing Skip OP/ED keybind at {}x{}", w, h);
             }
         }
     }
