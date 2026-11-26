@@ -1803,6 +1803,11 @@ impl AppState {
             if log.contains("No results found") {
                 return Some("Anime title could not be found on streaming sources.");
             }
+            if log.contains("Failed initializing any suitable GPU context")
+                || log.contains("Error opening/initializing the selected video_out")
+            {
+                return Some("Video output failed to initialize (GPU/Vulkan) — switching to OpenGL or check graphics drivers.");
+            }
             if log.contains("Player exited with error:") || log.contains("Player wait error:") {
                 return Some("Player failed to launch or stream expired — try another provider (HD-1 / Pahe / Gogo).");
             }

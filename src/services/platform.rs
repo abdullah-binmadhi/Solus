@@ -7,7 +7,86 @@
 
 use crate::api::player::find_binary;
 use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
+
+/// Session-wide runtime GPU fallback stage if `mpv` fails to initialize its GPU context:
+/// - `0`: Normal probed defaults (`vo=gpu-next`, `gpu-api=auto/vulkan/...`)
+/// - `1`: Force `gpu-api=opengl`
+/// - `2`: Force `vo=gpu` + `gpu-api=opengl`
+static GPU_FALLBACK_STAGE: AtomicU8 = AtomicU8::new(0);
+
+/// Returns the active runtime GPU fallback stage (`0`, `1`, or `2`).
+pub fn gpu_fallback_stage() -> u8 {
+    GPU_FALLBACK_STAGE.load(Ordering::Relaxed)
+}
+
+/// Advances the runtime GPU fallback stage (`0 -> 1 -> 2`), returning `Some(new_stage)`
+/// or `None` if all fallbacks have already been exhausted.
+pub fn advance_gpu_fallback_stage() -> Option<u8> {
+    let mut cur = GPU_FALLBACK_STAGE.load(Ordering::Relaxed);
+    loop {
+        if cur >= 2 {
+            return None;
+        }
+        let next = cur + 1;
+        match GPU_FALLBACK_STAGE.compare_exchange_weak(
+            cur,
+            next,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(next),
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Returns true if playback stderr logs indicate a GPU / video output context failure.
+pub fn has_gpu_context_init_error(logs: &[String]) -> bool {
+    logs.iter().any(|line| {
+        line.contains("Failed initializing any suitable GPU context")
+            || line.contains("Error opening/initializing the selected video_out")
+            || line.contains("Could not initialize video chain")
+            || (line.contains("[vo/gpu") && (line.contains("Failed") || line.contains("Error")))
+    })
+}
+
+/// Checks whether at least one Vulkan ICD manifest exists on Linux so `mpv` doesn't
+/// crash trying `--gpu-api=vulkan` on systems without Vulkan drivers (e.g. minimal Asahi/VMs).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn has_linux_vulkan_icd() -> bool {
+    for var in ["VK_ICD_FILENAMES", "VK_DRIVER_FILES"] {
+        if let Ok(val) = std::env::var(var) {
+            for entry in std::env::split_paths(&val) {
+                if entry.is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    let icd_dirs = [
+        "/usr/share/vulkan/icd.d",
+        "/etc/vulkan/icd.d",
+        "/usr/local/share/vulkan/icd.d",
+        "/run/opengl-driver/share/vulkan/icd.d",
+    ];
+    for dir in icd_dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .path()
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
 
 /// Cross-platform thermal pressure classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -143,8 +222,10 @@ impl PlayerCapabilities {
         }
     }
 
-    pub const fn effective_vo(&self) -> &'static str {
-        if self.has_gpu_next {
+    pub fn effective_vo(&self) -> &'static str {
+        if gpu_fallback_stage() >= 2 {
+            "gpu"
+        } else if self.has_gpu_next {
             "gpu-next"
         } else {
             "gpu"
@@ -152,9 +233,18 @@ impl PlayerCapabilities {
     }
 
     pub fn effective_gpu_api(&self, dev: &DeviceProfile) -> &'static str {
+        if gpu_fallback_stage() >= 1 {
+            return if self.has_opengl { "opengl" } else { "auto" };
+        }
+        self.resolve_gpu_api_for_os(dev, cfg!(target_os = "linux"))
+    }
+
+    pub fn resolve_gpu_api_for_os(&self, dev: &DeviceProfile, is_linux: bool) -> &'static str {
         match dev.recommended_gpu_api {
             "d3d11" if self.has_d3d11 => "d3d11",
             "vulkan" if self.has_vulkan => "vulkan",
+            "auto" => "auto",
+            _ if is_linux => "auto",
             _ if self.has_vulkan => "vulkan",
             _ if self.has_d3d11 => "d3d11",
             _ => "auto",
@@ -667,7 +757,12 @@ fn probe_player_capabilities_uncached() -> PlayerCapabilities {
         .unwrap_or_default();
     let list_opts = run_cmd_stdout(&bin, &["--list-options"]).unwrap_or_default();
 
-    parse_mpv_capabilities(&name, &ver, &vo_help, &api_help, &list_opts)
+    let mut caps = parse_mpv_capabilities(&name, &ver, &vo_help, &api_help, &list_opts);
+    #[cfg(target_os = "linux")]
+    {
+        caps.has_vulkan = caps.has_vulkan && has_linux_vulkan_icd();
+    }
+    caps
 }
 
 /// Synchronously sample current host power & thermal snapshot cleanly.
@@ -759,5 +854,39 @@ mod tests {
         assert!(!dev.decode_summary().is_empty());
         let caps = detect_player_capabilities();
         assert!(!caps.inspector_summary().is_empty());
+    }
+
+    #[test]
+    fn test_linux_gpu_api_respects_auto_and_missing_vulkan() {
+        let caps_with_vk = PlayerCapabilities {
+            binary_name: "mpv".to_string(),
+            version_str: "0.42.0".to_string(),
+            has_gpu_next: true,
+            has_shader_opts: true,
+            has_perceptual_gamut: true,
+            has_hdr_contrast_recovery: true,
+            has_gpu_shader_cache_dir: true,
+            has_vulkan: true,
+            has_d3d11: false,
+            has_opengl: true,
+        };
+        let asahi_dev = parse_linux_profile(None, None, Some("Apple GPU"), true, None, true);
+        assert_eq!(caps_with_vk.resolve_gpu_api_for_os(&asahi_dev, true), "auto");
+
+        let mut caps_no_vk = caps_with_vk.clone();
+        caps_no_vk.has_vulkan = false;
+        let amd_dev = parse_linux_profile(None, Some("0x1002"), Some("Radeon"), true, None, false);
+        assert_eq!(caps_no_vk.resolve_gpu_api_for_os(&amd_dev, true), "auto");
+        assert_eq!(caps_with_vk.resolve_gpu_api_for_os(&amd_dev, true), "vulkan");
+    }
+
+    #[test]
+    fn test_detects_gpu_context_init_errors() {
+        let logs = vec![
+            "[vo/gpu-next] Failed initializing any suitable GPU context!".to_string(),
+            "Error opening/initializing the selected video_out (--vo) device.".to_string(),
+        ];
+        assert!(has_gpu_context_init_error(&logs));
+        assert!(!has_gpu_context_init_error(&["VO: [gpu-next] 1920x1080".to_string()]));
     }
 }

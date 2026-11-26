@@ -1186,6 +1186,39 @@ async fn main() -> anyhow::Result<()> {
                     #[cfg(unix)]
                     let _ = std::fs::remove_file("/tmp/solus-mpv.sock");
 
+                    // Self-healing GPU fallback if `mpv` failed to initialize its GPU/VO context (e.g. missing Vulkan ICD on Linux)
+                    if !exited_ok
+                        && !user_quit
+                        && !natural_eof
+                        && elapsed_secs < 10
+                        && services::platform::has_gpu_context_init_error(&state.playback_logs)
+                    {
+                        if let Some(stage) = services::platform::advance_gpu_fallback_stage() {
+                            if let Some(retry_opts) = state.last_play_options.clone() {
+                                state.playback_logs.clear();
+                                let msg = if stage == 1 {
+                                    "◈ GPU context failed — retrying with OpenGL..."
+                                } else {
+                                    "◈ Retrying with legacy GPU video output (vo=gpu + OpenGL)..."
+                                };
+                                state.show_toast(msg, unix_now());
+                                let retry_title = retry_opts.title.clone();
+                                let retry_ep = retry_opts.episode;
+                                start_playback(
+                                    &mut state,
+                                    retry_opts,
+                                    retry_title,
+                                    retry_ep,
+                                    &tx,
+                                    &pool,
+                                    &cfg,
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
+                    }
+
                     // Self-healing retry once on verified backup mirror (e.g. AnimeHeaven Mirror 2/3)
                     // if a direct HTTP MP4 failed immediately on startup.
                     if !exited_ok && !user_quit && !natural_eof && elapsed_secs < 12 {
