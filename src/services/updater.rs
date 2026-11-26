@@ -574,15 +574,61 @@ pub fn target_asset_name() -> &'static str {
     { "solus-macos-x86_64" }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     { "solus-linux-x86_64" }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    { "solus-linux-aarch64" }
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     { "solus-windows-x86_64.exe" }
     #[cfg(not(any(
         all(target_os = "macos", target_arch = "aarch64"),
         all(target_os = "macos", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
         all(target_os = "windows", target_arch = "x86_64"),
     )))]
     { "solus" }
+}
+
+/// Validates that a downloaded Solus binary header matches the host OS and CPU architecture.
+pub fn has_valid_solus_binary_header(hdr: &[u8]) -> bool {
+    if hdr.len() < 4 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if hdr[0..4] != [0x7F, b'E', b'L', b'F'] {
+            return false;
+        }
+        if hdr.len() >= 20 {
+            let e_machine = u16::from_le_bytes([hdr[18], hdr[19]]);
+            #[cfg(target_arch = "aarch64")]
+            if e_machine != 183 {
+                return false;
+            }
+            #[cfg(target_arch = "x86_64")]
+            if e_machine != 62 {
+                return false;
+            }
+        }
+        true
+    }
+    #[cfg(target_os = "macos")]
+    {
+        matches!(
+            [hdr[0], hdr[1], hdr[2], hdr[3]],
+            [0xCF, 0xFA, 0xED, 0xFE]
+                | [0xFE, 0xED, 0xFA, 0xCF]
+                | [0xCA, 0xFE, 0xBA, 0xBE]
+                | [0xBE, 0xBA, 0xFE, 0xCA]
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        hdr[0..2] == [b'M', b'Z']
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        true
+    }
 }
 
 /// Resolve the canonical path of the running binary (following symlinks such as `/opt/homebrew/bin/solus -> ~/.cargo/bin/solus`).
@@ -708,8 +754,7 @@ pub fn evaluate_release_update(
     let asset = release
         .assets
         .iter()
-        .find(|a| a.name == target_name)
-        .or_else(|| release.assets.iter().find(|a| a.name.contains("solus")))?;
+        .find(|a| a.name == target_name)?;
 
     let cleaned_notes = clean_release_notes(release.body);
     let simple_notes = simplify_release_notes(cleaned_notes.as_deref().unwrap_or(""));
@@ -797,6 +842,29 @@ pub async fn download_and_install_update(
 
     tokio::io::AsyncWriteExt::flush(&mut file).await?;
     drop(file);
+
+    // Verify downloaded binary size and native OS/architecture header before replacing current_exe.
+    {
+        use std::io::Read;
+        let meta = std::fs::metadata(&temp_download_path)?;
+        if meta.len() < 1_000_000 {
+            let _ = std::fs::remove_file(&temp_download_path);
+            return Err(AppError::Player(format!(
+                "Downloaded binary is unexpectedly small ({} bytes); aborting update.",
+                meta.len()
+            )));
+        }
+        let mut f = std::fs::File::open(&temp_download_path)?;
+        let mut hdr = [0u8; 20];
+        let n = f.read(&mut hdr)?;
+        if !has_valid_solus_binary_header(&hdr[..n]) {
+            let _ = std::fs::remove_file(&temp_download_path);
+            return Err(AppError::Player(
+                "Downloaded update binary does not match this OS/CPU architecture; aborting update."
+                    .into(),
+            ));
+        }
+    }
 
     // Ensure permissions and replace running executable
     #[cfg(windows)]
@@ -951,6 +1019,15 @@ mod tests {
         // 4. Local newer dev commit (local_ts > remote_ts) is never downgraded.
         let r4 = sample_release("v1.0.7-rolling", Some(body));
         assert!(evaluate_release_update(r4, "1.0.7", "9999999888888877777776666666555555544444", 2500).is_none());
+
+        // 5. Missing exact platform asset must NOT fall back to another architecture's binary.
+        let mut r5 = sample_release("v1.0.7-rolling", Some(body));
+        r5.assets = vec![ReleaseAsset {
+            name: "solus-other-arch-placeholder".to_string(),
+            browser_download_url: "https://example.com/solus-other".to_string(),
+            size: 1024,
+        }];
+        assert!(evaluate_release_update(r5, "1.0.6", "unknown", 0).is_none());
     }
 
     #[test]
