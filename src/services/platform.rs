@@ -203,6 +203,7 @@ pub struct PlayerCapabilities {
     pub has_vulkan: bool,
     pub has_d3d11: bool,
     pub has_opengl: bool,
+    pub has_wayland_app_id: bool,
 }
 
 #[allow(dead_code)]
@@ -219,6 +220,7 @@ impl PlayerCapabilities {
             has_vulkan: false,
             has_d3d11: cfg!(target_os = "windows"),
             has_opengl: true,
+            has_wayland_app_id: false,
         }
     }
 
@@ -569,6 +571,7 @@ pub fn parse_mpv_capabilities(
         has_vulkan: has_word(gpu_api_help, "vulkan"),
         has_d3d11: has_word(gpu_api_help, "d3d11"),
         has_opengl: has_word(gpu_api_help, "opengl"),
+        has_wayland_app_id: has_opt("--wayland-app-id"),
     }
 }
 
@@ -869,6 +872,7 @@ mod tests {
             has_vulkan: true,
             has_d3d11: false,
             has_opengl: true,
+            has_wayland_app_id: true,
         };
         let asahi_dev = parse_linux_profile(None, None, Some("Apple GPU"), true, None, true);
         assert_eq!(caps_with_vk.resolve_gpu_api_for_os(&asahi_dev, true), "auto");

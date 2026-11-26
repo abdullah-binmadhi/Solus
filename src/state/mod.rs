@@ -772,6 +772,7 @@ pub struct LivePlaybackTelemetry {
     pub abr_refresh_in_flight:   bool,
     pub last_time_pos:           f64,
     pub pip_mode:                bool,
+    pub player_pid:              Option<u32>,
 }
 
 impl LivePlaybackTelemetry {

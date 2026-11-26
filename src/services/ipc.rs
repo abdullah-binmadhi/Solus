@@ -283,15 +283,21 @@ pub const PIP_CORNER_LABELS: [&str; 6] = [
 
 /// Build mpv IPC JSON commands to toggle borderless always-on-top Picture-in-Picture mode.
 pub fn build_set_pip_mode_commands(enabled: bool) -> Vec<Value> {
+    build_set_pip_mode_commands_for_corner(enabled, 0)
+}
+
+/// Build mpv IPC JSON commands to toggle PiP mode using a specific corner preset index.
+pub fn build_set_pip_mode_commands_for_corner(enabled: bool, corner_idx: usize) -> Vec<Value> {
+    let preset = crate::services::pip::pip_preset(corner_idx);
     if enabled {
         vec![
             serde_json::json!({ "command": ["set_property", "fullscreen", false] }),
             serde_json::json!({ "command": ["set_property", "ontop", true] }),
             serde_json::json!({ "command": ["set_property", "border", false] }),
             serde_json::json!({ "command": ["set_property", "keepaspect-window", true] }),
-            serde_json::json!({ "command": ["set_property", "window-scale", 0.30] }),
-            serde_json::json!({ "command": ["set_property", "geometry", "30%x30%-24-24"] }),
-            serde_json::json!({ "command": ["show-text", "◈ Picture-in-Picture: ON ([p] toggle, [P] corner)", 2400] }),
+            serde_json::json!({ "command": ["set_property", "window-scale", preset.scale] }),
+            serde_json::json!({ "command": ["set_property", "geometry", preset.mpv_geometry] }),
+            serde_json::json!({ "command": ["show-text", format!("◈ Picture-in-Picture: {} ([p] toggle, [P] corner)", preset.label), 2400] }),
         ]
     } else {
         vec![
@@ -304,8 +310,17 @@ pub fn build_set_pip_mode_commands(enabled: bool) -> Vec<Value> {
     }
 }
 
+#[allow(dead_code)]
 pub fn send_set_pip_mode(enabled: bool) -> bool {
-    let cmds = build_set_pip_mode_commands(enabled);
+    send_set_pip_mode_for_corner(enabled, 0)
+}
+
+pub fn send_set_pip_mode_for_corner(enabled: bool, corner_idx: usize) -> bool {
+    let mut cmds = build_set_pip_mode_commands_for_corner(enabled, corner_idx);
+    let idx = corner_idx % PIP_CORNER_LABELS.len();
+    cmds.push(serde_json::json!({
+        "command": ["script-message", "solus-pip-sync", if enabled { "1" } else { "0" }, idx.to_string()]
+    }));
     let mut all_ok = true;
     for cmd in cmds {
         if !try_send_via_active_monitor(&cmd.to_string()) {
@@ -319,6 +334,7 @@ pub fn build_cycle_pip_corner_commands() -> Vec<Value> {
     vec![serde_json::json!({ "command": ["script-binding", "solus-cycle-pip-corner"] })]
 }
 
+#[allow(dead_code)]
 pub fn send_cycle_pip_corner() -> bool {
     let cmds = build_cycle_pip_corner_commands();
     let mut all_ok = true;
@@ -328,6 +344,11 @@ pub fn send_cycle_pip_corner() -> bool {
         }
     }
     all_ok
+}
+
+/// Apply a specific PiP corner preset in running `mpv` and sync Lua's internal PiP state.
+pub fn send_apply_pip_corner(corner_idx: usize) -> bool {
+    send_set_pip_mode_for_corner(true, corner_idx)
 }
 
 pub fn build_toggle_info_hud_commands() -> Vec<Value> {
@@ -870,6 +891,29 @@ async fn drive_ipc_stream<S>(
                         .send(AppMessage::AutoSyncSubRequested {
                             time_pos_secs: requested_pos,
                         })
+                        .await;
+                    continue;
+                }
+
+                if line.contains("client-message") && line.contains("solus-ipc-toggle-pip") {
+                    let enabled = extract_client_message_f64_arg(&line, 1).unwrap_or(0.0) >= 0.5;
+                    let corner_idx = extract_client_message_f64_arg(&line, 2)
+                        .map(|v| v.max(0.0) as usize);
+                    let _ = tx
+                        .send(AppMessage::PipToggleFromPlayer {
+                            enabled,
+                            corner_idx,
+                        })
+                        .await;
+                    continue;
+                }
+
+                if line.contains("client-message") && line.contains("solus-ipc-cycle-pip") {
+                    let corner_idx = extract_client_message_f64_arg(&line, 1)
+                        .map(|v| v.max(0.0) as usize)
+                        .unwrap_or(0);
+                    let _ = tx
+                        .send(AppMessage::PipCornerFromPlayer { corner_idx })
                         .await;
                     continue;
                 }

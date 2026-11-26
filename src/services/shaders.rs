@@ -737,6 +737,7 @@ mod tests {
             has_vulkan: true,
             has_d3d11: false,
             has_opengl: true,
+            has_wayland_app_id: false,
         };
         let files = build_shader_files_with_caps(
             Anime4KMode::Balanced,

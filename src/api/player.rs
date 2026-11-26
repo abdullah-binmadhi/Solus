@@ -593,6 +593,7 @@ local function toggle_pip()
         mp.set_property("geometry", "50%:50%")
         mp.osd_message("◈ PiP Floating: OFF (Standard Window)", 2.0)
     end
+    mp.commandv("script-message", "solus-ipc-toggle-pip", pip_active and "1" or "0", tostring(pip_idx - 1))
 end
 
 local function cycle_pip_corner()
@@ -602,7 +603,18 @@ local function cycle_pip_corner()
         pip_idx = (pip_idx % #pip_presets) + 1
     end
     apply_pip_preset()
+    mp.commandv("script-message", "solus-ipc-cycle-pip", tostring(pip_idx - 1))
 end
+
+mp.register_script_message("solus-pip-sync", function(active_s, idx_s)
+    local next_active = (active_s == "1" or active_s == "true")
+    local idx_num = tonumber(idx_s)
+    if idx_num ~= nil then
+        pip_idx = (math.floor(idx_num) % #pip_presets) + 1
+    end
+    pip_active = next_active
+    if hud_visible then render_info_hud() end
+end)
 
 mp.add_forced_key_binding("p", "solus-toggle-pip", toggle_pip)
 mp.add_forced_key_binding("P", "solus-cycle-pip-corner", cycle_pip_corner)
@@ -1533,7 +1545,7 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     if let Some(ref direct_url) = opts.stream_url {
         if !direct_url.is_empty() {
             let mut cmd = Command::new(&player_bin);
-            let args = match effective_player {
+            let mut args = match effective_player {
                 Player::Celluloid => build_celluloid_direct_args(
                     opts,
                     direct_url,
@@ -1553,6 +1565,16 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
                     audio_script.as_deref(),
                 ),
             };
+            #[cfg(target_os = "linux")]
+            if matches!(effective_player, Player::Mpv | Player::AutoBest)
+                && env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+                && detect_player_capabilities().has_wayland_app_id
+            {
+                args.insert(
+                    0,
+                    format!("--wayland-app-id={}", crate::services::pip::SOLUS_WAYLAND_APP_ID),
+                );
+            }
             cmd.args(args);
 
             let mut current_paths = match env::var_os("PATH") {
@@ -1667,12 +1689,22 @@ pub fn spawn_async(opts: &PlayOptions) -> Result<Child> {
     }
 
     let (global_kv, item_kv) = shared_mpv_kv_flags(opts, "", yt_conf.as_deref(), audio_script.as_deref());
-    let player_flags: Vec<String> = global_kv
+    let mut player_flags: Vec<String> = global_kv
         .into_iter()
         .chain(item_kv)
         .filter(|kv| !kv.contains(' '))
         .map(|kv| format!("--{kv}"))
         .collect();
+    #[cfg(target_os = "linux")]
+    if matches!(effective_player, Player::Mpv | Player::AutoBest)
+        && env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        && detect_player_capabilities().has_wayland_app_id
+    {
+        player_flags.push(format!(
+            "--wayland-app-id={}",
+            crate::services::pip::SOLUS_WAYLAND_APP_ID
+        ));
+    }
     cmd.env("ANI_CLI_PLAYER_FLAGS", player_flags.join(" "));
 
     cmd.stdin(Stdio::null())

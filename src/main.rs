@@ -243,6 +243,17 @@ enum AppMessage {
     AutoSyncSubRequested {
         time_pos_secs: f64,
     },
+    /// User toggled Picture-in-Picture ([p]) inside libmpv player
+    PipToggleFromPlayer {
+        enabled:    bool,
+        corner_idx: Option<usize>,
+    },
+    /// User cycled Picture-in-Picture corner ([P]) inside libmpv player
+    PipCornerFromPlayer {
+        corner_idx: usize,
+    },
+    /// Result of applying compositor-level Linux Wayland PiP
+    LinuxPipOutcome(services::pip::PipApplyOutcome),
     /// Background Speech-VAD audio cross-correlation finished
     AutoSyncSubCompleted {
         anime_id:        i64,
@@ -671,6 +682,59 @@ async fn main() -> anyhow::Result<()> {
                                 unix_now(),
                             );
                         }
+                    }
+                }
+                AppMessage::PipToggleFromPlayer { enabled, corner_idx } => {
+                    cfg.auto_pip = enabled;
+                    state.auto_pip = enabled;
+                    state.live_playback.pip_mode = enabled;
+                    if enabled {
+                        cfg.auto_fullscreen = false;
+                        state.auto_fullscreen = false;
+                        if let Some(idx) = corner_idx {
+                            state.pip_corner_idx = idx % services::ipc::PIP_CORNER_LABELS.len();
+                        }
+                    }
+                    let _ = cfg.save();
+                    spawn_linux_pip_task(
+                        enabled,
+                        state.pip_corner_idx,
+                        state.live_playback.player_pid,
+                        false,
+                        Some(tx.clone()),
+                    );
+                    let msg = if enabled {
+                        "◈ Picture-in-Picture (PiP): Enabled (Floating Corner)"
+                    } else {
+                        "◈ Picture-in-Picture (PiP): Disabled (Standard Window)"
+                    };
+                    state.show_toast(msg, unix_now());
+                }
+                AppMessage::PipCornerFromPlayer { corner_idx } => {
+                    let n = services::ipc::PIP_CORNER_LABELS.len();
+                    cfg.auto_pip = true;
+                    state.auto_pip = true;
+                    state.live_playback.pip_mode = true;
+                    cfg.auto_fullscreen = false;
+                    state.auto_fullscreen = false;
+                    state.pip_corner_idx = corner_idx % n;
+                    let _ = cfg.save();
+                    spawn_linux_pip_task(
+                        true,
+                        state.pip_corner_idx,
+                        state.live_playback.player_pid,
+                        false,
+                        Some(tx.clone()),
+                    );
+                    let label = services::ipc::PIP_CORNER_LABELS[state.pip_corner_idx % n];
+                    state.show_toast(format!("◈ PiP Corner: {label}"), unix_now());
+                }
+                AppMessage::LinuxPipOutcome(outcome) => {
+                    if let services::pip::PipApplyOutcome::UnsupportedCompositor(de) = outcome {
+                        state.show_toast(
+                            format!("◈ PiP positioning isn't supported by {de} Wayland"),
+                            unix_now(),
+                        );
                     }
                 }
                 AppMessage::AutoSyncSubRequested { time_pos_secs } => {
@@ -3186,11 +3250,11 @@ async fn handle_mouse(
                         return true;
                     }
                     if layout.pip_chip_rect.contains(pos) {
-                        toggle_pip_mode_action(state, cfg);
+                        toggle_pip_mode_action(state, cfg, tx);
                         return true;
                     }
                     if layout.corner_chip_rect.contains(pos) {
-                        cycle_pip_corner_action(state, cfg);
+                        cycle_pip_corner_action(state, cfg, tx);
                         return true;
                     }
                     if layout.autofs_chip_rect.contains(pos) {
@@ -5192,10 +5256,10 @@ async fn handle_playback_options(
             cycle_network_mode(state, cfg, true, tx).await;
         }
         KeyCode::Char('w') => {
-            toggle_pip_mode_action(state, cfg);
+            toggle_pip_mode_action(state, cfg, tx);
         }
         KeyCode::Char('W') => {
-            cycle_pip_corner_action(state, cfg);
+            cycle_pip_corner_action(state, cfg, tx);
         }
         KeyCode::Char('f') | KeyCode::Char('F') => {
             toggle_auto_fullscreen_action(state, cfg);
@@ -5834,14 +5898,14 @@ async fn execute_hub_action(
             toggle_auto_fullscreen_action(state, cfg);
         }
         PipMode => {
-            toggle_pip_mode_action(state, cfg);
+            toggle_pip_mode_action(state, cfg, tx);
         }
         PipCorner => {
             if delta < 0 {
                 let n = services::ipc::PIP_CORNER_LABELS.len();
                 state.pip_corner_idx = (state.pip_corner_idx + n - 1) % n;
             }
-            cycle_pip_corner_action(state, cfg);
+            cycle_pip_corner_action(state, cfg, tx);
         }
         ToggleInfoHud => {
             toggle_info_hud_action(state, false);
@@ -9461,10 +9525,10 @@ async fn handle_playback(
             adjust_subtitle_delay(state, pool, None).await;
         }
         KeyCode::Char('p') => {
-            toggle_pip_mode_action(state, cfg);
+            toggle_pip_mode_action(state, cfg, tx);
         }
         KeyCode::Char('P') => {
-            cycle_pip_corner_action(state, cfg);
+            cycle_pip_corner_action(state, cfg, tx);
         }
         KeyCode::Char('i') => {
             toggle_info_hud_action(state, false);
@@ -9476,12 +9540,49 @@ async fn handle_playback(
     }
 }
 
+fn spawn_linux_pip_task(
+    enabled: bool,
+    corner_idx: usize,
+    player_pid: Option<u32>,
+    wait_for_map: bool,
+    tx: Option<tokio::sync::mpsc::Sender<AppMessage>>,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        tokio::spawn(async move {
+            let outcome = services::pip::apply_linux_pip(
+                enabled,
+                corner_idx,
+                player_pid,
+                wait_for_map,
+            )
+            .await;
+            if let Some(sender) = tx {
+                let _ = sender.send(AppMessage::LinuxPipOutcome(outcome)).await;
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (enabled, corner_idx, player_pid, wait_for_map, tx);
+    }
+}
+
 fn toggle_auto_fullscreen_action(state: &mut AppState, cfg: &mut config::Config) {
     cfg.auto_fullscreen = !cfg.auto_fullscreen;
     if cfg.auto_fullscreen {
         cfg.auto_pip = false;
         state.auto_pip = false;
         state.live_playback.pip_mode = false;
+        if state.live_playback.started_at.is_some() {
+            spawn_linux_pip_task(
+                false,
+                state.pip_corner_idx,
+                state.live_playback.player_pid,
+                false,
+                None,
+            );
+        }
     }
     state.auto_fullscreen = cfg.auto_fullscreen;
     let _ = cfg.save();
@@ -9494,7 +9595,11 @@ fn toggle_auto_fullscreen_action(state: &mut AppState, cfg: &mut config::Config)
     state.show_toast(msg, unix_now());
 }
 
-fn toggle_pip_mode_action(state: &mut AppState, cfg: &mut config::Config) {
+fn toggle_pip_mode_action(
+    state: &mut AppState,
+    cfg: &mut config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
     let next = !(state.live_playback.pip_mode || cfg.auto_pip);
     cfg.auto_pip = next;
     state.auto_pip = next;
@@ -9504,7 +9609,16 @@ fn toggle_pip_mode_action(state: &mut AppState, cfg: &mut config::Config) {
         state.auto_fullscreen = false;
     }
     let _ = cfg.save();
-    services::ipc::send_set_pip_mode(next);
+    services::ipc::send_set_pip_mode_for_corner(next, state.pip_corner_idx);
+    if state.live_playback.started_at.is_some() {
+        spawn_linux_pip_task(
+            next,
+            state.pip_corner_idx,
+            state.live_playback.player_pid,
+            false,
+            Some(tx.clone()),
+        );
+    }
     let msg = if next {
         "◈ Picture-in-Picture (PiP): Enabled (Floating Corner)"
     } else {
@@ -9513,7 +9627,11 @@ fn toggle_pip_mode_action(state: &mut AppState, cfg: &mut config::Config) {
     state.show_toast(msg, unix_now());
 }
 
-fn cycle_pip_corner_action(state: &mut AppState, cfg: &mut config::Config) {
+fn cycle_pip_corner_action(
+    state: &mut AppState,
+    cfg: &mut config::Config,
+    tx: &tokio::sync::mpsc::Sender<AppMessage>,
+) {
     let n = services::ipc::PIP_CORNER_LABELS.len();
     if !(state.live_playback.pip_mode || cfg.auto_pip) {
         cfg.auto_pip = true;
@@ -9525,7 +9643,16 @@ fn cycle_pip_corner_action(state: &mut AppState, cfg: &mut config::Config) {
     } else {
         state.pip_corner_idx = (state.pip_corner_idx + 1) % n;
     }
-    services::ipc::send_cycle_pip_corner();
+    services::ipc::send_apply_pip_corner(state.pip_corner_idx);
+    if state.live_playback.started_at.is_some() {
+        spawn_linux_pip_task(
+            true,
+            state.pip_corner_idx,
+            state.live_playback.player_pid,
+            false,
+            Some(tx.clone()),
+        );
+    }
     let label = services::ipc::PIP_CORNER_LABELS[state.pip_corner_idx % n];
     state.show_toast(format!("◈ PiP Corner: {label}"), unix_now());
 }
@@ -10640,6 +10767,11 @@ async fn start_playback(
             return;
         }
     };
+    let player_pid = child.id();
+    state.live_playback.player_pid = player_pid;
+    if opts.auto_pip {
+        spawn_linux_pip_task(true, state.pip_corner_idx, player_pid, true, Some(tx.clone()));
+    }
 
     state.show_toast(
         format!("Launching Episode {} in {}", episode, resolved_engine.label()),
