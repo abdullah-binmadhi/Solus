@@ -1082,6 +1082,14 @@ async fn main() -> anyhow::Result<()> {
                     state.subtitle_delay_ms = 0;
 
                     if stream_url.is_none() && was_direct_stream {
+                        if state.queue.restore_unfinished_active_to_front().is_some() {
+                            state.queue_cursor = 0;
+                            services::queue::save_active_queue(&state.active_profile_id, &state.queue);
+                            sync_remote_queue_snapshot(&state);
+                        }
+                        if state.screen == Screen::Playback {
+                            state.screen = Screen::Detail;
+                        }
                         state.show_toast(
                             format!("No playable source verified for Episode {}", episode),
                             unix_now(),
@@ -1221,6 +1229,10 @@ async fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     let active_snapshot = state.queue.active_item.clone();
+                    let live_pos = state.live_playback.last_time_pos;
+                    let live_dur = state.live_playback.last_duration;
+                    let live_anime_id = state.live_playback.anime_id;
+                    let live_is_offline = state.live_playback.is_offline_local;
                     state.now_playing = None;
                     state.player_stop = None;
                     state.sub_sync_in_progress = false;
@@ -1335,7 +1347,7 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     // Auto-advance next queued item ONLY on true natural EOF or >=90% completion.
-                    // Never jump to the next episode if the player crashed or was closed early.
+                    // Never jump to the next episode if the player crashed or closed mid-episode.
                     let active_completion_reached = active_snapshot
                         .as_ref()
                         .is_some_and(|a| {
@@ -1345,16 +1357,114 @@ async fn main() -> anyhow::Result<()> {
                     let active_ep = active_snapshot
                         .as_ref()
                         .map(|a| a.item.episode)
+                        .or_else(|| state.last_play_options.as_ref().map(|o| o.episode))
                         .unwrap_or(0);
-                    let had_ipc_duration = state
+                    let saved_ep_progress = state
                         .selected_anime
                         .as_ref()
-                        .and_then(|_| state.anime_progress.get(&active_ep))
-                        .is_some_and(|(_, dur)| *dur >= 60.0);
+                        .and_then(|_| state.anime_progress.get(&active_ep).copied());
+                    let effective_dur = if live_dur >= 60.0 {
+                        live_dur
+                    } else {
+                        saved_ep_progress.map(|(_, d)| d).unwrap_or(0.0)
+                    };
+                    let effective_pos = live_pos.max(
+                        saved_ep_progress
+                            .filter(|(_, d)| *d >= 60.0)
+                            .map(|(p, _)| p)
+                            .unwrap_or(0.0),
+                    );
+                    let had_ipc_duration = effective_dur >= 60.0;
+                    let pos_near_end = if had_ipc_duration {
+                        (effective_pos / effective_dur) >= 0.85
+                    } else {
+                        true
+                    };
 
-                    let natural_finish = natural_eof
-                        || (active_completion_reached && !user_quit)
+                    let natural_finish = (natural_eof && pos_near_end)
+                        || (active_completion_reached && pos_near_end && !user_quit)
                         || (!had_ipc_duration && exited_ok && !user_quit && elapsed_secs >= 900);
+
+                    // Mid-episode crash / premature stream drop recovery:
+                    // If the player exited before finishing and the user didn't quit, automatically
+                    // re-resolve the stream and resume near the last known position (up to 2 tries).
+                    if !user_quit
+                        && !natural_finish
+                        && (elapsed_secs >= 3 || effective_pos >= 3.0)
+                        && !services::platform::has_gpu_context_init_error(&state.playback_logs)
+                    {
+                        if let Some(mut retry_opts) = state.last_play_options.clone() {
+                            let target_aid = live_anime_id
+                                .or_else(|| state.selected_anime.as_ref().map(|a| a.id))
+                                .unwrap_or(0);
+                            let target_ep = retry_opts.episode;
+                            if state.mid_stream_recovery_target != Some((target_aid, target_ep)) {
+                                state.mid_stream_recovery_target = Some((target_aid, target_ep));
+                                state.mid_stream_recovery_count = 0;
+                            }
+                            if state.mid_stream_recovery_count < 2 {
+                                state.mid_stream_recovery_count += 1;
+                                let attempt = state.mid_stream_recovery_count;
+                                let resume_at = (effective_pos - 2.0).max(0.0);
+                                let mins = (resume_at as u64) / 60;
+                                let secs = (resume_at as u64) % 60;
+                                state.queue.active_item = active_snapshot;
+                                if !live_is_offline
+                                    && retry_opts.stream_url.is_some()
+                                    && state.selected_anime.is_some()
+                                {
+                                    state.show_toast(
+                                        format!(
+                                            "◈ Stream interrupted — recovering Ep {} at {:02}:{:02} ({}/2)...",
+                                            target_ep, mins, secs, attempt
+                                        ),
+                                        unix_now(),
+                                    );
+                                    launch_remote_stream_switch(
+                                        &mut state,
+                                        &pool,
+                                        &cfg,
+                                        &tx,
+                                        target_ep,
+                                        Some(retry_opts.dub),
+                                        Some(resume_at),
+                                    )
+                                    .await;
+                                    continue;
+                                } else {
+                                    retry_opts.start_pos = Some(resume_at);
+                                    let retry_title = state
+                                        .selected_anime
+                                        .as_ref()
+                                        .map(|a| a.display_title().to_string())
+                                        .unwrap_or_else(|| retry_opts.title.clone());
+                                    state.show_toast(
+                                        format!(
+                                            "◈ Player closed unexpectedly — resuming Ep {} at {:02}:{:02} ({}/2)...",
+                                            target_ep, mins, secs, attempt
+                                        ),
+                                        unix_now(),
+                                    );
+                                    start_playback(
+                                        &mut state,
+                                        retry_opts,
+                                        retry_title,
+                                        target_ep,
+                                        &tx,
+                                        &pool,
+                                        &cfg,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    if natural_finish || user_quit {
+                        state.mid_stream_recovery_count = 0;
+                        state.mid_stream_recovery_target = None;
+                    }
 
                     if natural_finish {
                         state.queue.mark_active_completed();
@@ -1976,6 +2086,9 @@ async fn main() -> anyhow::Result<()> {
                         spawn_silent_analytics_refresh(&pool, &tx);
                     }
                     state.live_playback.last_time_pos = pos;
+                    if dur > 0.0 {
+                        state.live_playback.last_duration = dur;
+                    }
                     let remote_state_clone = state.remote_state.clone();
                     let title = state.selected_anime.as_ref().map(|a| a.display_title().to_string()).unwrap_or_else(|| "Anime Stream".to_string());
                     let ep_title = state.episode_titles.get(&ep).cloned().unwrap_or_else(|| format!("Episode {}", ep));

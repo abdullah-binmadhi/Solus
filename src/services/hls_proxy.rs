@@ -193,7 +193,8 @@ impl HlsProxyServer {
         let mut builder = reqwest::Client::builder()
             .user_agent(PROXY_UA)
             .connect_timeout(Duration::from_secs(6))
-            .timeout(Duration::from_secs(20));
+            .timeout(Duration::from_secs(25))
+            .pool_max_idle_per_host(8);
         if force_ipv4 {
             builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         }
@@ -265,6 +266,67 @@ async fn write_http_response(
     stream.flush().await
 }
 
+fn should_retry_http_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status.is_server_error()
+}
+
+async fn fetch_upstream_with_retry(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    referer: &str,
+) -> std::result::Result<Vec<u8>, (String, String)> {
+    const BACKOFFS_MS: [u64; 3] = [0, 150, 400];
+    let mut last_err = ("502 Bad Gateway".to_string(), "Upstream request failed".to_string());
+
+    for (attempt, delay_ms) in BACKOFFS_MS.iter().enumerate() {
+        if *delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+        }
+        let resp = match client
+            .get(upstream_url)
+            .header("Referer", referer)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = ("502 Bad Gateway".to_string(), format!("Upstream error: {e}"));
+                if attempt + 1 < BACKOFFS_MS.len() {
+                    continue;
+                }
+                break;
+            }
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            last_err = (
+                "502 Bad Gateway".to_string(),
+                format!("Upstream HTTP {}", status.as_u16()),
+            );
+            if should_retry_http_status(status) && attempt + 1 < BACKOFFS_MS.len() {
+                continue;
+            }
+            break;
+        }
+
+        match resp.bytes().await {
+            Ok(b) => return Ok(b.to_vec()),
+            Err(_) => {
+                last_err = ("502 Bad Gateway".to_string(), "Upstream read failed".to_string());
+                if attempt + 1 < BACKOFFS_MS.len() {
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
 async fn handle_client(
     mut stream: TcpStream,
     client: &reqwest::Client,
@@ -299,27 +361,10 @@ async fn handle_client(
         return write_http_response(&mut stream, "400 Bad Request", "text/plain", b"Invalid URL").await;
     }
 
-    let upstream_resp = match client
-        .get(&upstream_url)
-        .header("Referer", &referer)
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            let msg = format!("Upstream HTTP {}", r.status().as_u16());
-            return write_http_response(&mut stream, "502 Bad Gateway", "text/plain", msg.as_bytes()).await;
-        }
-        Err(e) => {
-            let msg = format!("Upstream error: {e}");
-            return write_http_response(&mut stream, "502 Bad Gateway", "text/plain", msg.as_bytes()).await;
-        }
-    };
-
-    let bytes = match upstream_resp.bytes().await {
+    let bytes = match fetch_upstream_with_retry(client, &upstream_url, &referer).await {
         Ok(b) => b,
-        Err(_) => {
-            return write_http_response(&mut stream, "502 Bad Gateway", "text/plain", b"Upstream read failed").await;
+        Err((status, msg)) => {
+            return write_http_response(&mut stream, &status, "text/plain", msg.as_bytes()).await;
         }
     };
 

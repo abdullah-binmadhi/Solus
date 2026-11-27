@@ -1294,7 +1294,8 @@ pub fn mpv_network_kv_args(
 ) -> Vec<String> {
     let mut kv = vec![
         "demuxer-max-bytes=75497472".to_string(),      // 72 MiB hard RAM cap
-        "demuxer-max-back-bytes=25165824".to_string(), // 24 MiB rewind cushion
+        "demuxer-max-back-bytes=33554432".to_string(), // 32 MiB rewind cushion
+        "demuxer-seekable-cache=yes".to_string(),
     ];
     if is_local_file {
         return kv;

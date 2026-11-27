@@ -739,6 +739,9 @@ pub struct AppState {
     pub active_sub_path:             Option<String>,
     pub active_provider_id:          Option<String>,
     pub active_ref_sync_source:      Option<(String, Option<String>, Option<String>)>,
+    /// Automatic mid-stream crash/drop recovery counter for the active episode
+    pub mid_stream_recovery_count:   u8,
+    pub mid_stream_recovery_target:  Option<(i64, u32)>,
     /// Settings Control Hub v2 navigation + Remote live state
     pub settings_category:           usize,
     pub settings_scroll_offset:      usize,
@@ -771,6 +774,7 @@ pub struct LivePlaybackTelemetry {
     pub prompted_congested_mode: bool,
     pub abr_refresh_in_flight:   bool,
     pub last_time_pos:           f64,
+    pub last_duration:           f64,
     pub pip_mode:                bool,
     pub player_pid:              Option<u32>,
 }
@@ -1094,6 +1098,8 @@ impl AppState {
             active_sub_path: None,
             active_provider_id: None,
             active_ref_sync_source: None,
+            mid_stream_recovery_count: 0,
+            mid_stream_recovery_target: None,
             settings_category: 0,
             settings_scroll_offset: 0,
             remote_ws_clients: 0,

@@ -303,7 +303,8 @@ impl WatchQueue {
     }
 
     /// Update live playback completion progress for the currently active episode.
-    /// Returns `true` the first time the episode crosses `QUEUE_COMPLETION_THRESHOLD` (90%).
+    /// Tracks the current live ratio so seeking backward clears `completion_reached` if the
+    /// user rewinds well before the ending. Returns `true` when crossing `QUEUE_COMPLETION_THRESHOLD`.
     pub fn record_active_progress(
         &mut self,
         anime_id: i64,
@@ -318,14 +319,10 @@ impl WatchQueue {
             return false;
         }
         let ratio = (pos / duration).clamp(0.0, 1.0);
-        if ratio > active.progress_ratio {
-            active.progress_ratio = ratio;
-        }
-        if !active.completion_reached && active.progress_ratio >= QUEUE_COMPLETION_THRESHOLD {
-            active.completion_reached = true;
-            return true;
-        }
-        false
+        let was_reached = active.completion_reached;
+        active.progress_ratio = ratio;
+        active.completion_reached = ratio >= QUEUE_COMPLETION_THRESHOLD;
+        !was_reached && active.completion_reached
     }
 
     /// Mark the currently active item as completed (e.g., on natural EOF).
@@ -1317,6 +1314,12 @@ mod tests {
             completion_reached: false,
             progress_ratio: 0.0,
         });
+        assert!(q.record_active_progress(1, 1, 1290.0, 1420.0));
+        assert!(q.active_item.as_ref().unwrap().completion_reached);
+        // Seeking backward well before the ending clears completion_reached so early crashes don't auto-advance
+        assert!(!q.record_active_progress(1, 1, 500.0, 1420.0));
+        assert!(!q.active_item.as_ref().unwrap().completion_reached);
+        // Seeking back past 90% marks it completed again
         assert!(q.record_active_progress(1, 1, 1290.0, 1420.0));
         assert!(q.active_item.as_ref().unwrap().completion_reached);
         assert!(q.restore_unfinished_active_to_front().is_none());

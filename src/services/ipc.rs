@@ -439,11 +439,37 @@ pub struct IpcMonitorConfig {
 
 /// Parse `end-file` event reason from mpv JSON-RPC (`"eof"`, `"quit"`, `"stop"`, `"error"`).
 pub fn parse_end_file_reason(line: &str) -> Option<String> {
+    parse_end_file_event(line).map(|(reason, _)| reason)
+}
+
+/// Parse `end-file` event returning `(reason, has_file_error)`.
+/// In `mpv`, network/HLS/seek drops can emit `reason == "eof"` alongside a non-empty `file_error`.
+pub fn parse_end_file_event(line: &str) -> Option<(String, bool)> {
     let parsed: Value = serde_json::from_str(line).ok()?;
     if parsed.get("event")?.as_str()? == "end-file" {
-        return parsed.get("reason")?.as_str().map(|s| s.to_string());
+        let reason = parsed.get("reason")?.as_str()?.to_string();
+        let has_file_error = parsed
+            .get("file_error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty());
+        return Some((reason, has_file_error));
     }
     None
+}
+
+/// Verify whether an EOF occurred genuinely near the end of the episode rather than on a
+/// mid-stream network drop or failed seek.
+pub fn is_true_natural_eof(pos: f64, duration: f64) -> bool {
+    if !pos.is_finite() || !duration.is_finite() || duration <= 0.0 || pos <= 0.0 {
+        return false;
+    }
+    if duration >= 60.0 {
+        (pos / duration) >= 0.85
+    } else if duration >= 10.0 {
+        pos >= (duration - 3.0).max(duration * 0.85)
+    } else {
+        false
+    }
 }
 
 /// Parse `playlist-pos` property changes from mpv JSON-RPC.
@@ -924,29 +950,36 @@ async fn drive_ipc_stream<S>(
                     }
                 }
 
-                if let Some(reason) = parse_end_file_reason(&line) {
+                if let Some((reason, has_file_error)) = parse_end_file_event(&line) {
                     if let Some(ref kind) = playback_exit_kind {
                         if reason == "quit" {
                             kind.store(PLAYBACK_EXIT_USER_QUIT, Ordering::Relaxed);
                         } else if !stream_started && current_duration <= 10.0 && current_pos <= 1.5 && (reason == "eof" || reason == "error") {
                             kind.store(PLAYBACK_EXIT_STREAM_FAILED, Ordering::Relaxed);
                         } else if reason == "eof"
-                            && (stream_started || current_duration > 10.0 || current_pos > 1.0)
+                            && !has_file_error
+                            && is_true_natural_eof(current_pos, current_duration)
                         {
                             kind.store(PLAYBACK_EXIT_NATURAL_EOF, Ordering::Relaxed);
+                        } else if reason == "error" || has_file_error || reason == "eof" {
+                            kind.store(PLAYBACK_EXIT_STREAM_FAILED, Ordering::Relaxed);
                         }
                     }
                 }
 
                 if parse_bool_property_change(&line, "eof-reached") == Some(true)
-                    && (stream_started || current_duration > 10.0 || current_pos > 1.0)
+                    && stream_started
                 {
-                    if let Some(ref kind) = playback_exit_kind {
-                        kind.store(PLAYBACK_EXIT_NATURAL_EOF, Ordering::Relaxed);
+                    if is_true_natural_eof(current_pos, current_duration) {
+                        if let Some(ref kind) = playback_exit_kind {
+                            kind.store(PLAYBACK_EXIT_NATURAL_EOF, Ordering::Relaxed);
+                        }
+                        let _ = writer_half.write_all(b"{\"command\":[\"quit\"]}\n").await;
+                        let _ = writer_half.flush().await;
+                        break;
+                    } else if let Some(ref kind) = playback_exit_kind {
+                        kind.store(PLAYBACK_EXIT_STREAM_FAILED, Ordering::Relaxed);
                     }
-                    let _ = writer_half.write_all(b"{\"command\":[\"quit\"]}\n").await;
-                    let _ = writer_half.flush().await;
-                    break;
                 }
 
                 if in_loading_screen {
@@ -1383,6 +1416,17 @@ mod tests {
             parse_end_file_reason(r#"{"event":"end-file","reason":"stop"}"#).as_deref(),
             Some("stop")
         );
+        assert_eq!(
+            parse_end_file_event(r#"{"event":"end-file","reason":"eof","file_error":"loading failed"}"#),
+            Some(("eof".to_string(), true))
+        );
+        assert_eq!(
+            parse_end_file_event(r#"{"event":"end-file","reason":"eof"}"#),
+            Some(("eof".to_string(), false))
+        );
+        assert!(!is_true_natural_eof(420.0, 1440.0)); // mid-episode stream drop (~29%)
+        assert!(!is_true_natural_eof(0.0, 0.0));      // unknown duration
+        assert!(is_true_natural_eof(1380.0, 1440.0)); // near end (~95.8%)
     }
 
     #[test]
